@@ -381,7 +381,10 @@ class PaperSearchEngine:
         """关闭所有 Provider 的资源。"""
         for provider in self._providers.values():
             if hasattr(provider, "close"):
-                await provider.close()
+                result = provider.close()
+                # 支持同步和异步 close
+                if hasattr(result, "__await__"):
+                    await result
         self._providers.clear()
 
 

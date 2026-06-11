@@ -71,18 +71,20 @@ class SemanticScholarProvider(BaseProvider):
 
         async with self._make_client() as client:
             try:
-                # 尝试关键词搜索
-                resp = await client.get("/paper/search", params=params)
-                resp.raise_for_status()
+                resp = await self._request_with_retry(client, "/paper/search", params)
             except httpx.HTTPStatusError as e:
-                # 如果是按标题/DOI 搜索，尝试 paper/search 的 match 端点
                 if query.title or query.doi:
                     logger.info("Semantic Scholar: 尝试标题/DOI 匹配搜索")
                     match_params = {"query": search_text, "fields": S2_PAPER_FIELDS}
-                    resp = await client.get("/paper/search/match", params=match_params)
-                    resp.raise_for_status()
+                    try:
+                        resp = await self._request_with_retry(client, "/paper/search/match", match_params)
+                    except httpx.HTTPStatusError:
+                        return []
                 else:
-                    logger.error(f"Semantic Scholar 搜索失败: {e}")
+                    if e.response.status_code == 429:
+                        logger.warning("Semantic Scholar: 速率限制 (429)，稍后重试")
+                    else:
+                        logger.warning(f"Semantic Scholar 搜索失败: HTTP {e.response.status_code}")
                     return []
 
             data = resp.json()
@@ -166,6 +168,31 @@ class SemanticScholarProvider(BaseProvider):
                 except Exception:
                     pass
         return None
+
+    async def _request_with_retry(
+        self, client: httpx.AsyncClient, path: str, params: dict,
+        max_retries: int = 3, base_delay: float = 1.5,
+    ) -> httpx.Response:
+        """带指数退避的请求重试，处理 429 速率限制。"""
+        import asyncio
+
+        for attempt in range(max_retries):
+            try:
+                resp = await client.get(path, params=params)
+                if resp.status_code == 429:
+                    delay = base_delay * (2 ** attempt)
+                    logger.debug(f"Semantic Scholar 429 — {delay:.1f}s 后重试 ({attempt + 1}/{max_retries})")
+                    await asyncio.sleep(delay)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429 and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+        raise RuntimeError(f"Semantic Scholar: {max_retries} 次重试后仍失败")
 
     async def health_check(self) -> bool:
         """检查 Semantic Scholar API 连通性。"""
