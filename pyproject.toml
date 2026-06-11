@@ -1,0 +1,42 @@
+[project]
+name = "paper-search"
+version = "0.1.0"
+description = "学术论文搜索与 PDF 下载系统 — 支持 arXiv、PubMed、Semantic Scholar、CNKI、IEEE、ScienceDirect 等多源"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "chaocaiwei"}]
+
+[project.scripts]
+paper-search = "paper_search.cli.main:main"
+
+[project.optional-dependencies]
+# MCP Server
+mcp = ["fastmcp>=2,<3"]
+# Free API providers
+arxiv = ["arxiv>=2.3"]
+pubmed = ["biopython>=1.83", "metapub>=0.6"]
+# Browser automation for institutional access
+playwright = ["playwright>=1.40"]
+# CLI output formatting
+rich = ["rich>=13"]
+# CAPTCHA handling (CNKI)
+ocr = ["pytesseract>=0.3"]
+# All deps
+all = [
+    "fastmcp>=2,<3",
+    "httpx>=0.27",
+    "pydantic>=2",
+    "arxiv>=2.3",
+    "biopython>=1.83",
+    "metapub>=0.6",
+    "playwright>=1.40",
+    "rich>=13",
+    "pytesseract>=0.3",
+]
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
