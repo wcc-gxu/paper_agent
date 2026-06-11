@@ -5,6 +5,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# 自动加载项目根目录的 .env 文件
+_ENV_PATH = Path(__file__).parent.parent.parent / ".env"
+if _ENV_PATH.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_ENV_PATH)
+    except ImportError:
+        pass  # python-dotenv 未安装时静默跳过，用户可直接设环境变量
+
 
 @dataclass
 class Config:
