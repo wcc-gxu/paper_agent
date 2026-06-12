@@ -339,6 +339,205 @@ async def list_sources() -> str:
     }, ensure_ascii=False, indent=2)
 
 
+# ── Agent 实例 (惰性初始化) ────────────────────────────
+
+_agent = None
+
+def _get_agent():
+    global _agent
+    if _agent is None:
+        from ..agent.agent import ResearchAgent
+        _agent = ResearchAgent()
+    return _agent
+
+
+# ── Agent MCP Tools ──────────────────────────────────────
+
+@mcp.tool()
+async def research(
+    query: Annotated[
+        str,
+        Field(description="自然语言搜索需求，如 '帮我搜近半年 adversarial attack 的最新进展'"),
+    ],
+    enable_citation_chase: Annotated[
+        bool,
+        Field(description="是否在搜索完成后执行引用追踪（1层）"),
+    ] = False,
+    max_iterations: Annotated[
+        int,
+        Field(description="最大搜索迭代轮数 (1-5，默认 3)", ge=1, le=5),
+    ] = 3,
+) -> str:
+    """智能学术搜索 — 用自然语言一句话完成搜索全流程。
+
+    自动完成：
+    1. 解析搜索意图 → 2. 拆解子查询 → 3. 多源并发搜索
+    → 4. AI 逐篇评估相关性 → 5. 自动判断是否继续搜索
+    → 6. 下载相关论文 PDF → 7. 生成结构化报告
+
+    报告包含：搜索概况、关键论文、研究方向分类、后续建议。
+    """
+    agent = _get_agent()
+
+    result = await agent.research(
+        user_query=query,
+        enable_citation_chase=enable_citation_chase,
+        max_iterations=max_iterations,
+    )
+
+    # 返回精简版（报告全文在文件中）
+    papers_preview = result.get("papers", [])[:10]
+    stats = result.get("stats", {})
+
+    return json.dumps({
+        "project_id": result["project_id"],
+        "stats": stats,
+        "report": result["report"],
+        "top_papers": papers_preview,
+        "report_path": result.get("report_path", ""),
+        "errors": stats.get("errors", [])[:5],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def research_status(
+    project_id: Annotated[
+        str,
+        Field(description="搜索项目 ID (从 research tool 返回)"),
+    ],
+) -> str:
+    """查看某个搜索项目的状态和结果摘要。"""
+    agent = _get_agent()
+    status = await agent.get_status(project_id)
+    return json.dumps(status, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def research_history(
+    limit: Annotated[
+        int,
+        Field(description="返回最近 N 条历史记录 (默认 10)"),
+    ] = 10,
+) -> str:
+    """列出历史搜索项目。"""
+    agent = _get_agent()
+    projects = await agent.list_history(limit)
+    return json.dumps(projects, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def citation_chase(
+    paper_title: Annotated[
+        str,
+        Field(description="种子论文标题"),
+    ],
+    doi: Annotated[
+        Optional[str],
+        Field(description="论文 DOI (如果有，可精确定位)"),
+    ] = None,
+) -> str:
+    """独立引用追踪 — 找到引用了某篇论文的后继研究和它引用的前人工作（1层）。
+
+    可用于单独对某篇关键论文做引用分析。
+    """
+    from ..models import Paper, SearchQuery, SourceType
+
+    engine = _get_engine()
+
+    # 先找到这篇论文
+    query = SearchQuery(title=paper_title, doi=doi, sources=[SourceType.SEMANTIC_SCHOLAR], max_results=1)
+    result = await engine.search(query)
+
+    if not result.papers:
+        return json.dumps({"error": f"未找到论文: {paper_title}"}, ensure_ascii=False)
+
+    paper = result.papers[0]
+
+    # 通过 Semantic Scholar 查引用和被引
+    from ..providers.semanticscholar_provider import SemanticScholarProvider
+    s2 = SemanticScholarProvider()
+
+    citations_info = {"seed_paper": paper.title, "doi": paper.doi, "citing": [], "references": []}
+
+    # 查被引用（cited by）
+    if paper.doi:
+        try:
+            async with s2._make_client() as client:
+                resp = await client.get(
+                    f"/paper/DOI:{paper.doi}/citations",
+                    params={"fields": "title,year,authors,url", "limit": 20},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data.get("data", []):
+                        cp = item.get("citingPaper", {})
+                        citations_info["citing"].append({
+                            "title": cp.get("title", ""),
+                            "year": cp.get("year"),
+                            "url": cp.get("url"),
+                        })
+
+                # 查参考文献（references）
+                resp2 = await client.get(
+                    f"/paper/DOI:{paper.doi}/references",
+                    params={"fields": "title,year,authors,url", "limit": 20},
+                )
+                if resp2.status_code == 200:
+                    data2 = resp2.json()
+                    for item in data2.get("data", []):
+                        rp = item.get("citedPaper", {})
+                        citations_info["references"].append({
+                            "title": rp.get("title", ""),
+                            "year": rp.get("year"),
+                            "url": rp.get("url"),
+                        })
+        except Exception as e:
+            citations_info["error"] = str(e)
+
+    return json.dumps(citations_info, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def export_report(
+    project_id: Annotated[
+        str,
+        Field(description="搜索项目 ID"),
+    ],
+    format: Annotated[
+        str,
+        Field(description="导出格式: bibtex 或 json"),
+    ] = "bibtex",
+) -> str:
+    """导出某次搜索的报告（BibTeX 或 JSON 格式）。"""
+    agent = _get_agent()
+    project = agent.db.get_project(project_id)
+    if not project:
+        return json.dumps({"error": f"项目不存在: {project_id}"}, ensure_ascii=False)
+
+    papers = agent.db.get_relevant_papers(project_id)
+
+    if format == "bibtex":
+        entries = []
+        for p in papers:
+            authors = json.loads(p.get("authors", "[]"))
+            first_author = authors[0].split()[-1] if authors else "Unknown"
+            key = f"{first_author}{p.get('year', '????')}{p['title'][:20]}"
+            entry = (
+                f"@article{{{key},\n"
+                f"  title = {{{{{p['title']}}}}},\n"
+                f"  author = {{{{' and '.join(authors[:10])}}}},\n"
+                f"  year = {{{p.get('year', '????')}}},\n"
+                f"  doi = {{{p.get('doi', '')}}},\n"
+                f"  journal = {{{p.get('venue', '')}}}\n"
+                f"}}"
+            )
+            entries.append(entry)
+        return "\n\n".join(entries)
+
+    else:
+        return json.dumps(papers, ensure_ascii=False, indent=2)
+
+
 # ── 直接运行入口 ──────────────────────────────────────
 
 def main():
