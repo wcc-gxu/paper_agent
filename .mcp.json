@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "paper-search": {
+      "command": "python",
+      "args": ["-m", "paper_search.mcp.server"]
+    }
+  }
+}
