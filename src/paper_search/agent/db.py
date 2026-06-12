@@ -68,11 +68,31 @@ CREATE TABLE IF NOT EXISTS search_logs (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS journal_ranks (
+    venue_name TEXT PRIMARY KEY,
+    ccf_level TEXT,
+    sci_zone TEXT,
+    unified_level TEXT,
+    updated_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
 CREATE INDEX IF NOT EXISTS idx_papers_source ON papers(source);
+CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level);
 CREATE INDEX IF NOT EXISTS idx_project_papers_project ON project_papers(project_id);
 CREATE INDEX IF NOT EXISTS idx_search_logs_project ON search_logs(project_id);
 """
+
+# 运行时迁移：为旧 papers 表添加新列
+_MIGRATIONS = [
+    "ALTER TABLE papers ADD COLUMN unified_level TEXT",
+    "ALTER TABLE papers ADD COLUMN reading_level TEXT",
+    "ALTER TABLE papers ADD COLUMN digest TEXT",
+    "ALTER TABLE papers ADD COLUMN method_tags TEXT",
+    "ALTER TABLE papers ADD COLUMN dataset_info TEXT",
+    "ALTER TABLE papers ADD COLUMN code_url TEXT",
+    "ALTER TABLE papers ADD COLUMN markdown_path TEXT",
+]
 
 
 class AgentDB:
@@ -89,8 +109,21 @@ class AgentDB:
             self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.executescript(SCHEMA)
+            self._run_migrations()
             self._conn.commit()
         return self._conn
+
+    def _run_migrations(self):
+        """运行缺失列的迁移。"""
+        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(papers)")}
+        for sql in _MIGRATIONS:
+            col = sql.split("ADD COLUMN ")[1].split(" ")[0]
+            if col not in existing:
+                try:
+                    self._conn.execute(sql)
+                    logger.info(f"DB migration: {sql}")
+                except Exception:
+                    pass
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -143,6 +176,7 @@ class AgentDB:
         now = self._now()
         authors_json = json.dumps(paper.authors, ensure_ascii=False) if paper.authors else "[]"
         keywords_json = json.dumps(paper.keywords, ensure_ascii=False) if paper.keywords else "[]"
+        source_str = paper.source.value if hasattr(paper.source, 'value') else str(paper.source)
 
         self.conn.execute(
             """INSERT INTO papers (id, title, authors, year, abstract, doi, arxiv_id, pmid,
@@ -155,13 +189,33 @@ class AgentDB:
             (
                 pid, paper.title, authors_json, paper.year, paper.abstract,
                 paper.doi, paper.arxiv_id, paper.pmid,
-                paper.source.value if hasattr(paper.source, 'value') else str(paper.source),
-                paper.source_url, paper.pdf_url, paper.citation_count,
+                source_str, paper.source_url, paper.pdf_url, paper.citation_count,
                 paper.venue, keywords_json, now, now,
             ),
         )
         self.conn.commit()
         return pid
+
+    def update_paper_meta(self, paper_id: str, **kwargs):
+        """更新论文的增强元数据字段。"""
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [paper_id]
+        self.conn.execute(f"UPDATE papers SET {sets}, updated_at=? WHERE id=?", vals + [self._now()])
+        self.conn.commit()
+
+    # ── 期刊分级缓存 ─────────────────────────────────────
+
+    def upsert_journal_rank(self, venue: str, ccf: str = None, sci: str = None, unified: str = None):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO journal_ranks (venue_name, ccf_level, sci_zone, unified_level, updated_at) "
+            "VALUES (?,?,?,?,?)",
+            (venue, ccf, sci, unified, self._now()),
+        )
+        self.conn.commit()
+
+    def get_journal_rank(self, venue: str) -> Optional[dict]:
+        row = self.conn.execute("SELECT * FROM journal_ranks WHERE venue_name=?", (venue,)).fetchone()
+        return dict(row) if row else None
 
     def link_paper_to_project(
         self, project_id: str, paper_id: str, round_num: int = 1,

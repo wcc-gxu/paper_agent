@@ -325,6 +325,36 @@ class LLMClient:
 
     # ── Stage 6: 报告生成 ─────────────────────────────────
 
+    # ── 摘要提炼 (Phase 3B 新增) ──────────────────────────
+
+    DIGEST_SYSTEM_PROMPT = """你是一个学术论文摘要提炼器。给定论文元数据，输出结构化摘要:
+
+输出纯 JSON:
+{
+  "digest": ["要点1", "要点2", "要点3", "要点4", "要点5"],
+  "one_liner": "一句话总结这篇论文的贡献",
+  "method_tags": ["方法1", "方法2"],
+  "dataset_info": "用的数据集/基准",
+  "reading_level": "skim"  // "skim"=粗略读即可 "deep"=值得细读 (考虑期刊等级)
+}"""
+
+    async def extract_digest(self, paper, journal_level: str = None) -> dict:
+        """提炼论文关键要点和方法标签。"""
+        user_message = (
+            f"标题: {paper.title}\n"
+            f"作者: {', '.join(paper.authors[:5])}\n"
+            f"年份: {paper.year or '?'}\n"
+            f"期刊/会议: {paper.venue or '未知'} (等级: {journal_level or '未评级'})\n"
+            f"摘要: {(paper.abstract or '无')[:800]}\n"
+        )
+        try:
+            return await self._chat_json(self.DIGEST_SYSTEM_PROMPT, user_message)
+        except Exception as e:
+            logger.warning(f"摘要提炼失败: {e}")
+            return {"digest": [], "one_liner": "", "method_tags": [], "dataset_info": "", "reading_level": "skim"}
+
+    # ── 报告生成 ─────────────────────────────────────────
+
     REPORT_SYSTEM_PROMPT = """你是一个学术搜索报告生成器。根据搜索结果生成结构化的文献综述摘要。
 
 输出应包含以下部分（使用 Markdown 格式）:
