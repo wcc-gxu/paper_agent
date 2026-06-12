@@ -2,17 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Quick Start — 启动智能文献搜索 Agent
+## Quick Start
 
-### 1. 一次性安装
+### 1. Install
 
 ```bash
-pip install -e ".[arxiv,pubmed,mcp,rich]" pymupdf4llm chromadb
+pip install -e ".[arxiv,rich]" pymupdf4llm chromadb
 ```
 
-### 2. 配置 Claude Code 自动启动 MCP Server
-
-在项目根目录创建 `.mcp.json`：
+### 2. MCP Server (auto-start via .mcp.json)
 
 ```json
 {
@@ -26,194 +24,192 @@ pip install -e ".[arxiv,pubmed,mcp,rich]" pymupdf4llm chromadb
 }
 ```
 
-Claude Code 启动后会自动拉起 MCP Server。如果不想自动启动，手动运行：
-
-```bash
-python -m paper_search.mcp.server
-```
-
-### 3. 确认服务正常
-
-在 Claude Code 对话中说：**"列出可用文献来源"**
-
-→ 会调用 `list_sources` tool，返回 6 个来源状态。
+Verify: say **"列出可用文献来源"** → calls `list_sources` tool.
 
 ---
 
-## 可用 MCP Tools（9 个）
+## Architecture: Modular CLI + Claude Code Harness
 
-### 全自动智能搜索（核心入口）
+The old 8-stage monolithic `research` pipeline is replaced by **10 independent CLI tools**.
+Claude Code acts as the **harness**: understand intent → ask questions → generate plan → call CLIs step by step → aggregate → next round.
 
-| Tool | 用途 | 示例 |
-|------|------|------|
-| `research` | **一句话触发全链路搜索** | "帮我搜 adversarial attack on LLM 近半年论文" |
+### Core Data Flow CLIs (4)
 
-### 底层原子操作
+| CLI | Purpose | Example |
+|-----|---------|---------|
+| `paper-search` | Multi-source search → dedup → SQLite | `paper-search --keywords "adversarial attack" --sources arxiv --year-from 2024` |
+| `paper-download` | Download single paper PDF | `paper-download --paper-id "arxiv:2401.xxx" --source arxiv` |
+| `paper-convert` | PDF → Markdown (pymupdf4llm) | `paper-convert --paper-id "arxiv:2401.xxx"` |
+| `paper-index` | MD → ChromaDB dual-collection (abstract + fulltext) | `paper-index --paper-id "arxiv:2401.xxx" --project-id <id>` |
 
-| Tool | 用途 |
-|------|------|
-| `search_papers` | 多源关键词搜索（arxiv/semantic_scholar/pubmed/sciencedirect） |
-| `download_paper` | 下载单篇 PDF |
-| `batch_search` | 从 JSON/CSV 文件批量搜索 |
+### Auxiliary CLIs (6)
 
-### 管理与导出
+| CLI | Purpose |
+|-----|---------|
+| `paper-evaluate` | LLM batch relevance scoring (0-1) |
+| `paper-rank` | Journal ranking (CCF + SCI → A+/A/B/C) |
+| `paper-survey` | Generate AI survey report |
+| `paper-export` | Export BibTeX / JSON |
+| `paper-status` | View project/paper state |
+| `paper-clean` | Clean DB/index (--keep-pdfs flag) |
 
-| Tool | 用途 |
-|------|------|
-| `research_status` | 查看搜索项目进度 |
-| `research_history` | 历史搜索项目列表 |
-| `citation_chase` | 独立引用追踪（1层） |
-| `export_report` | 导出 BibTeX / JSON 报告 |
-| `list_sources` | 列出所有来源及可用状态 |
+### MCP Tools (v2, 8 tools)
+
+| Tool | Maps to |
+|------|---------|
+| `search_papers` | paper-search (writes SQLite) |
+| `download_paper` | paper-download |
+| `batch_search` | Batch search from JSON/CSV |
+| `list_sources` | Source health check |
+| `paper_status` | paper-status |
+| `paper_export` | paper-export |
+| `paper_clean` | paper-clean |
+| `citation_chase` | 1-hop citation tracking |
+
+> **Removed:** `research` (old monolithic 8-stage pipeline)
 
 ---
 
-## `research` Tool 全链路流程
+## Claude Code Harness Workflow
 
 ```
-用户: "帮我搜 adversarial attack on large language models"
+User: "搜近3年自动驾驶安全新论文"
     │
-    ├─ Stage 1:  LLM 意图解析 → 拆解为 3~5 个子查询 + 自动选来源 + 推断时间范围
-    ├─ Stage 2:  策略规划 → 确定每轮搜索词和来源
-    ├─ Stage 3:  迭代搜索 → 4源并发 → 去重 → LLM逐篇评估相关性(0~1分)
-    │             → Agent自动判断是否继续搜（搜够了自动停）
-    ├─ Stage 3.5: 期刊分级(CCF+SCI) + LLM提炼5个要点 + 方法标签 + 粗读/细读分级
-    ├─ Stage 4:  PDF下载（全量相关论文）
-    ├─ Stage 4.5: PDF→Markdown全文转换 (pymupdf4llm)
-    ├─ Stage 5:  按章节分块 → ChromaDB向量入库
-    ├─ Stage 6:  LLM自动聚类 → Wiki页面 + JSON元数据 + Survey综述
-    ├─ Stage 7:  引用追踪 (可选)
-    └─ Stage 8:  输出报告
+    ├─ Claude Code 分析意图 → 生成 4+ 澄清问题 → 用户回答
+    ├─ Claude Code 生成 plan.json + plan.md
+    │
+    ├─ paper-search --keywords "..." --sources ... --project-id <id>
+    │   → stdout JSON → Claude Code 解析结果
+    │
+    ├─ Claude Code 评估搜索结果 → 决定下载列表
+    │
+    ├─ paper-download --paper-id "..." (per paper)
+    ├─ paper-convert --paper-id "..."
+    ├─ paper-index --paper-id "..." --project-id <id>
+    │
+    ├─ Claude Code 判断是否需要下一轮搜索
+    │   → Yes: 生成新 plan → 重复
+    │   → No: 进入汇总
+    │
+    └─ paper-survey --project-id <id>
+       paper-export --project-id <id> --format bibtex
 ```
 
-### `research` 参数
+### CLI Design Principles
 
-| 参数 | 类型 | 默认 | 说明 |
-|------|------|------|------|
-| `query` | string | 必填 | 自然语言搜索需求 |
-| `enable_citation_chase` | bool | false | 是否启用引用追踪 |
-| `max_iterations` | int | 3 | 最大搜索轮数 (1-5) |
+- **stdout**: JSON (machine-readable, pipeable)
+- **stderr**: Rich formatted (progress bars, tables, colors for humans)
+- **State**: SQLite `~/.paper_search/agent.db` for all intermediate state
+- **ChromaDB**: Dual collections — `papers_abstract` (fast filter) + `papers_fulltext` (deep search)
+- **Error handling**: Non-zero exit codes + stderr detail; caller decides retry
+- **Each CLI is independently callable** from terminal, scripts, or Claude Code
 
-### 全链路产出物
+---
+
+## Data Flow
+
+```
+paper-search → (papers in SQLite)
+    → Claude Code evaluates → selects which to download
+        → paper-download → (updates pdf_path)
+            → paper-convert → (updates markdown_path)
+                → paper-index → (updates embedding_id, chunks in ChromaDB)
+```
+
+### Output Structure
 
 ```
 ~/papers/outputs/{project_id}/
-├── metadata.json          # 按 A+/A/B/C 等级分组的 JSON 元数据
-├── wiki/
-│   ├── index.md           # LLM 自动组织的文献综述首页
-│   └── {研究方向}.md       # 各主题子页面（含结构化论文条目）
-├── survey.md              # AI 生成的文献综述文章
-├── report.md              # 搜索报告
-└── references.bib         # BibTeX 引用
+├── plan.json / plan.md     # Claude Code generated plan
+├── metadata.json           # Graded paper metadata (A+/A/B/C)
+├── survey.md               # AI survey report
+└── references.bib          # BibTeX export
 
 ~/papers/markdown/{project_id}/
-└── *.md                   # 每篇论文的全文 Markdown
+└── *.md                    # Full-text Markdown per paper
 
 ~/.paper_search/
-├── agent.db               # SQLite: 项目/论文/分级/标签
-└── chroma/                # ChromaDB: 章节级向量索引
+├── agent.db                # SQLite: projects, papers, project_papers, journal_ranks
+└── chroma/                 # ChromaDB: papers_abstract + papers_fulltext collections
 ```
 
 ---
 
-## 使用示例
-
-在 Claude Code 对话中直接说：
-
-```
-"搜一下近半年 adversarial attack 在 LLM 安全方面的最新论文"
-"帮我做一次全面的 LLM jailbreak 文献调研"
-"找出所有关于 prompt injection defense 的论文，按期刊等级排序"
-```
-
-### CLI 快捷命令
-
-```bash
-# 查看来源状态
-python -m paper_search.cli.main list-sources
-
-# 快速搜索（不触发全链路Agent）
-python -m paper_search.cli.main search "transformer" --sources arxiv,semantic_scholar --max-results 10
-
-# 下载单篇
-python -m paper_search.cli.main download "Attention Is All You Need" --source arxiv
-
-# 现有 PDF 上传远端
-python scripts/upload_all_pdf.py
-```
-
----
-
-## 环境配置 (.env)
-
-项目根目录 `.env` 文件，已配置的 API Key：
-
-| 变量 | 用途 | 状态 |
-|------|------|------|
-| `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar 1req/s | ✅ |
-| `ELSEVIER_API_KEY` | ScienceDirect 搜索+PDF | ✅ |
-| `IEEE_API_KEY` | IEEE Xplore 搜索 | 🔑 等激活 |
-| `VOLCANO_API_KEY` | 火山引擎 LLM (Agent大脑) | ✅ |
-
-添加新 Key：直接编辑 `.env`，重启 MCP Server 即生效。
-
----
-
-## 来源与能力矩阵
-
-| 来源 | 搜索 | PDF | 需要 |
-|------|------|-----|------|
-| arXiv | ✅ | ✅ 直下 | 无 |
-| Semantic Scholar | ✅ 1/s | ✅ OA | API Key (已有) |
-| PubMed | ✅ | ✅ OA | 无 |
-| ScienceDirect | ✅ 5k/周 | ✅ API | API Key (已有) + 校内IP |
-| IEEE Xplore | 🔑 | 🌐 | API Key (等激活) + 校内IP |
-| CNKI 知网 | ⚠️ | 🌐 | 校内IP + Playwright过验证码 |
-
----
-
-## 依赖
-
-```toml
-# pyproject.toml
-fastmcp>=2,<3       # MCP Server
-httpx>=0.27          # HTTP
-pydantic>=2          # 数据模型
-arxiv>=2.3           # arXiv
-biopython, metapub   # PubMed
-pymupdf4llm          # PDF→Markdown
-chromadb             # 向量库
-python-dotenv        # 环境变量
-rich>=13             # CLI输出
-```
-
-Python >= 3.11
-
----
-
-## 项目结构
+## Project Structure
 
 ```
 paper_agant/
 ├── src/paper_search/
-│   ├── agent/              # 智能搜索 Agent
-│   │   ├── agent.py        # 8-Stage 管道编排
-│   │   ├── llm_client.py   # 火山引擎 LLM 调用
-│   │   ├── db.py           # SQLite 持久化
-│   │   ├── chroma_store.py # ChromaDB 向量索引
-│   │   ├── pdf_converter.py # PDF→Markdown
-│   │   ├── chunker.py      # 章节感知分块
-│   │   ├── journal_ranker.py # CCF+SCI 分级
-│   │   └── wiki_generator.py # Wiki+JSON生成
-│   ├── providers/          # 6 个搜索来源 Provider
-│   ├── downloaders/        # HTTP + Playwright 下载器
-│   ├── mcp/server.py       # MCP Server (9 tools)
-│   ├── cli/main.py         # CLI 入口
-│   ├── engine.py           # 搜索引擎门面
-│   ├── models.py           # Pydantic 数据模型
-│   └── config.py           # 配置管理
-├── scripts/                # 工具脚本 (Zotero导出/上传)
-├── docs/product/           # 产品蓝图文档
-├── .env                    # API Key 配置
-└── pyproject.toml          # 项目元数据
+│   ├── agent/              # Core components
+│   │   ├── db.py           # SQLite persistence (AgentDB)
+│   │   ├── chroma_store.py # ChromaDB dual-collection (ChromaStore + ChromaStoreV2)
+│   │   ├── pdf_converter.py # PDF→Markdown (pymupdf4llm)
+│   │   ├── chunker.py      # Section-aware chunking
+│   │   ├── journal_ranker.py # CCF+SCI journal ranking
+│   │   ├── llm_client.py   # Volcano Engine LLM (intent/eval/report)
+│   │   └── agent.py        # [DEPRECATED] Old 8-stage ResearchAgent pipeline
+│   ├── cli/                # 10 independent CLI tools
+│   │   ├── common.py       # Rich console, DB/Engine factory, shared args
+│   │   ├── search_cmd.py   # paper-search
+│   │   ├── download_cmd.py # paper-download
+│   │   ├── convert_cmd.py  # paper-convert
+│   │   ├── index_cmd.py    # paper-index
+│   │   ├── evaluate_cmd.py # paper-evaluate
+│   │   ├── rank_cmd.py     # paper-rank
+│   │   ├── survey_cmd.py   # paper-survey
+│   │   ├── export_cmd.py   # paper-export
+│   │   ├── status_cmd.py   # paper-status
+│   │   ├── clean_cmd.py    # paper-clean
+│   │   └── main.py         # Legacy CLI (backward compat)
+│   ├── providers/          # 6 search source providers
+│   ├── downloaders/        # HTTP + Playwright downloaders
+│   ├── mcp/server.py       # MCP Server v2 (8 tools, thin wrappers)
+│   ├── engine.py           # PaperSearchEngine facade
+│   ├── models.py           # Pydantic data models
+│   └── config.py           # Configuration management
+├── scripts/
+├── .env                    # API keys
+└── pyproject.toml          # 11 console_scripts entry points
 ```
+
+---
+
+## Environment (.env)
+
+| Variable | Purpose | Status |
+|----------|---------|--------|
+| `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar 1 req/s | ✅ |
+| `ELSEVIER_API_KEY` | ScienceDirect search + PDF | ✅ |
+| `IEEE_API_KEY` | IEEE Xplore search | 🔑 pending activation |
+| `VOLCANO_API_KEY` | Volcano Engine LLM | ✅ |
+
+---
+
+## Source Capability Matrix
+
+| Source | Search | PDF | Requires |
+|--------|--------|-----|----------|
+| arXiv | ✅ | ✅ direct | None |
+| Semantic Scholar | ✅ 1 req/s | ✅ OA | API Key |
+| PubMed | ✅ | ✅ OA | None |
+| ScienceDirect | ✅ 5k/week | ✅ API | API Key + campus IP |
+| IEEE Xplore | 🔑 | 🌐 | API Key + campus IP |
+| CNKI | ⚠️ | 🌐 | Campus IP + Playwright CAPTCHA |
+
+---
+
+## Dependencies
+
+```
+fastmcp>=2,<3       # MCP Server
+httpx>=0.27          # HTTP
+pydantic>=2          # Data models
+arxiv>=2.3           # arXiv
+biopython, metapub   # PubMed
+pymupdf4llm          # PDF→Markdown
+chromadb             # Vector DB
+python-dotenv        # Environment
+rich>=13             # CLI output
+```
+
+Python >= 3.11

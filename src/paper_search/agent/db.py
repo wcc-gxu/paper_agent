@@ -78,7 +78,6 @@ CREATE TABLE IF NOT EXISTS journal_ranks (
 
 CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
 CREATE INDEX IF NOT EXISTS idx_papers_source ON papers(source);
-CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level);
 CREATE INDEX IF NOT EXISTS idx_project_papers_project ON project_papers(project_id);
 CREATE INDEX IF NOT EXISTS idx_search_logs_project ON search_logs(project_id);
 """
@@ -92,6 +91,7 @@ _MIGRATIONS = [
     "ALTER TABLE papers ADD COLUMN dataset_info TEXT",
     "ALTER TABLE papers ADD COLUMN code_url TEXT",
     "ALTER TABLE papers ADD COLUMN markdown_path TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)",
 ]
 
 
@@ -114,16 +114,24 @@ class AgentDB:
         return self._conn
 
     def _run_migrations(self):
-        """运行缺失列的迁移。"""
+        """运行缺失列的迁移和索引创建。"""
         existing = {row[1] for row in self._conn.execute("PRAGMA table_info(papers)")}
         for sql in _MIGRATIONS:
-            col = sql.split("ADD COLUMN ")[1].split(" ")[0]
-            if col not in existing:
+            if "ADD COLUMN" in sql:
+                col = sql.split("ADD COLUMN ")[1].split(" ")[0]
+                if col not in existing:
+                    try:
+                        self._conn.execute(sql)
+                        logger.info(f"DB migration: {sql}")
+                    except Exception as e:
+                        logger.debug(f"Migration skipped: {e}")
+            else:
+                # 其他迁移语句（如 CREATE INDEX）——直接尝试执行
                 try:
                     self._conn.execute(sql)
-                    logger.info(f"DB migration: {sql}")
-                except Exception:
-                    pass
+                    logger.info(f"DB migration (ddl): {sql}")
+                except Exception as e:
+                    logger.debug(f"Migration skipped: {e}")
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

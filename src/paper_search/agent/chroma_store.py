@@ -155,3 +155,190 @@ class ChromaStore:
             return self.collection.count()
         except Exception:
             return 0
+
+
+class ChromaStoreV2:
+    """ChromaDB 双 Collection 版本 — 摘要索引 + 全文分块索引。
+
+    - papers_abstract: title + abstract → 快速论文筛选
+    - papers_fulltext: 章节分块文本 → 深度语义检索
+    两者通过 paper_id 关联到 SQLite 论文元数据。
+    """
+
+    COLLECTION_ABSTRACT = "papers_abstract"
+    COLLECTION_FULLTEXT = "papers_fulltext"
+
+    def __init__(self, persist_dir: Optional[Path] = None):
+        self.persist_dir = persist_dir or DEFAULT_CHROMA_PATH
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self._client = None
+        self._collections: dict[str, object] = {}
+
+    @property
+    def client(self):
+        if self._client is None:
+            import chromadb
+            self._client = chromadb.PersistentClient(path=str(self.persist_dir))
+        return self._client
+
+    def _get_collection(self, name: str) -> object:
+        """惰性获取或创建指定名称的 Collection。"""
+        if name not in self._collections:
+            try:
+                self._collections[name] = self.client.get_collection(name)
+            except Exception:
+                descriptions = {
+                    self.COLLECTION_ABSTRACT: "论文摘要向量索引 — 标题+摘要用于快速筛选",
+                    self.COLLECTION_FULLTEXT: "论文全文分块向量索引 — 章节级深度检索",
+                }
+                self._collections[name] = self.client.create_collection(
+                    name=name,
+                    metadata={"description": descriptions.get(name, "")},
+                )
+        return self._collections[name]
+
+    @property
+    def abstract_collection(self):
+        return self._get_collection(self.COLLECTION_ABSTRACT)
+
+    @property
+    def fulltext_collection(self):
+        return self._get_collection(self.COLLECTION_FULLTEXT)
+
+    # ── 摘要索引 ────────────────────────────────────────
+
+    def add_paper_abstract(self, paper_id: str, title: str, abstract: str,
+                           metadata: dict = None):
+        """将论文标题+摘要索引到 papers_abstract collection。"""
+        text = f"{title}\n{abstract or ''}"
+        meta = metadata or {}
+        meta["paper_id"] = paper_id
+        meta["title"] = title[:200]
+        try:
+            self.abstract_collection.add(
+                ids=[paper_id], documents=[text], metadatas=[meta]
+            )
+        except Exception as e:
+            logger.warning(f"ChromaDB abstract add 失败 ({paper_id}): {e}")
+
+    def add_abstracts_batch(self, items: list[dict]):
+        """批量添加摘要索引。
+
+        items: [{"paper_id": "...", "title": "...", "abstract": "...", ...}, ...]
+        """
+        if not items:
+            return
+        ids, docs, metas = [], [], []
+        for item in items:
+            pid = item["paper_id"]
+            title = item.get("title", "")
+            abstract = item.get("abstract", "") or ""
+            ids.append(pid)
+            docs.append(f"{title}\n{abstract}")
+            metas.append({
+                "paper_id": pid,
+                "title": title[:200],
+                "year": item.get("year"),
+                "source": item.get("source"),
+                "venue": item.get("venue"),
+            })
+        try:
+            self.abstract_collection.add(ids=ids, documents=docs, metadatas=metas)
+        except Exception as e:
+            logger.warning(f"ChromaDB abstract batch add 失败: {e}")
+
+    def search_abstract(self, query: str, n_results: int = 20) -> list[dict]:
+        """通过摘要语义搜索论文。"""
+        try:
+            results = self.abstract_collection.query(
+                query_texts=[query], n_results=n_results,
+            )
+            papers = []
+            if results and results.get("ids") and results["ids"][0]:
+                for i, pid in enumerate(results["ids"][0]):
+                    meta = results.get("metadatas", [[{}]])[0][i] if results.get("metadatas") else {}
+                    dist = results.get("distances", [[0]])[0][i] if results.get("distances") else 0
+                    papers.append({
+                        "paper_id": pid,
+                        "title": meta.get("title", ""),
+                        "distance": dist,
+                    })
+            return papers
+        except Exception as e:
+            logger.warning(f"ChromaDB abstract search 失败: {e}")
+            return []
+
+    # ── 全文分块索引 ────────────────────────────────────
+
+    def add_fulltext_chunks(self, chunks: list) -> int:
+        """将论文章节分块索引到 papers_fulltext collection。
+
+        Args:
+            chunks: Chunk 对象列表（来自 SectionChunker）。
+
+        Returns:
+            成功添加的块数量。
+        """
+        if not chunks:
+            return 0
+
+        ids, docs, metas = [], [], []
+        for c in chunks:
+            ids.append(c.id)
+            docs.append(f"# {c.section_title}\n\n{c.text}")
+            metas.append({
+                "paper_id": c.paper_id,
+                "section": c.section_title,
+                "level": c.section_level,
+                "chunk_index": c.chunk_index,
+                **c.metadata,
+            })
+
+        try:
+            self.fulltext_collection.add(ids=ids, documents=docs, metadatas=metas)
+            return len(chunks)
+        except Exception as e:
+            logger.warning(f"ChromaDB fulltext chunk add 失败: {e}")
+            return 0
+
+    def search_fulltext(self, query: str, paper_id: str = None,
+                        n_results: int = 10) -> list[dict]:
+        """在全文块中语义搜索。
+
+        Args:
+            query: 搜索查询。
+            paper_id: 可选，限定搜索某篇论文的块。
+            n_results: 返回结果数。
+        """
+        where_filter = {"paper_id": paper_id} if paper_id else None
+        try:
+            results = self.fulltext_collection.query(
+                query_texts=[query], n_results=n_results, where=where_filter,
+            )
+            chunks = []
+            if results and results.get("ids") and results["ids"][0]:
+                for i, cid in enumerate(results["ids"][0]):
+                    meta = results.get("metadatas", [[{}]])[0][i] if results.get("metadatas") else {}
+                    doc = results.get("documents", [[""]])[0][i] if results.get("documents") else ""
+                    chunks.append({
+                        "chunk_id": cid,
+                        "paper_id": meta.get("paper_id", ""),
+                        "section": meta.get("section", ""),
+                        "text": doc[:500],
+                    })
+            return chunks
+        except Exception as e:
+            logger.warning(f"ChromaDB fulltext search 失败: {e}")
+            return []
+
+    def count_abstract(self) -> int:
+        try:
+            return self.abstract_collection.count()
+        except Exception:
+            return 0
+
+    def count_fulltext(self) -> int:
+        try:
+            return self.fulltext_collection.count()
+        except Exception:
+            return 0
