@@ -169,21 +169,34 @@ class ResearchAgent:
                 if decision.new_sources:
                     sources = self._resolve_sources(decision.new_sources)
 
+            # ── Stage 3.5: 期刊分级 + 摘要提炼 ──────────
+            logger.info(f"[{project_id}] Stage 3.5: 元数据增强")
+            relevant_papers = [p for p, j in zip(all_papers, all_judgments) if j.is_relevant]
+            await self._enrich_metadata(project_id, relevant_papers, user_query)
+
             # ── Stage 4: PDF 下载 ────────────────────────
             logger.info(f"[{project_id}] Stage 4: PDF 下载")
-            relevant_papers = [p for p, j in zip(all_papers, all_judgments) if j.is_relevant]
             stats["downloaded"] = await self._download_all(project_id, relevant_papers, stats)
 
-            # ── Stage 5: 引用追踪 ────────────────────────
-            if enable_citation_chase and relevant_papers:
-                logger.info(f"[{project_id}] Stage 5: 引用追踪")
-                cited_papers = await self._citation_chase(project_id, relevant_papers, stats)
-                all_papers.extend(cited_papers)
+            # ── Stage 4.5: PDF→Markdown 转换 ────────────
+            logger.info(f"[{project_id}] Stage 4.5: PDF→Markdown")
+            await self._convert_pdfs(project_id, relevant_papers)
 
-            # ── Stage 6: 报告生成 ────────────────────────
-            logger.info(f"[{project_id}] Stage 6: 报告生成")
-            report = await self.llm.generate_report(user_query, all_papers, all_judgments)
-            report_path = self._save_report(project_id, report, all_papers, all_judgments, stats)
+            # ── Stage 5: 分块入库 ────────────────────────
+            logger.info(f"[{project_id}] Stage 5: Markdown分块入库")
+            await self._chunk_and_index(project_id, relevant_papers)
+
+            # ── Stage 6: Wiki + JSON + Survey ────────────
+            logger.info(f"[{project_id}] Stage 6: 结构化输出")
+            report_path = await self._generate_outputs(project_id, relevant_papers, all_judgments, user_query, stats)
+
+            # ── Stage 7: 引用追踪 (可选) ──────────────────
+            if enable_citation_chase and relevant_papers:
+                logger.info(f"[{project_id}] Stage 7: 引用追踪")
+                await self._citation_chase(project_id, relevant_papers, stats)
+
+            # ── Stage 8: 收尾 ───────────────────────────
+            logger.info(f"[{project_id}] Stage 8: 管道完成")
             self.db.update_project(
                 project_id,
                 status="completed",
@@ -197,14 +210,26 @@ class ResearchAgent:
             logger.info(f"[{project_id}] 完成: {stats['relevant']}/{stats['found']} 相关, "
                         f"{stats['downloaded']} PDF, {elapsed:.0f}s")
 
+            # 构建返回的论文摘要
+            paper_summaries = []
+            for p, j in zip(all_papers, all_judgments):
+                if j.is_relevant:
+                    pid = self.db._paper_id(p)
+                    # 从DB读取增强元数据
+                    enriched = self.db.conn.execute(
+                        "SELECT unified_level, reading_level, digest FROM papers WHERE id=?", (pid,)
+                    ).fetchone()
+                    paper_summaries.append({
+                        "title": p.title, "year": p.year, "source": p.source.value,
+                        "score": j.score, "reason": j.reason,
+                        "level": enriched["unified_level"] if enriched else None,
+                        "reading_level": enriched["reading_level"] if enriched else None,
+                    })
+
             return {
                 "project_id": project_id,
-                "report": report,
-                "papers": [
-                    {"title": p.title, "year": p.year, "source": p.source.value,
-                     "score": j.score, "reason": j.reason}
-                    for p, j in zip(all_papers, all_judgments) if j.is_relevant
-                ],
+                "report_path": str(report_path),
+                "papers": paper_summaries,
                 "stats": stats,
                 "report_path": str(report_path),
             }
@@ -372,6 +397,142 @@ class ResearchAgent:
             + "  url = {" + url + "}" + nl
             + "}"
         )
+
+    # ── Stage 3.5: 元数据增强 ─────────────────────────
+
+    async def _enrich_metadata(self, project_id: str, papers: list, user_query: str):
+        """期刊分级 + LLM摘要提炼 + 方法标签提取。"""
+        from .journal_ranker import JournalRanker
+        ranker = JournalRanker()
+
+        for p in papers:
+            pid = self.db._paper_id(p)
+            venue = p.venue or ""
+            level = ranker.rank(venue)
+            if level:
+                self.db.update_paper_meta(pid, unified_level=level)
+
+            # LLM提取摘要+方法标签（限制并发）
+            try:
+                digest_data = await self.llm.extract_digest(p, level)
+                self.db.update_paper_meta(
+                    pid,
+                    digest=json.dumps(digest_data.get("digest", []), ensure_ascii=False),
+                    reading_level=digest_data.get("reading_level", "skim"),
+                    method_tags=json.dumps(digest_data.get("method_tags", []), ensure_ascii=False),
+                    dataset_info=digest_data.get("dataset_info", ""),
+                )
+                # 缓存期刊分级
+                if level:
+                    self.db.upsert_journal_rank(venue, unified=level)
+            except Exception as e:
+                logger.warning(f"元数据增强失败 {p.title[:40]}: {e}")
+
+    # ── Stage 4.5: PDF→Markdown 转换 ──────────────────
+
+    async def _convert_pdfs(self, project_id: str, papers: list):
+        """将下载的PDF转为Markdown。"""
+        from .pdf_converter import PDFConverter
+        converter = PDFConverter()
+
+        md_dir = self.config.storage_dir / "markdown" / project_id
+        for p in papers:
+            pid = self.db._paper_id(p)
+            row = self.db.conn.execute(
+                "SELECT pdf_path FROM project_papers WHERE project_id=? AND paper_id=? AND pdf_downloaded=1",
+                (project_id, pid)
+            ).fetchone()
+            if not row or not row["pdf_path"]:
+                continue
+
+            pdf_path = Path(row["pdf_path"])
+            md_path = await converter.convert(pdf_path, md_dir)
+            if md_path:
+                self.db.update_paper_meta(pid, markdown_path=str(md_path))
+
+    # ── Stage 5: 分块入库 ────────────────────────────
+
+    async def _chunk_and_index(self, project_id: str, papers: list):
+        """将Markdown分块并装入ChromaDB。"""
+        from .chunker import SectionChunker
+        chunker = SectionChunker()
+
+        for p in papers:
+            pid = self.db._paper_id(p)
+            row = self.db.conn.execute(
+                "SELECT markdown_path FROM papers WHERE id=? AND markdown_path IS NOT NULL",
+                (pid,)
+            ).fetchone()
+            if not row:
+                continue
+
+            md_path = Path(row["markdown_path"])
+            if not md_path.exists():
+                continue
+
+            md_text = md_path.read_text(encoding="utf-8")
+            chunks = chunker.chunk(md_text, pid)
+            if chunks:
+                self.chroma.add_chunks(chunks)
+
+    # ── Stage 6: Wiki + JSON + Survey ────────────────
+
+    async def _generate_outputs(self, project_id: str, papers: list, judgments: list,
+                                user_query: str, stats: dict) -> Path:
+        """生成Wiki、JSON元数据、Survey报告。"""
+        from .wiki_generator import WikiGenerator
+
+        output_dir = self.config.storage_dir / "outputs" / project_id
+        wiki = WikiGenerator(self.llm)
+
+        # 构建增强的论文数据
+        papers_data = []
+        for p, j in zip(papers, judgments):
+            pid = self.db._paper_id(p)
+            enriched = self.db.conn.execute(
+                "SELECT unified_level, reading_level, digest, method_tags, dataset_info "
+                "FROM papers WHERE id=?", (pid,)
+            ).fetchone()
+            if not enriched:
+                continue
+
+            digest = enriched["digest"]
+            try:
+                digest = json.loads(digest) if digest else []
+            except Exception:
+                digest = [digest] if digest else []
+
+            papers_data.append({
+                "paper_id": pid,
+                "title": p.title,
+                "authors": p.authors,
+                "year": p.year,
+                "source": p.source.value,
+                "doi": p.doi,
+                "venue": p.venue,
+                "citation_count": p.citation_count,
+                "level": enriched["unified_level"],
+                "reading_level": enriched["reading_level"],
+                "one_liner": "",
+                "digest": digest,
+                "method_tags": enriched["method_tags"],
+                "dataset_info": enriched["dataset_info"],
+            })
+
+        if papers_data:
+            # JSON元数据
+            await wiki.export_metadata_json(papers_data, output_dir / "metadata.json")
+            # Wiki
+            await wiki.generate_wiki(papers_data, project_id, output_dir, user_query)
+
+        # LLM综述报告
+        report = await self.llm.generate_report(user_query, papers, judgments)
+        (output_dir / "survey.md").write_text(report, encoding="utf-8")
+
+        # 保存旧格式报告（兼容）
+        self._save_report(project_id, report, papers, judgments, stats)
+
+        return output_dir
 
     # ── 工具方法 ──────────────────────────────────────────
 
