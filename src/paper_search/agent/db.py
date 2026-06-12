@@ -91,6 +91,7 @@ _MIGRATIONS = [
     "ALTER TABLE papers ADD COLUMN dataset_info TEXT",
     "ALTER TABLE papers ADD COLUMN code_url TEXT",
     "ALTER TABLE papers ADD COLUMN markdown_path TEXT",
+    "ALTER TABLE papers ADD COLUMN pdf_path TEXT",
     "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)",
 ]
 
@@ -149,8 +150,8 @@ class AgentDB:
 
     # ── Project CRUD ─────────────────────────────────────
 
-    def create_project(self, user_query: str, parsed_intent: dict = None) -> str:
-        pid = str(uuid.uuid4())[:8]
+    def create_project(self, user_query: str, parsed_intent: dict = None, project_id: str = None) -> str:
+        pid = project_id or str(uuid.uuid4())[:8]
         self.conn.execute(
             "INSERT INTO projects (id, user_query, parsed_intent, created_at) VALUES (?,?,?,?)",
             (pid, user_query, json.dumps(parsed_intent, ensure_ascii=False) if parsed_intent else None, self._now()),
@@ -206,9 +207,14 @@ class AgentDB:
 
     def update_paper_meta(self, paper_id: str, **kwargs):
         """更新论文的增强元数据字段。"""
+        if not kwargs:
+            return
         sets = ", ".join(f"{k}=?" for k in kwargs)
-        vals = list(kwargs.values()) + [paper_id]
-        self.conn.execute(f"UPDATE papers SET {sets}, updated_at=? WHERE id=?", vals + [self._now()])
+        vals = list(kwargs.values())
+        self.conn.execute(
+            f"UPDATE papers SET {sets}, updated_at=? WHERE id=?",
+            vals + [self._now(), paper_id],
+        )
         self.conn.commit()
 
     # ── 期刊分级缓存 ─────────────────────────────────────

@@ -122,10 +122,8 @@ async def main():
             db.create_project(
                 user_query=query.effective_query(),
                 parsed_intent={"keywords": args.keywords, "sources": args.sources},
+                project_id=project_id,
             )
-            # 覆盖 ID 需要特殊处理，直接用 create_project 并忽略返回
-            _pid = db.create_project(query.effective_query())
-            project_id = _pid
 
     # 执行搜索（带 spinner）
     errors = []
