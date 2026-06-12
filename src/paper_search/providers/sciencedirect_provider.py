@@ -191,101 +191,96 @@ class ScienceDirectProvider(BaseProvider):
 
         return papers
 
-    # ── PDF 下载 ──────────────────────────────────────────
+    # ── PDF 下载 (官方 Article Retrieval API) ──────────────
+
+    # Elsevier Article Retrieval API 端点
+    ARTICLE_API = "https://api.elsevier.com/content/article/doi"
 
     async def resolve_pdf_url(self, paper: Paper) -> Optional[str]:
-        """尝试解析 ScienceDirect 论文的 PDF URL。
+        """通过 Elsevier Article Retrieval API 获取 PDF URL。
 
-        ScienceDirect PDF URL 模式:
-        https://www.sciencedirect.com/science/article/pii/{pii}/pdfft?isDTMRedir=true
+        官方文档: https://dev.elsevier.com/documentation/ArticleRetrievalAPI.wadl
+        端点: GET /content/article/doi/{DOI}?httpAccept=application/pdf
+
+        需要: API Key (免费注册) + 机构订阅（校内IP可下载全文）
         """
-        if paper.source_url and "science/article/pii/" in paper.source_url:
-            # 构造 PDF 下载 URL
-            return f"{paper.source_url}/pdfft?isDTMRedir=true&download=true"
+        if not paper.doi:
+            return None
+        if not self.config.elsevier_api_key:
+            logger.warning("ScienceDirect: 未设置 ELSEVIER_API_KEY")
+            return None
 
-        return None
+        return (
+            f"{self.ARTICLE_API}/{paper.doi}"
+            f"?APIKey={self.config.elsevier_api_key}"
+            f"&httpAccept=application/pdf"
+        )
 
     async def download_pdf(self, paper: Paper, target_dir: Path) -> Optional[Path]:
-        """下载 ScienceDirect 论文 PDF。
+        """通过官方 Article Retrieval API 下载 PDF。
 
-        优先直接 HTTP 下载（校内IP自动授权），失败则用 Playwright。
+        端点: GET /content/article/doi/{DOI}?httpAccept=application/pdf
+        权限: API Key + 机构订阅（校内IP）
         """
         from ..downloaders.filename_utils import build_pdf_filename, ensure_unique_path
+
+        if not paper.doi:
+            logger.warning("ScienceDirect: 无 DOI，无法下载")
+            return None
+        if not self.config.elsevier_api_key:
+            logger.warning("ScienceDirect: 未设置 API Key")
+            return None
 
         filename = build_pdf_filename(paper, naming_format="author_year_title")
         target_path = ensure_unique_path(target_dir / filename)
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 策略 1: 直接 HTTP 下载（校内IP下通常可用）
-        pdf_url = await self.resolve_pdf_url(paper)
-        if pdf_url:
-            from ..downloaders.http_downloader import HttpDownloader
-            downloader = HttpDownloader(config=self.config)
-            success = await downloader.download(pdf_url, target_path)
-            await downloader.close()
-            if success:
-                return target_path
-            logger.info("ScienceDirect: 直接下载失败，尝试 Playwright")
-
-        # 策略 2: Playwright 浏览器下载
-        if not paper.source_url:
-            logger.warning("ScienceDirect: 无 source_url，无法下载")
-            return None
-
-        return await self._playwright_download(paper.source_url, target_path)
-
-    async def _playwright_download(self, page_url: str, target_path: Path) -> Optional[Path]:
-        """通过 Playwright 下载 ScienceDirect PDF。"""
-        from ..downloaders.browser_downloader import CookieCache, PlaywrightDownloader
-
-        if self._cookie_cache is None:
-            self._cookie_cache = CookieCache(self.config.cookie_cache_dir)
-
-        cookies = self._cookie_cache.load("sciencedirect")
+        url = f"{self.ARTICLE_API}/{paper.doi}"
+        params = {
+            "APIKey": self.config.elsevier_api_key,
+            "httpAccept": "application/pdf",
+        }
 
         try:
-            async with PlaywrightDownloader(headless=True) as dl:
-                result = await dl.download(
-                    url=page_url,
-                    target_path=target_path,
-                    auth_cookies=cookies,
-                    pdf_selector=(
-                        'a[href*="pdfft"], '
-                        'a[href*="/pdf/"], '
-                        'a.pdf-download-link, '
-                        'a.download-pdf-link, '
-                        'a[aria-label*="PDF"], '
-                        'a.link.pdf-link'
-                    ),
-                )
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=60.0,
+                headers={"Accept": "application/pdf"},
+            ) as client:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
 
-                if result:
-                    saved_path, new_cookies = result
-                    if new_cookies:
-                        self._cookie_cache.save("sciencedirect", new_cookies)
-                    return saved_path
-
-                # Cookie 过期重试
-                if cookies:
-                    logger.info("ScienceDirect: Cookie 可能过期，清除缓存重试")
-                    self._cookie_cache.clear("sciencedirect")
-                    async with PlaywrightDownloader(headless=True) as dl2:
-                        result2 = await dl2.download(
-                            url=page_url,
-                            target_path=target_path,
-                            auth_cookies=None,
-                            pdf_selector='a[href*="pdfft"], a[href*="pdf"], a.download-pdf-link',
+                content = resp.content
+                if len(content) >= 4 and content[:4] == b"%PDF":
+                    target_path.write_bytes(content)
+                    logger.info(
+                        f"ScienceDirect PDF: {target_path} ({len(content)/1024:.0f} KB)"
+                    )
+                    return target_path
+                else:
+                    # 可能返回的是 XML 错误（无权限）
+                    text = content.decode("utf-8", errors="replace")[:200]
+                    if "service-error" in text.lower() or "quota" in text.lower():
+                        logger.warning(
+                            f"ScienceDirect: 无全文权限 (DOI: {paper.doi})"
                         )
-                        if result2:
-                            saved_path2, new_cookies2 = result2
-                            if new_cookies2:
-                                self._cookie_cache.save("sciencedirect", new_cookies2)
-                            return saved_path2
+                    else:
+                        logger.warning(f"ScienceDirect: 非 PDF 响应: {text[:100]}")
+                    return None
 
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                logger.warning(
+                    f"ScienceDirect: 403 无权限或超出配额 (DOI: {paper.doi})"
+                )
+            elif e.response.status_code == 401:
+                logger.warning("ScienceDirect: 401 API Key 无效")
+            else:
+                logger.error(f"ScienceDirect PDF HTTP {e.response.status_code}")
+            return None
         except Exception as e:
-            logger.error(f"ScienceDirect Playwright 下载异常: {e}")
-
-        return None
+            logger.error(f"ScienceDirect PDF 异常: {e}")
+            return None
 
     # ── 健康检查 ──────────────────────────────────────────
 
