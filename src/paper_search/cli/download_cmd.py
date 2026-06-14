@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="arxiv",
         help="来源 (默认: arxiv, 当 paper_id 不含前缀时必须指定)",
     )
-    add_output_dir_arg(parser, default="~/papers")
+    add_output_dir_arg(parser)
     add_project_id_arg(parser)
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
     return parser

@@ -4,9 +4,11 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from ..config import get_chroma_path
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_CHROMA_PATH = Path("~/.paper_search/chroma").expanduser()
+DEFAULT_CHROMA_PATH = get_chroma_path()
 
 
 class ChromaStore:

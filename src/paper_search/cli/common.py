@@ -183,7 +183,10 @@ def add_project_id_arg(parser: argparse.ArgumentParser):
     )
 
 
-def add_output_dir_arg(parser: argparse.ArgumentParser, default: str = "~/papers"):
+def add_output_dir_arg(parser: argparse.ArgumentParser, default: str = None):
+    if default is None:
+        from ..config import get_papers_dir
+        default = str(get_papers_dir())
     parser.add_argument(
         "--output-dir", "-o", type=str, default=default,
         help=f"输出目录 (默认: {default})",

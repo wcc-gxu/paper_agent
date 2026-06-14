@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from ..config import get_db_path
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = Path("~/.paper_search/agent.db").expanduser()
+DEFAULT_DB_PATH = get_db_path()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -76,10 +78,61 @@ CREATE TABLE IF NOT EXISTS journal_ranks (
     updated_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS citations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_paper_id TEXT NOT NULL,
+    target_paper_id TEXT,
+    target_title TEXT NOT NULL,
+    target_doi TEXT,
+    target_year INTEGER,
+    relation_type TEXT NOT NULL DEFAULT 'references',
+    confidence REAL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (source_paper_id) REFERENCES papers(id)
+);
+
+CREATE TABLE IF NOT EXISTS agent_tasks (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    user_query TEXT NOT NULL,
+    plan_json TEXT,
+    plan_markdown TEXT,
+    status TEXT DEFAULT 'pending',
+    current_step INTEGER DEFAULT 0,
+    total_steps INTEGER DEFAULT 0,
+    max_steps INTEGER DEFAULT 50,
+    total_tokens_used INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES agent_tasks(id),
+    step_index INTEGER NOT NULL,
+    step_name TEXT,
+    action TEXT NOT NULL,
+    tool_name TEXT,
+    tool_args TEXT,
+    result_summary TEXT,
+    status TEXT DEFAULT 'pending',
+    metrics TEXT DEFAULT '{}',
+    llm_assessment TEXT,
+    retry_count INTEGER DEFAULT 0,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE(task_id, step_index)
+);
+
 CREATE INDEX IF NOT EXISTS idx_papers_doi ON papers(doi);
 CREATE INDEX IF NOT EXISTS idx_papers_source ON papers(source);
 CREATE INDEX IF NOT EXISTS idx_project_papers_project ON project_papers(project_id);
 CREATE INDEX IF NOT EXISTS idx_search_logs_project ON search_logs(project_id);
+CREATE INDEX IF NOT EXISTS idx_citations_source ON citations(source_paper_id);
+CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_paper_id);
+CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks(session_id);
+CREATE INDEX IF NOT EXISTS idx_task_steps_task ON task_steps(task_id);
 """
 
 # 运行时迁移：为旧 papers 表添加新列
@@ -279,6 +332,150 @@ class AgentDB:
             (project_id, round_num, source, query, results_count, error, duration_ms, self._now()),
         )
         self.conn.commit()
+
+    # ── 引用关系管理 ─────────────────────────────────────
+
+    def add_citation(self, source_paper_id: str, target_title: str,
+                     target_paper_id: str = None, target_doi: str = None,
+                     target_year: int = None, relation_type: str = "references",
+                     confidence: float = 1.0):
+        """添加引用关系."""
+        self.conn.execute(
+            """INSERT OR IGNORE INTO citations
+               (source_paper_id, target_paper_id, target_title, target_doi,
+                target_year, relation_type, confidence, created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (source_paper_id, target_paper_id, target_title, target_doi,
+             target_year, relation_type, confidence, self._now()),
+        )
+        self.conn.commit()
+
+    def get_citations(self, paper_id: str, relation_type: str = None,
+                      direction: str = "outgoing") -> list[dict]:
+        """获取论文的引用关系.
+
+        Args:
+            paper_id: 论文 ID
+            relation_type: 过滤关系类型
+            direction: "outgoing" (这篇引用了谁) | "incoming" (谁引用了这篇)
+        """
+        if direction == "outgoing":
+            where = "source_paper_id = ?"
+            params = [paper_id]
+        else:
+            where = "target_paper_id = ?"
+            params = [paper_id]
+
+        if relation_type:
+            where += " AND relation_type = ?"
+            params.append(relation_type)
+
+        rows = self.conn.execute(
+            f"SELECT * FROM citations WHERE {where} ORDER BY target_year DESC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_citation_count(self, paper_id: str) -> dict:
+        """获取论文的引用统计."""
+        outgoing = self.conn.execute(
+            "SELECT COUNT(*) FROM citations WHERE source_paper_id = ?", (paper_id,)
+        ).fetchone()[0]
+        incoming = self.conn.execute(
+            "SELECT COUNT(*) FROM citations WHERE target_paper_id = ?", (paper_id,)
+        ).fetchone()[0]
+        return {"outgoing": outgoing, "incoming": incoming}
+
+    # ── Agent 任务管理 ────────────────────────────────────
+
+    def create_agent_task(self, task_id: str, user_query: str,
+                          session_id: str = None, max_steps: int = 50) -> str:
+        """创建 Agent 任务."""
+        now = self._now()
+        self.conn.execute(
+            """INSERT INTO agent_tasks
+               (id, session_id, user_query, status, max_steps, created_at, updated_at)
+               VALUES (?,?,?,'pending',?,?,?)""",
+            (task_id, session_id, user_query, max_steps, now, now),
+        )
+        self.conn.commit()
+        return task_id
+
+    def update_agent_task(self, task_id: str, **kwargs):
+        """更新 Agent 任务状态."""
+        kwargs["updated_at"] = self._now()
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [task_id]
+        self.conn.execute(f"UPDATE agent_tasks SET {sets} WHERE id=?", vals)
+        self.conn.commit()
+
+    def get_agent_task(self, task_id: str) -> Optional[dict]:
+        """获取 Agent 任务."""
+        row = self.conn.execute(
+            "SELECT * FROM agent_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_agent_tasks(self, session_id: str = None, limit: int = 20) -> list[dict]:
+        """列出 Agent 任务."""
+        if session_id:
+            rows = self.conn.execute(
+                "SELECT * FROM agent_tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM agent_tasks ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── 任务步骤管理 ──────────────────────────────────────
+
+    def add_task_step(self, task_id: str, step_index: int, step_name: str,
+                      action: str, tool_name: str = None, tool_args: dict = None) -> int:
+        """添加任务步骤."""
+        now = self._now()
+        self.conn.execute(
+            """INSERT OR REPLACE INTO task_steps
+               (task_id, step_index, step_name, action, tool_name, tool_args, status, started_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (task_id, step_index, step_name, action, tool_name,
+             json.dumps(tool_args, ensure_ascii=False) if tool_args else None,
+             "in_progress", now),
+        )
+        self.conn.commit()
+        return step_index
+
+    def update_task_step(self, task_id: str, step_index: int, **kwargs):
+        """更新任务步骤."""
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values())
+        if "completed_at" not in kwargs and kwargs.get("status") in ("done", "failed", "skipped"):
+            kwargs["completed_at"] = self._now()
+            sets += ", completed_at=?"
+            vals.append(kwargs["completed_at"])
+        self.conn.execute(
+            f"UPDATE task_steps SET {sets} WHERE task_id = ? AND step_index = ?",
+            vals + [task_id, step_index],
+        )
+        self.conn.commit()
+
+    def get_task_steps(self, task_id: str) -> list[dict]:
+        """获取任务的所有步骤."""
+        rows = self.conn.execute(
+            "SELECT * FROM task_steps WHERE task_id = ? ORDER BY step_index",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_task_step(self, task_id: str, step_index: int) -> Optional[dict]:
+        """获取指定步骤."""
+        row = self.conn.execute(
+            "SELECT * FROM task_steps WHERE task_id = ? AND step_index = ?",
+            (task_id, step_index),
+        ).fetchone()
+        return dict(row) if row else None
 
     def close(self):
         if self._conn:

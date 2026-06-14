@@ -98,8 +98,8 @@ async def main():
             db.conn.commit()
 
             try:
-                from pathlib import Path
-                chroma_dir = Path("~/.paper_search/chroma").expanduser()
+                from ..config import get_chroma_path
+                chroma_dir = get_chroma_path()
                 if chroma_dir.exists():
                     import shutil
                     shutil.rmtree(chroma_dir, ignore_errors=True)

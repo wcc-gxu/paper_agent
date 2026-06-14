@@ -18,7 +18,7 @@ from typing import Annotated, Optional
 from fastmcp import FastMCP
 from pydantic import Field
 
-from ..config import Config
+from ..config import Config, get_papers_dir, get_markdown_dir, get_outputs_dir
 from ..engine import PaperSearchEngine
 from ..models import SearchQuery, SourceType
 
@@ -151,7 +151,7 @@ async def download_paper(
     paper_id: Annotated[Optional[str], Field(description="论文 DB ID（如已知，优先使用）")] = None,
     doi: Annotated[Optional[str], Field(description="论文 DOI")] = None,
     project_id: Annotated[Optional[str], Field(description="关联的项目 ID")] = None,
-    output_dir: Annotated[str, Field(description="下载目录，默认 ~/papers")] = "~/papers",
+    output_dir: Annotated[str, Field(description="下载目录")] = "",
 ) -> str:
     """下载单篇论文的 PDF 文件到本地。
 
@@ -162,7 +162,7 @@ async def download_paper(
     db = _get_db()
 
     source_type = SourceType(source.strip().lower())
-    target_dir = Path(output_dir).expanduser().resolve()
+    target_dir = Path(output_dir or str(get_papers_dir())).expanduser().resolve()
 
     paper = None
     p_id = paper_id
@@ -430,6 +430,373 @@ async def citation_chase(
             citations_info["error"] = str(e)
 
     return json.dumps(citations_info, ensure_ascii=False, indent=2)
+
+
+# ── 转换/索引/评估/排名/综述 MCP Tools ──────────────────────
+
+
+@mcp.tool()
+async def convert_paper(
+    paper_id: Annotated[Optional[str], Field(description="论文唯一 ID（从 DB 查找 PDF 路径）")] = None,
+    pdf_path: Annotated[Optional[str], Field(description="PDF 文件路径（直接指定）")] = None,
+    project_id: Annotated[Optional[str], Field(description="项目 ID（与 --all 配合批量转换）")] = None,
+    all: Annotated[bool, Field(description="批量转换项目下所有已下载 PDF")] = False,
+    output_dir: Annotated[str, Field(description="输出目录")] = "",
+    max_concurrent: Annotated[int, Field(description="最大并发转换数")] = 2,
+) -> str:
+    """PDF 转 Markdown — 使用 pymupdf4llm 将论文 PDF 转为结构化 Markdown。
+
+    支持单篇转换（--paper-id / --pdf-path）和批量转换（--project-id --all）。
+    """
+    import asyncio
+    import time
+    from pathlib import Path
+    from ..agent.pdf_converter import PDFConverter
+
+    db = _get_db()
+    out_dir = Path(output_dir or str(get_markdown_dir())).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    converter = PDFConverter(max_concurrent=max_concurrent)
+    pdf_tasks = []
+
+    if project_id and all:
+        rows = db.conn.execute(
+            """SELECT p.id, p.title, pp.pdf_path FROM papers p
+               JOIN project_papers pp ON p.id = pp.paper_id
+               WHERE pp.project_id = ? AND pp.pdf_downloaded = 1
+               AND pp.pdf_path IS NOT NULL""",
+            (project_id,),
+        ).fetchall()
+        for row in rows:
+            rd = dict(row)
+            ppath = Path(rd.get("pdf_path", ""))
+            if ppath.exists():
+                existing = db.conn.execute(
+                    "SELECT markdown_path FROM papers WHERE id=?", (rd["id"],)
+                ).fetchone()
+                if existing and existing["markdown_path"] and Path(existing["markdown_path"]).exists():
+                    continue
+                pdf_tasks.append((ppath, rd["id"]))
+    elif paper_id:
+        row = db.conn.execute("SELECT id, title FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if row is None:
+            return json.dumps({"success": False, "error": f"论文不存在: {paper_id}"}, ensure_ascii=False)
+        pp = db.conn.execute(
+            "SELECT pdf_path FROM project_papers WHERE paper_id=? AND pdf_downloaded=1",
+            (paper_id,),
+        ).fetchone()
+        pdf_path_str = pp["pdf_path"] if pp else None
+        if not pdf_path_str:
+            return json.dumps({"success": False, "error": f"论文尚未下载 PDF: {paper_id}"}, ensure_ascii=False)
+        ppath = Path(pdf_path_str)
+        if not ppath.exists():
+            return json.dumps({"success": False, "error": f"PDF 文件不存在: {pdf_path_str}"}, ensure_ascii=False)
+        pdf_tasks.append((ppath, paper_id))
+    elif pdf_path:
+        ppath = Path(pdf_path).expanduser().resolve()
+        if not ppath.exists():
+            return json.dumps({"success": False, "error": f"文件不存在: {pdf_path}"}, ensure_ascii=False)
+        pdf_tasks.append((ppath, ppath.stem))
+    else:
+        return json.dumps({"success": False, "error": "请指定 --paper-id, --pdf-path 或 --project-id --all"}, ensure_ascii=False)
+
+    if not pdf_tasks:
+        return json.dumps({"success": True, "converted": 0, "message": "没有需要转换的 PDF"}, ensure_ascii=False)
+
+    results = []
+    for ppath, pid in pdf_tasks:
+        t0 = time.time()
+        md_path = await converter.convert(ppath, out_dir)
+        elapsed = time.time() - t0
+        r = {
+            "paper_id": pid,
+            "pdf_path": str(ppath),
+            "markdown_path": str(md_path) if md_path else None,
+            "success": md_path is not None,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+        if r["success"] and pid:
+            db.update_paper_meta(pid, markdown_path=str(md_path))
+        results.append(r)
+
+    success = sum(1 for r in results if r["success"])
+    return json.dumps({
+        "success": True, "converted": success, "failed": len(results) - success, "results": results,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def index_paper(
+    paper_id: Annotated[Optional[str], Field(description="论文唯一 ID")] = None,
+    project_id: Annotated[Optional[str], Field(description="项目 ID（与 --all 配合批量索引）")] = None,
+    all: Annotated[bool, Field(description="批量索引项目下所有已转换论文")] = False,
+    index_type: Annotated[str, Field(description="索引类型: abstract(摘要), fulltext(全文分块), both(两者)")] = "both",
+) -> str:
+    """论文索引入库 — 摘要 + 全文分块 → ChromaDB 双 Collection。
+
+    索引到 papers_abstract (快速筛选) 和 papers_fulltext (深度检索) 两个 Collection。
+    """
+    import time
+    from pathlib import Path
+    from ..agent.chroma_store import ChromaStoreV2
+    from ..agent.chunker import SectionChunker
+
+    db = _get_db()
+    store = ChromaStoreV2()
+
+    paper_ids = []
+    if paper_id:
+        paper_ids = [paper_id]
+    elif project_id and all:
+        rows = db.conn.execute(
+            """SELECT p.id FROM papers p
+               JOIN project_papers pp ON p.id = pp.paper_id
+               WHERE pp.project_id = ? AND p.markdown_path IS NOT NULL""",
+            (project_id,),
+        ).fetchall()
+        paper_ids = [dict(r)["id"] for r in rows]
+    else:
+        return json.dumps({"success": False, "error": "请指定 --paper-id 或 --project-id --all"}, ensure_ascii=False)
+
+    if not paper_ids:
+        return json.dumps({"success": True, "indexed": 0, "message": "没有需要索引的论文"}, ensure_ascii=False)
+
+    t0 = time.time()
+    results = []
+    for pid in paper_ids:
+        row = db.conn.execute("SELECT * FROM papers WHERE id=?", (pid,)).fetchone()
+        if row is None:
+            results.append({"paper_id": pid, "success": False, "error": "论文不存在"})
+            continue
+        rd = dict(row)
+        r = {"paper_id": pid, "title": rd.get("title", "")}
+
+        if index_type in ("abstract", "both"):
+            title = rd.get("title", "")
+            abstract = rd.get("abstract", "") or ""
+            if title or abstract:
+                store.add_paper_abstract(
+                    paper_id=pid, title=title, abstract=abstract,
+                    metadata={"year": rd.get("year"), "source": rd.get("source"), "venue": rd.get("venue")},
+                )
+                r["abstract_indexed"] = True
+            else:
+                r["abstract_indexed"] = False
+
+        if index_type in ("fulltext", "both"):
+            md_path = rd.get("markdown_path")
+            if md_path and Path(md_path).exists():
+                md_text = Path(md_path).read_text(encoding="utf-8")
+                chunks = SectionChunker().chunk(md_text, pid)
+                if chunks:
+                    count = store.add_fulltext_chunks(chunks)
+                    r["fulltext_chunks"] = count
+                    r["fulltext_indexed"] = True
+                else:
+                    r["fulltext_chunks"] = 0
+                    r["fulltext_indexed"] = False
+            else:
+                r["fulltext_indexed"] = False
+
+        r["success"] = r.get("abstract_indexed") or r.get("fulltext_indexed")
+        if r["success"]:
+            db.update_paper_meta(pid, embedding_id=f"chroma:{pid}")
+        results.append(r)
+
+    success = sum(1 for r in results if r["success"])
+    elapsed = time.time() - t0
+    return json.dumps({
+        "success": True, "indexed": success, "total": len(results),
+        "elapsed_seconds": round(elapsed, 2), "results": results,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def evaluate_papers(
+    project_id: Annotated[str, Field(description="项目 ID")],
+    query: Annotated[str, Field(description="原始搜索意图（用于判断相关性）")] = "",
+    paper_ids: Annotated[Optional[str], Field(description="要评估的 paper_id 列表（逗号分隔）")] = None,
+    all: Annotated[bool, Field(description="评估项目下所有未评估的论文")] = False,
+    max_concurrent: Annotated[int, Field(description="最大并发 LLM 调用数")] = 5,
+) -> str:
+    """LLM 批量评估论文相关性 — 使用 LLM 对每篇论文打分 (0-1)。
+
+    更新 DB 中的 relevance_score 和 relevance_reason。
+    """
+    import asyncio
+    import time
+
+    db = _get_db()
+    project = db.get_project(project_id)
+    if project is None:
+        return json.dumps({"success": False, "error": f"项目不存在: {project_id}"}, ensure_ascii=False)
+
+    user_query = query or project.get("user_query", "")
+
+    if paper_ids:
+        pids = [p.strip() for p in paper_ids.split(",")]
+        papers = []
+        for pid in pids:
+            row = db.conn.execute("SELECT * FROM papers WHERE id=?", (pid,)).fetchone()
+            if row:
+                papers.append(dict(row))
+    else:
+        papers = db.get_project_papers(project_id)
+        if all:
+            papers = [p for p in papers if p.get("relevance_score", 0.5) == 0.5 and p.get("relevance_reason", "") == ""]
+
+    if not papers:
+        return json.dumps({"success": True, "evaluated": 0, "message": "没有需要评估的论文"}, ensure_ascii=False)
+
+    from ..agent.llm_client import LLMClient
+    llm = LLMClient()
+    sem = asyncio.Semaphore(max_concurrent)
+    t0 = time.time()
+
+    async def evaluate_one(p):
+        async with sem:
+            try:
+                # Evaluate using title+abstract
+                title = p.get("title", "")
+                abstract = p.get("abstract", "") or ""
+                result = await llm._chat_json(
+                    llm.RELEVANCE_SYSTEM_PROMPT,
+                    f"用户研究需求: {user_query}\n\n论文标题: {title}\n摘要: {abstract[:500]}\n",
+                )
+                score = float(result.get("score", 0.5))
+                reason = result.get("reason", "")
+                return {
+                    "paper_id": p["id"], "title": title[:80], "score": score,
+                    "reason": reason, "is_relevant": score >= 0.5, "success": True,
+                }
+            except Exception as e:
+                return {
+                    "paper_id": p["id"], "title": p.get("title", "")[:80],
+                    "score": 0.5, "reason": f"评估失败: {e}", "is_relevant": True,
+                    "success": False, "error": str(e),
+                }
+
+    tasks = [evaluate_one(p) for p in papers]
+    results = await asyncio.gather(*tasks)
+
+    for r in results:
+        db.link_paper_to_project(project_id, r["paper_id"],
+                                 relevance_score=r["score"],
+                                 relevance_reason=(r.get("reason") or "")[:500])
+
+    elapsed = time.time() - t0
+    relevant = sum(1 for r in results if r.get("is_relevant"))
+    return json.dumps({
+        "success": True, "project_id": project_id, "evaluated": len(results),
+        "relevant": relevant, "irrelevant": len(results) - relevant,
+        "elapsed_seconds": round(elapsed, 2), "results": results,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def rank_papers(
+    project_id: Annotated[Optional[str], Field(description="项目 ID")] = None,
+    paper_id: Annotated[Optional[str], Field(description="单篇论文 ID")] = None,
+    all: Annotated[bool, Field(description="评定项目下所有论文")] = False,
+) -> str:
+    """期刊等级评定 — CCF / SCI 分级，统一为 A+ / A / B / C。
+
+    将等级缓存到 journal_ranks 表并更新论文的 unified_level。
+    """
+    db = _get_db()
+    from ..agent.journal_ranker import JournalRanker
+    ranker = JournalRanker()
+
+    papers = []
+    if paper_id:
+        row = db.conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+        if row is None:
+            return json.dumps({"success": False, "error": f"论文不存在: {paper_id}"}, ensure_ascii=False)
+        papers = [dict(row)]
+    elif project_id and all:
+        papers = db.get_project_papers(project_id)
+    else:
+        return json.dumps({"success": False, "error": "请指定 --paper-id 或 --project-id --all"}, ensure_ascii=False)
+
+    results = []
+    for p in papers:
+        venue = p.get("venue", "")
+        if not venue:
+            results.append({"paper_id": p["id"], "title": p.get("title", "")[:60], "venue": None, "level": None})
+            continue
+        level = ranker.rank(venue)
+        if level:
+            db.upsert_journal_rank(venue, unified=level)
+            db.update_paper_meta(p["id"], unified_level=level)
+        results.append({
+            "paper_id": p["id"], "title": p.get("title", "")[:60],
+            "venue": venue, "level": level,
+        })
+
+    levels = {"A+": 0, "A": 0, "B": 0, "C": 0, None: 0}
+    for r in results:
+        lvl = r["level"]
+        levels[lvl] = levels.get(lvl, 0) + 1
+
+    return json.dumps({
+        "success": True, "total": len(results),
+        "distribution": {k: v for k, v in levels.items() if v > 0},
+        "results": results,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def generate_survey(
+    project_id: Annotated[str, Field(description="项目 ID")],
+    output: Annotated[Optional[str], Field(description="输出文件路径")] = None,
+) -> str:
+    """生成 AI 文献综述报告 — 使用 LLM 为项目生成结构化综述 Markdown。
+
+    包含搜索概况、关键论文、研究方向分类、建议等。
+    """
+    from pathlib import Path
+
+    db = _get_db()
+    project = db.get_project(project_id)
+    if project is None:
+        return json.dumps({"success": False, "error": f"项目不存在: {project_id}"}, ensure_ascii=False)
+
+    user_query = project.get("user_query", "")
+    papers = db.get_project_papers(project_id, relevant_only=True)
+    if not papers:
+        papers = db.get_project_papers(project_id)
+
+    if not papers:
+        return json.dumps({"success": False, "error": "项目下没有论文"}, ensure_ascii=False)
+
+    from ..agent.llm_client import LLMClient
+    llm = LLMClient()
+
+    # 构建论文摘要列表
+    paper_items = []
+    for p in papers[:50]:
+        paper_items.append(
+            f"- [{p.get('relevance_score', 0.5):.2f}] {p['title']} "
+            f"({p.get('year', '?')}) | {p.get('source', '')} | {p.get('venue', '')}"
+        )
+
+    report = await llm.generate_report(user_query, papers, judgments=[])
+
+    # 保存报告
+    out_path = Path(output) if output else get_outputs_dir(project_id) / "survey.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(report, encoding="utf-8")
+
+    # 更新项目
+    db.update_project(project_id, report_path=str(out_path), status="completed")
+
+    return json.dumps({
+        "success": True, "project_id": project_id,
+        "papers_included": min(len(papers), 50),
+        "report_path": str(out_path),
+        "report_preview": report[:1000] + "..." if len(report) > 1000 else report,
+    }, ensure_ascii=False, indent=2)
 
 
 # ── 直接运行入口 ──────────────────────────────────────────

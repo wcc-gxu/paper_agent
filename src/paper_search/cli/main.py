@@ -376,10 +376,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="来源 (arxiv, semantic_scholar, pubmed, cnki, ieee, sciencedirect)",
     )
+    from ..config import get_papers_dir
     p_dl.add_argument(
         "--output", "-o",
-        default="~/papers",
-        help="下载目录 (默认: ~/papers)",
+        default=str(get_papers_dir()),
+        help=f"下载目录 (默认: {get_papers_dir()})",
     )
     p_dl.set_defaults(func=cmd_download)
 

@@ -19,6 +19,8 @@ paper-status = "paper_search.cli.status_cmd:main"
 paper-clean = "paper_search.cli.clean_cmd:main"
 # 保留旧入口（向后兼容）
 paper-search-legacy = "paper_search.cli.main:main"
+# API Server
+paper-agent-api = "paper_search.api.app:main"
 
 [project.optional-dependencies]
 # MCP Server
@@ -30,6 +32,8 @@ pubmed = ["biopython>=1.83", "metapub>=0.6"]
 playwright = ["playwright>=1.40"]
 # CLI output formatting
 rich = ["rich>=13"]
+# Web API
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 # CAPTCHA handling (CNKI)
 ocr = ["pytesseract>=0.3"]
 # All deps
@@ -43,6 +47,8 @@ all = [
     "playwright>=1.40",
     "rich>=13",
     "pytesseract>=0.3",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
 ]
 
 [build-system]

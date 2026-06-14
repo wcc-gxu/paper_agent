@@ -43,8 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all", action="store_true",
                         help="批量转换项目下所有已下载 PDF")
     # 输出
-    add_output_dir_arg(parser,
-                       default="~/papers/markdown")
+    from ..config import get_markdown_dir
+    add_output_dir_arg(parser, default=str(get_markdown_dir()))
     parser.add_argument("--max-concurrent", type=int, default=2,
                         help="最大并发转换数 (默认: 2)")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细输出")
