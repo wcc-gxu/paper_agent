@@ -59,6 +59,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec --save 900 1
     volumes:
       - redis_data:/data
     healthcheck:
@@ -297,4 +298,4 @@ rsync -av /papers/ ~/backups/papers/
 
 ---
 
-> 版本: v1.1 | 新增结构化 JSON 日志与 task 独立日志
+> 版本: v1.2 | Redis AOF 持久化 + 多供应商 Embedding 可插拔

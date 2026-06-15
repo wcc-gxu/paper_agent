@@ -25,8 +25,12 @@
               │  │  Plan Graph + Execute Graph  │   │
               │  └──────────────────────────────┘   │
               │  ┌──────────────────────────────┐   │
-              │  │  子Agent (asyncio 协程)       │   │
-              │  │  编排入库全流程 + 进度收集    │   │
+              │  │  AgentRegistry (7 种子Agent)   │   │
+              │  │  IngestAgent / RADQueryAgent  │   │
+              │  │  ClusteringAgent /            │   │
+              │  │  CitationChaseAgent /         │   │
+              │  │  HistoryAgent /               │   │
+              │  │  TranslationAgent             │   │
               │  └──────────────────────────────┘   │
               │  ┌──────────────────────────────┐   │
               │  │  TaskLogger (JSON 日志)       │   │
@@ -56,7 +60,8 @@
                            │          │  (tasks/)   │
                     ┌──────┴──────┐   └─────────────┘
                     │  Providers  │
-                    │  (6 来源)   │
+                    │  S2(P0) +  │
+                    │  6降级来源  │
                     │  Engine     │
                     └─────────────┘
 ```
@@ -121,71 +126,58 @@ plan_graph.add_conditional_edges("await_approval", user_approved, {
     "yes": "execute_plan",
     "no": END
 })
-plan_graph.add_edge("execute_plan", END)
-```
-
-### 3.2 Execute Graph（逐步执行子图）
-
-```python
-execute_graph = StateGraph(ResearchState)
-
-execute_graph.add_node("tool_execute", tool_execute_node)      # LLM + ToolNode
-execute_graph.add_node("collect_metrics", collect_metrics_node) # 纯函数
-execute_graph.add_node("verify_quality", verify_quality_node)   # LLM
-execute_graph.add_node("adjust_strategy", adjust_strategy_node) # LLM
-execute_graph.add_node("alert_user", interrupt_node)            # 暂停求助
-execute_graph.add_node("summarize", summarize_node)             # LLM
-
-execute_graph.add_edge(START, "tool_execute")
-execute_graph.add_edge("tool_execute", "collect_metrics")
-execute_graph.add_edge("collect_metrics", "verify_quality")
-
-execute_graph.add_conditional_edges("verify_quality", decide_after_verify, {
-    "pass": "next_step_or_done",
-    "retry": "adjust_strategy",
-    "fail": "alert_user"
+plan_graph.add_node("overall_evaluate", overall_evaluate_node)  # LLM
+plan_graph.add_edge("execute_plan", "overall_evaluate")
+plan_graph.add_conditional_edges("overall_evaluate", decide_overall, {
+    "satisfied": END,
+    "adjust": "generate_plan",        # ← 策略调整循环
 })
-execute_graph.add_edge("adjust_strategy", "tool_execute")  # 重试循环
-execute_graph.add_edge("alert_user", "next_step_or_done")
 ```
 
-### 3.3 ResearchState
+### 3.2 Execute Graph — 每个子 Agent 独立定义
+
+不再使用单一 Execute Graph。每个子 Agent 有自己的 StateGraph：
+
+| Sub Agent | Graph 类型 | 节点数 | 特点 |
+|-----------|-----------|--------|------|
+| **IngestAgent** | 线性 Execute Graph | 7 节点 | search→evaluate→download→convert→index→rank→survey，无条件分支，每阶段自动 checkpoint |
+| **RADQueryAgent** | 动态 Execute Graph | 5 节点 | parse→route→search→evaluate(refine loop)→format，条件分支+迭代循环 |
+| **ClusteringAgent** | 线性 Execute Graph | 5 节点 | load→cluster→label→visualize→detect，无条件分支 |
+| **CitationChaseAgent** | 动态 Execute Graph | 7 节点 | resolve→check→fetch(evaluate parallel)→filter→ingest(parallel)→decide(loop)→summarize |
+| **HistoryAgent** | Plan Graph + Execute Graph | 2+4 节点 | Plan: analyze→generate_plan；Execute: archive→merge→skip→notify |
+| **TranslationAgent** | 无 Graph | — | 工具型 Agent，直接调用：build_glossary / translate_query / enrich_terminology |
+
+### 3.3 State 定义 — 每个 Agent 独立 State
 
 ```python
-from typing import TypedDict, Annotated
-from langgraph.graph.message import add_messages
-
-class ResearchState(TypedDict):
-    # 对话
+# 主 Agent State
+class MainAgentState(TypedDict):
     messages: Annotated[list, add_messages]
-    
-    # 会话
     session_id: str
-    project_id: str | None
-    
-    # Plan
+    active_agent_ids: list[str]
     plan: dict | None
-    plan_status: str            # "pending" | "awaiting_approval" | "executing" | "done"
-    
-    # 当前步骤
-    current_step_index: int
-    steps: list[dict]
-    
-    # iOS
+    plan_status: str            # "pending" | "awaiting_approval" | "executing" | "done" | "needs_adjustment"
     ios_tools: list[dict]
     ios_connected: bool
-    pending_ios_tools: dict     # {tool_call_id: {name, timeout, started_at}}
-    
-    # 异步任务
-    celery_task_ids: dict       # {step_index: celery_task_id}
-    
-    # 结果
-    step_results: dict          # {step_index: result}
-    errors: list[str]
-    
-    # Memory
     short_term_token_count: int
     compression_needed: bool
+
+# IngestAgent State
+class IngestState(TypedDict):
+    project_id: str
+    current_stage: str          # search|evaluate|download|convert|index|rank|survey
+    stage_index: int
+    celery_task_ids: dict
+    papers: list[PaperStatus]   # 每篇论文的处理状态
+    existing_papers: list[str]  # 已入库论文（增量模式）
+
+# RADQueryAgent State
+class QueryState(TypedDict):
+    query_intent: dict
+    target_collections: list[str]
+    retrieval_rounds: int
+    found_chunks: list[dict]
+    is_complete: bool
 ```
 
 ---
@@ -427,4 +419,4 @@ src/paper_search/
 
 ---
 
-> 版本: v1.1 | 新增子Agent、TaskLogger、JSON进度日志
+> 版本: v1.2 | 多Agent拆分、State分治、overall_evaluate循环、TranslationAgent

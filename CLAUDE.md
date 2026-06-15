@@ -147,14 +147,19 @@ paper_agant/
 
 ## Source Capability Matrix
 
-| Source | Search | PDF | Requires |
-|--------|--------|-----|----------|
-| arXiv | ✅ | ✅ direct | None |
-| Semantic Scholar | ✅ 1 req/s | ✅ OA | API Key |
-| PubMed | ✅ | ✅ OA | None |
-| ScienceDirect | ✅ 5k/week | ✅ API | API Key + campus IP |
-| IEEE Xplore | 🔑 | 🌐 | API Key + campus IP |
-| CNKI | ⚠️ | 🌐 | Campus IP + Playwright CAPTCHA |
+| Source | Priority | Search | PDF | Requires |
+|--------|----------|--------|-----|----------|
+| Semantic Scholar | P0 | ✅ 1 req/s | ✅ OA | API Key |
+| arXiv | P1 | ✅ | ✅ direct | None |
+| PubMed | P1 | ✅ | ✅ OA | None |
+| OpenAlex | P2 | ✅ 1 req/s | ❌ | None（无需 key） |
+| ScienceDirect | P2 | ✅ 5k/week | ✅ API | API Key + campus IP |
+| IEEE Xplore | P3 | 🔑 | 🌐 | API Key + campus IP |
+| CNKI | P3 | ⚠️ | 🌐 | Campus IP + Playwright CAPTCHA |
+
+> **搜索策略**：Semantic Scholar 作为元数据主来源（完整摘要 + AI 排序 + 引用关系 + OA PDF）→ arXiv/PubMed 并行补充 → 合并去重。
+> PDF 下载顺序：Semantic Scholar OA → arXiv direct → ScienceDirect → IEEE → publisher page。
+> 全部失败 → 记录到 `unavailable_pdfs` 表 → API 可查询。
 
 ---
 

@@ -109,9 +109,48 @@ Celery Worker 负责重量计算任务，但多阶段流水线（搜索→评估
 
 **结论**：ChromaDB 不变。双 Collection（papers_abstract + papers_fulltext）+ 新增 agent_conversations。
 
----
+### 5.1 Embedding 模型：OpenAIEmbeddings（替代本地 sentence-transformers）
 
-## 6. 数据库：SQLite（保持现有）
+| 对比维度 | 本地 MiniLM | 火山 doubao-embedding-vision | DeepSeek embedding-v1 | OpenAI text-embedding-3-small |
+|----------|------------|------------------------------|----------------------|------------------------------|
+| 向量维度 | 384 | 1024 | 1024 | 512-1536（可配置）|
+| 中文优化 | 一般 | ✅ 字节自研 | ✅ 专门中文优化 | 通用多语言 |
+| 多模态 | ❌ | ✅ 文本+图片+视频 | ❌ | ❌ |
+| 部署 | 本地，零延迟 | API，~50ms | API，~50ms | API，~50ms |
+| 费用 | 免费 | 含在 Coding/Agent Plan | ~$0.0002/1K tokens | ~$0.02/1M tokens |
+| LangChain 集成 | ❌ 手动 | ✅ OpenAIEmbeddings (兼容) | ✅ OpenAIEmbeddings (兼容) | ✅ 原生 |
+| LangSmith trace | ❌ | ✅ 自动 | ✅ 自动 | ✅ 自动 |
+
+**结论**：使用火山引擎 `doubao-embedding-vision`（1024维，中文优化，与 LLM 同一供应商统一计费）。通过 `OpenAIEmbeddings` 包装（改 base_url），LangChain 兼容，LangSmith 自动 trace。备选 DeepSeek（中文更好、更便宜，可插拔切换）。原因：
+1. **中英文混合检索质量是关键需求**：用户用中文搜索英文论文库，本地小模型在跨语言场景下表现不佳
+2. **动态维度**：可根据场景调整（精确检索用 1536 维，快速粗筛用 512 维）
+3. **LangChain 生态统一**：与 LangSmith trace 自动集成
+4. **切换成本可控**：ChromaDB 支持自定义 `embedding_function`，改一行即可。已入库数据可通过 `index_paper --all` 一键重新 embedding
+
+```python
+from langchain_openai import OpenAIEmbeddings
+
+# 火山引擎 Embedding — 通过 OpenAI 兼容接口调用
+embeddings = OpenAIEmbeddings(
+    model="doubao-embedding-vision",
+    base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+    api_key="...",  # 同火山引擎 API Key
+)
+
+# 两个 Collection 共用同一 embedding 模型，保证向量空间一致
+papers_abstract = chromadb.Collection(
+    name="papers_abstract",
+    embedding_function=embeddings,
+)
+papers_fulltext = chromadb.Collection(
+    name="papers_fulltext",
+    embedding_function=embeddings,
+)
+```
+
+备选：DeepSeek `deepseek-embedding-v1`（中文准确率比 OpenAI 高 15-20%，成本更低）。切换只需改 `model` + `base_url`。
+
+
 
 | 对比维度 | SQLite | PostgreSQL |
 |----------|--------|------------|
@@ -125,22 +164,38 @@ Celery Worker 负责重量计算任务，但多阶段流水线（搜索→评估
 
 ---
 
-## 7. 搜索引擎：保留现有 Provider 体系
+## 7. 搜索引擎：Semantic Scholar P0 + 多源降级
+
+### 搜索策略
+
+```
+P0: Semantic Scholar → 元数据主来源 (2亿+，完整摘要 + AI排序 + 引用关系 + OA PDF)
+P1: arXiv + PubMed (并行补充，预印本 + 生物医学)
+P2: OpenAlex + ScienceDirect (广度补充，免费无key + 爱思唯尔)
+P3: IEEE Xplore + CNKI (按需，工程 + 中文)
+```
+
+### 下载策略
+
+```
+Semantic Scholar OA → arXiv direct → ScienceDirect API
+  → IEEE → publisher page → CNKI
+  → 全部失败 → 记录 unavailable_pdfs
+```
 
 ```
 providers/
+├── semanticscholar_provider.py [P0] 元数据主来源
 ├── arxiv_provider.py           (保持)
-├── semanticscholar_provider.py (保持)
 ├── pubmed_provider.py          (保持)
+├── openalex_provider.py        [NEW] 免费补充来源
 ├── ieee_provider.py            (保持)
 ├── sciencedirect_provider.py   (保持)
 ├── cnki_provider.py            (保持)
 └── [Phase 2] github_provider.py (新增)
-              web_scraper.py      (新增)
-              stackoverflow.py    (新增)
 ```
 
-**结论**：6 个论文 Provider 完全不动。Phase 2 新增 3 个技术文档 Provider。
+**结论**：Semantic Scholar 为 P0（完整 API + OA PDF）。P1-P3 为降级来源。PDF 不可用追踪写入 `unavailable_pdfs` 表。Google Scholar 因无官方 API / 反爬维护成本高而放弃。
 
 ---
 
@@ -200,10 +255,11 @@ providers/
 | 搜索引擎 | 6 个 Provider (arxiv/s2/pubmed/ieee/sciencedirect/cnki) | 保持 |
 | 部署 | Docker + docker-compose | 新增 |
 | PDF 转换 | pymupdf4llm | 保持 |
+| Embedding 模型 | OpenAIEmbeddings (text-embedding-3-small) | 替换本地模型 |
 | 进度日志 | TaskLogger + JSONL | 新增 |
 | 子Agent编排 | Python asyncio 协程 + 进度回调 | 新增 |
 | iOS 推送 | APNs | 新增 |
 
 ---
 
-> 版本: v1.1 | 新增进度日志与子Agent选型
+> 版本: v1.3 | 火山 doubao-embedding-vision (可插拔) + Semantic Scholar P0 + 多源降级
