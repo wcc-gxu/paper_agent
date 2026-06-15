@@ -83,16 +83,6 @@ def _get_llm():
     return get_llm()
 
 
-def _get_agent_loop():
-    from .app import get_agent_loop
-    return get_agent_loop()
-
-
-def _get_auto_pipeline():
-    from .app import get_auto_pipeline
-    return get_auto_pipeline()
-
-
 def _get_kb():
     from .app import get_kb
     return get_kb()
@@ -268,35 +258,8 @@ async def upload_paper(file: UploadFile = File(...), project_id: Optional[str] =
 
 @router.post("/pipeline/auto")
 async def run_auto_pipeline(req: AutoPipelineRequest, background_tasks: BackgroundTasks):
-    """一键自动搜集入库 — 搜索→评估→下载→转换→索引→知识提取."""
-    pipeline = _get_auto_pipeline()
-
-    # 异步后台执行
-    async def run():
-        result = await pipeline.run(
-            keywords=req.keywords,
-            sources=req.sources,
-            year_from=req.year_from,
-            year_to=req.year_to,
-            max_papers=req.max_papers,
-            auto_download=req.auto_download,
-            auto_extract_knowledge=req.auto_extract_knowledge,
-            project_id=req.project_id,
-        )
-        return result
-
-    result = await run()
-    return {
-        "success": True,
-        "project_id": result.project_id,
-        "total_found": result.total_found,
-        "total_relevant": result.total_relevant,
-        "total_downloaded": result.total_downloaded,
-        "total_converted": result.total_converted,
-        "total_indexed": result.total_indexed,
-        "total_knowledge_extracted": result.total_knowledge_extracted,
-        "elapsed_seconds": result.elapsed_seconds,
-        "errors": result.errors,
+    """[REWRITE PENDING] 一键自动搜集入库 — 将由 IngestAgent 替代."""
+    raise HTTPException(status_code=501, detail="AutoPipeline removed. Pending IngestAgent rewrite.")
     }
 
 
@@ -368,10 +331,8 @@ async def knowledge_related(paper_id: str, top_k: int = 10):
 
 @router.post("/tasks")
 async def create_task(query: str = Query(..., description="研究需求")):
-    """创建新的 Agent 任务 — 返回澄清问题或 plan."""
-    loop = _get_agent_loop()
-    result = await loop.run_full_pipeline(query)
-    return result
+    """[REWRITE PENDING] 创建 Agent 任务 — 将由 Plan Graph 替代."""
+    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
 
 
 @router.get("/tasks")
@@ -395,41 +356,26 @@ async def get_task(task_id: str):
 
 @router.post("/tasks/{task_id}/confirm")
 async def confirm_task(task_id: str, req: PlanConfirmRequest):
-    """确认并执行任务."""
-    if req.confirmed:
-        loop = _get_agent_loop()
-        # 应用修改（如果提供）
-        if req.modifications:
-            db = _get_db()
-            # 更新 plan JSON
-            pass
-        result = await loop.execute_plan(task_id)
-        return {"success": True, "task_id": task_id, "results": result}
-    else:
-        db = _get_db()
-        db.update_agent_task(task_id, status="cancelled")
-        return {"success": True, "task_id": task_id, "status": "cancelled"}
+    """[REWRITE PENDING] 确认并执行任务."""
+    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
 
 
 @router.post("/tasks/{task_id}/pause")
 async def pause_task(task_id: str):
-    loop = _get_agent_loop()
-    await loop.pause(task_id)
-    return {"success": True, "task_id": task_id, "status": "paused"}
+    """[REWRITE PENDING] 暂停任务."""
+    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
 
 
 @router.post("/tasks/{task_id}/resume")
 async def resume_task(task_id: str):
-    loop = _get_agent_loop()
-    result = await loop.resume(task_id)
-    return {"success": True, "task_id": task_id, "results": result}
+    """[REWRITE PENDING] 恢复任务."""
+    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
 
 
 @router.delete("/tasks/{task_id}")
 async def cancel_task(task_id: str):
-    loop = _get_agent_loop()
-    await loop.cancel(task_id)
-    return {"success": True, "task_id": task_id, "status": "cancelled"}
+    """[REWRITE PENDING] 取消任务."""
+    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
 
 
 # ═══════════════════════════════════════════════════════════════
