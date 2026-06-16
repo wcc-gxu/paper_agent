@@ -386,7 +386,7 @@ src/paper_search/
 | 15. task_logger.py | TaskLogger — 统一 JSON 日志写入器，task 独立日志 + agent 全局日志 |
 | 16. sub_agent.py | 子Agent 编排器 — asyncio 协程，编排入库全流程，进度回调注入 |
 | 17. reporter.py | Celery report() API + JSON 日志写入 |
-| 18. ws_handler.py | WebSocket 4 种事件 + 会话持久化 |
+| 18. ws_handler.py | WebSocket 7 大类消息 + 会话持久化 |
 | 19. routes.py | REST 知识库端点 + task 日志查询端点 |
 | 20. auth.py + middleware.py | API Key + 速率限制 |
 | 21. iOS tool_use 链路 | 并发 + LLM 设超时 |

@@ -67,10 +67,10 @@
 ```
 
 - **后端核心**：Python 单体服务，FastAPI + WebSocket
-- **前端**：Vue SPA（后续版本，MVP 阶段优先 CLI + MCP）
-- **交互协议**：REST (CRUD) + WebSocket (实时对话) + SSE (进度推送)
-- **消息格式**：Anthropic Messages API 兼容（system/user/assistant/tool 角色）
-- **WS 协议**：JSON 消息帧，`type` 字段区分消息类型
+- **客户端**：iOS（主），REST 扩展接口
+- **交互协议**：WebSocket（全双工实时通信）+ REST（数据查询）
+- **消息格式**：自定义信封（role/type/subType/agentId/sessionId/seq/priority/timestamp/payload），7 大类 × 22 种子类
+- **WS 协议**：详见 `docs/development/websocket-protocol.md`
 
 ### 2.2 核心差异化竞争力
 
@@ -464,32 +464,45 @@ REST API:
   POST   /api/papers/upload            # 上传PDF
   GET    /api/knowledge-base/search    # 知识库检索
   GET    /api/projects                 # 项目列表
+  GET    /api/agents                   # Agent 列表
+  GET    /api/agents/{id}/sessions     # Session 列表
+  POST   /api/agents/{id}/sessions     # 创建新 session
   GET    /api/subscriptions            # 订阅管理
 
 WebSocket:
-  WS  /ws/chat/{session_id}            # 对话通道
-  WS  /ws/tasks/{task_id}              # 任务实时进度
+  WS  /ws/chat/{agent_id}/{session_id}  # 单一全双工通道 — 对话/进度/工具/审批
 
-SSE:
-  GET  /api/tasks/{id}/events          # 任务事件流
+(不再使用 SSE — 所有实时推送通过 WebSocket phase 消息)
 ```
 
 ### 4.8 WebSocket 消息协议
 
-```json
-// Client → Server
-{"type": "chat", "payload": {"message": "我想研究...", "context": {...}}}
-{"type": "clarify_response", "payload": {"question_id": "q1", "answer": "..."}}
-{"type": "plan_confirm", "payload": {"plan_id": "...", "modifications": {...}}}
-{"type": "task_control", "payload": {"task_id": "...", "action": "pause/resume/cancel"}}
+> 详见 `docs/development/websocket-protocol.md`（v6.0, 2026-06-16）。此处仅列概要。
 
-// Server → Client
-{"type": "chat_response", "payload": {"message": "...", "tool_calls": [...]}}
-{"type": "clarify_question", "payload": {"questions": [...]}}
-{"type": "plan", "payload": {"json": {...}, "markdown": "..."}}
-{"type": "progress", "payload": {"task_id": "...", "step": 3, "total": 8, "status": "..."}}
-{"type": "step_result", "payload": {"step_id": "...", "output": {...}, "verification": {...}}}
-{"type": "error", "payload": {"code": "...", "message": "...", "recoverable": true}}
+**通用信封**（所有消息必含）:
+```json
+{
+  "role": "user | assistant",
+  "type": "<7 大类>",
+  "subType": "<22 种子类>",
+  "agentId": "agent-001",
+  "sessionId": "main",
+  "seq": 0,
+  "priority": 0 | 1 | 2,
+  "timestamp": "2026-06-16T10:30:00Z",
+  "payload": { ... }
+}
+```
+
+**7 大类消息**: `heartbeat` / `phase` / `thinking` / `message` / `tool` / `review` / `error`
+
+**握手流程**:
+```
+① iOS → Server:  WS 连接 /ws/chat/{agent_id}/{session_id}
+② iOS → Server:  message(chat, seq=1) — 首条消息必须夹带握手信息
+③ Server:        检查 session → 不存在则自动创建
+④ Server → iOS:  phase(connected) — 握手回复
+⑤ 握手完成，进入正常交互
 ```
 
 ---

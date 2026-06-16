@@ -512,12 +512,16 @@ async def delete_subscription(subscription_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════
-# SSE Progress Stream
+# SSE Progress Stream (DEPRECATED)
 # ═══════════════════════════════════════════════════════════════
+#
+# 协议 v6.0 已不再使用 SSE — 所有实时进度推送通过 WebSocket phase 消息。
+# 此端点保留用于向后兼容，将在下一主版本移除。
+# 参见 docs/development/websocket-protocol.md §2.1
 
-@router.get("/tasks/{task_id}/events")
+@router.get("/tasks/{task_id}/events", deprecated=True)
 async def task_events(task_id: str):
-    """SSE 任务事件流 — 实时推送任务进度."""
+    """[DEPRECATED] SSE 任务事件流 — 已由 WebSocket phase 消息替代."""
     import asyncio
 
     async def event_generator():

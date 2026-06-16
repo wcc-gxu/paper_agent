@@ -127,16 +127,63 @@ app.include_router(router)
 # WebSocket
 # ═══════════════════════════════════════════════════════════════
 
-@app.websocket("/ws/chat/{session_id}")
-async def ws_chat(websocket: WebSocket, session_id: str):
+@app.websocket("/ws/chat/{agent_id}/{session_id}")
+async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
     """WebSocket 对话通道 — 主 Agent Plan Graph 入口.
 
-    [REWRITE PENDING] 当前为骨架实现，待 LangGraph Plan Graph 替换。
-    消息格式见 docs/development/websocket-protocol.md
+    协议见 docs/development/websocket-protocol.md
+
+    握手流程:
+      ① iOS → Server:  WS 连接 /ws/chat/{agent_id}/{session_id}
+      ② iOS → Server:  message(chat, seq=1) — 首条消息夹带握手信息
+      ③ Server:        检查 session → 不存在则自动创建
+      ④ Server → iOS:  phase(connected) — 握手回复
+      ⑤ 握手完成，进入正常交互
+
+    [REWRITE PENDING] 消息路由待 LangGraph Plan Graph 接入。
     """
     import json as _json
+    from datetime import datetime, timezone
 
     await websocket.accept()
+    await ws_manager.connect(agent_id, session_id, websocket)
+    logger.info(f"WS connected: agent={agent_id}, session={session_id}")
+
+    # Mutable handshake state — True after first chat with seq=1 is acked
+    handshake_done = False
+
+    def _envelope(**overrides) -> dict:
+        """Build a protocol-compliant message envelope with defaults."""
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {
+            "role": "assistant",
+            "type": "error",
+            "subType": "INTERNAL_ERROR",
+            "agentId": agent_id,
+            "sessionId": session_id,
+            "seq": 0,
+            "priority": 2,
+            "timestamp": now,
+            "payload": {},
+        } | overrides
+
+    def _maybe_create_session() -> bool:
+        """Check session exists; auto-create if not.  Returns True = already existed."""
+        db = get_db()
+        existing = db.conn.execute(
+            "SELECT 1 FROM sessions WHERE agent_id=? AND session_id=?",
+            (agent_id, session_id),
+        ).fetchone()
+        if existing:
+            return True
+        db.conn.execute(
+            "INSERT INTO sessions (agent_id, session_id, title, created_at, updated_at) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now'))",
+            (agent_id, session_id, "新对话"),
+        )
+        db.conn.commit()
+        logger.info(f"Auto-created session: agent={agent_id}, session={session_id}")
+        return False
 
     try:
         while True:
@@ -144,22 +191,61 @@ async def ws_chat(websocket: WebSocket, session_id: str):
             try:
                 msg = _json.loads(raw)
             except _json.JSONDecodeError:
-                await websocket.send_text(_json.dumps({
-                    "type": "error",
-                    "payload": {"message": "Invalid JSON", "recoverable": True},
-                }, ensure_ascii=False))
+                await websocket.send_text(_json.dumps(
+                    _envelope(
+                        type="error", subType="INTERNAL_ERROR",
+                        payload={"message": "Invalid JSON", "recoverable": True},
+                    ), ensure_ascii=False,
+                ))
                 continue
 
             msg_type = msg.get("type", "")
+            msg_sub = msg.get("subType", "")
+            msg_seq = msg.get("seq", 0)
 
-            # [REWRITE] 所有消息处理待 LangGraph Plan Graph 接入
-            await websocket.send_text(_json.dumps({
-                "type": "error",
-                "payload": {"message": f"Not implemented yet: {msg_type}", "recoverable": True},
-            }, ensure_ascii=False))
+            # ── Handshake ──────────────────────────────────────────
+            if not handshake_done and msg_type == "message" and msg_sub == "chat":
+                handshake_done = True
+                existed = _maybe_create_session()
+
+                # Build connected payload
+                payload: dict[str, object] = {
+                    "sessionTitle": None if not existed else None,  # TODO: load from DB
+                    "historyCount": 0,                              # TODO: real count
+                    "activeTasks": [],                              # TODO: real tasks
+                }
+                await websocket.send_text(_json.dumps(
+                    _envelope(
+                        type="phase", subType="connected",
+                        priority=0, payload=payload,
+                    ), ensure_ascii=False,
+                ))
+                logger.info(f"Handshake complete: agent={agent_id}, session={session_id}, existed={existed}")
+
+                # [REWRITE] 消息处理 → LangGraph Plan Graph.astream()
+                continue
+
+            if not handshake_done:
+                # 首条消息必须是 message(chat)
+                await websocket.send_text(_json.dumps(
+                    _envelope(
+                        type="error", subType="INTERNAL_ERROR",
+                        payload={
+                            "message": "Handshake required — first message must be message(chat) with seq=1",
+                            "recoverable": False,
+                        },
+                    ), ensure_ascii=False,
+                ))
+                continue
+
+            # ── Normal message processing ───────────────────────────
+            # TODO: LangGraph Plan Graph dispatch by type/subType
+            logger.debug(f"WS message: agent={agent_id}, session={session_id}, type={msg_type}, subType={msg_sub}")
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: session={session_id}")
+        logger.info(f"WebSocket disconnected: agent={agent_id}, session={session_id}")
+    finally:
+        await ws_manager.disconnect(agent_id, session_id, websocket)
 
 
 # ═══════════════════════════════════════════════════════════════
