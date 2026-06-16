@@ -57,7 +57,7 @@
 │          REST API + WebSocket                   │
 ├─────────────────────────────────────────────────┤
 │           Python Agent Engine (核心)             │
-│  Prompt优化 │ Agent Loop │ Tool Registry │ Memory │
+│  AgentRunLoop │ PlanGraph │ ToolRegistry │ Memory │
 ├─────────────────────────────────────────────────┤
 │           CLI Tools (13个)                       │
 │  search │ download │ convert │ index │ ...       │

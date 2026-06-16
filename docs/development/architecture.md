@@ -6,6 +6,8 @@
 
 ## 1. 系统拓扑
 
+### 1.1 单 Agent 内部结构
+
 ```
                          ┌──────────────┐
                          │   iOS 客户端  │
@@ -17,88 +19,125 @@
                          │  REST + WS    │
                          └──────┬───────┘
                                 │
-              ┌─────────────────┴──────────────────┐
-              │         Agent 守护进程 (主线程)      │
-              │                                     │
-              │  ┌──────────────────────────────┐   │
-              │  │  LangGraph 双图引擎           │   │
-              │  │  Plan Graph + Execute Graph  │   │
-              │  └──────────────────────────────┘   │
-              │  ┌──────────────────────────────┐   │
-              │  │  Agent Manifest (身份证)      │   │
-              │  │  启动/恢复/迁移               │   │
-              │  └──────────────────────────────┘   │
-              │  ┌──────────────────────────────┐   │
-              │  │  AgentRegistry (6 种子Agent)  │   │
-              │  │  IngestAgent / RADQueryAgent  │   │
-              │  │  ClusteringAgent /            │   │
-              │  │  CitationChaseAgent /         │   │
-              │  │  HistoryAgent /               │   │
-              │  │  TranslationAgent             │   │
-              │  └──────────────────────────────┘   │
-              │  ┌──────────────────────────────┐   │
-              │  │  TaskLogger (JSON 日志)       │   │
-              │  │  task独立日志 + agent全局日志  │   │
-              │  └──────────────────────────────┘   │
-              │  ┌──────────────────────────────┐   │
-              │  │  ToolRegistry (LangChain)     │   │
-              │  │  Server Tools + iOS Tools     │   │
-              │  └──────────────────────────────┘   │
-              │  ┌──────────────────────────────┐   │
-              │  │  Memory System (MemGPT)       │   │
-              │  │  4 层记忆 + RAG               │   │
-              │  └──────────────────────────────┘   │
-              │  ┌──────────────────────────────┐   │
-              │  │  Event Bus (Redis BRPOP)      │   │
-              │  └──────────────────────────────┘   │
-              └─────────────┬────────────────────┘
+              ┌─────────────────┴──────────────────────────┐
+              │         Agent 守护进程 (daemon.py)          │
+              │                                             │
+              │  ┌──────────────────────────────────────┐   │
+              │  │  AgentRunLoop (事件驱动主循环)        │   │
+              │  │  PriorityQueue ← WS/EventBus/Redis/  │   │
+              │  │  Timer 四个事件源                     │   │
+              │  └──────────────────────────────────────┘   │
+              │  ┌──────────────────────────────────────┐   │
+              │  │  PlanGraph (主Agent 决策)             │   │
+              │  │  Parse → Clarify → Plan → Execute    │   │
+              │  └──────────────────────────────────────┘   │
+              │  ┌──────────────────────────────────────┐   │
+              │  │  6 个子 Agent (IngestAgent 等)       │   │
+              │  └──────────────────────────────────────┘   │
+              │  ┌──────────────────────────────────────┐   │
+              │  │  ToolRegistry (50+ 工具)              │   │
+              │  │  纯内存直接调用 / 其余走 Celery       │   │
+              │  └──────────────────────────────────────┘   │
+              │  ┌──────────────────────────────────────┐   │
+              │  │  MemoryManager (4层记忆)              │   │
+              │  └──────────────────────────────────────┘   │
+              └─────────────┬────────────────────────────┘
+                            │
+              ┌─────────────┴─────────────┐
+              │      Redis (共享)          │
+              │  ┌──────────────────────┐  │
+              │  │ agent:events:{id}    │  │
+              │  │ agent:cmd:{id}       │  │
+              │  └──────────────────────┘  │
+              └─────────────┬─────────────┘
                             │
          ┌──────────────────┼──────────────────┐
          │                  │                  │
   ┌──────┴──────┐   ┌──────┴──────┐   ┌──────┴──────┐
-  │   Redis     │   │   Celery    │   │   Storage   │
-  │  事件队列   │   │  Worker     │   │  SQLite     │
-  │  Broker     │   │  长任务执行  │   │  ChromaDB   │
-  │  Beat定时   │   │             │   │  PDF/MD文件 │
-  └─────────────┘   └──────┬──────┘   │  JSON 日志  │
-                           │          │  Manifest   │
-                           │          │  (tasks/)   │
-                    ┌──────┴──────┐   └─────────────┘
-                    │  Providers  │
-                    │  S2(P0) +  │
-                    │  6降级来源  │
-                    │  Engine     │
-                    └─────────────┘
+  │  SQLite     │   │  ChromaDB   │   │  Celery     │
+  │  (agent.db) │   │  (6 colls)  │   │  Worker 池  │
+  └─────────────┘   └─────────────┘   └─────────────┘
 ```
+
+### 1.2 多 Agent 部署
+
+```
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│ agent-cv :8001   │  │ agent-nlp :8002  │  │ agent-001 :8000  │
+│   独立 daemon     │  │   独立 daemon     │  │   独立 daemon     │
+│   独立 agent.db   │  │   独立 agent.db   │  │   独立 agent.db   │
+│   独立 PlanGraph  │  │   独立 PlanGraph  │  │   独立 PlanGraph  │
+└────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘
+         │                     │                     │
+         └─────────────────────┼─────────────────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │    Redis (共享)      │
+                    │    Celery Worker 池   │
+                    └─────────────────────┘
 
 ---
 
-## 2. Agent 主线程事件循环
+## 2. AgentRunLoop — 事件驱动主循环
+
+> 详见 `docs/development/agent-runloop.md`
 
 ```
-┌─────────────────────────────────────────────────┐
-│            Agent Main Thread (asyncio)           │
-│                                                 │
-│   while True:                                   │
-│     event = await redis.brpop("agent:events")   │
-│                                                 │
-│     match event.type:                           │
-│       "user_message"    → LangGraph.astream()   │
-│       "ios_tool_result" → LangGraph.resume()    │
-│       "celery_progress" →                        │
-│         level=normal → 缓存, 更新 iOS status    │
-│         level=high   → 立即喂 LLM               │
-│       "celery_done"    → LangGraph.resume()     │
-│       "celery_error"   → LangGraph.resume()     │
-│       "task_progress"  → 更新 task 日志 →       │
-│         iOS 可通过 REST 查询最新进度            │
-│       "subscription"   → LLM 评估 → iOS 推送    │
-│       "trending"       → LLM 评估 → iOS 推送    │
-│       "health_check"   → 执行检查 → 写日志      │
-│                                                 │
-│     → 每次 LLM 返回 → 更新会话 → 通知 iOS       │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│               AgentRunLoop (asyncio PriorityQueue)               │
+│                                                                  │
+│   4 个事件源 (后台协程，互不阻塞):                                 │
+│   ┌─────────────┐ ┌─────────────┐ ┌──────────────┐ ┌──────────┐ │
+│   │ _ws_source  │ │_eventbus_src│ │ _redis_source│ │_timer_src│ │
+│   │ (prio=0)    │ │ (prio=1~2)  │ │ (prio=1~2)   │ │(prio=3)  │ │
+│   └──────┬──────┘ └──────┬──────┘ └──────┬───────┘ └─────┬────┘ │
+│          │               │               │               │      │
+│          └───────────────┴───────────────┴───────────────┘      │
+│                              │                                   │
+│                              ▼                                   │
+│          while running:                                          │
+│            priority, seq, event = await queue.get()  ← 休眠     │
+│            plan_graph.dispatch(event)               ← 逐个处理   │
+└──────────────────────────────────────────────────────────────────┘
+
+优先级:
+  prio=0  user_message / ios_tool_result     ← iOS 用户，立即处理
+  prio=1  celery_done / celery_error          ← 子Agent 完成，尽快
+  prio=2  celery_progress / tool_start/end    ← 进度状态，可批量
+  prio=3  timer_fired                        ← 定时任务触发
+
+Fire-and-Subscribe 模式:
+  所有慢操作 (IO/网络/LLM) → celery.send_task() → 立即返回
+  PlanGraph 不阻塞等待 → RunLoop 继续处理下一个事件
+  任务完成 → EventBus 回传 → PlanGraph 处理结果
 ```
+
+### 2.1 前台/后台自动判定
+
+| 工具 | 前台阈值 | 规则 |
+|------|---------|------|
+| `search_papers` | ≤10 篇 | 超过阈值自动后台 |
+| `evaluate_papers` | ≤5 篇 | 超过阈值自动后台 |
+| `download_paper` | ≤1 篇 | 超过阈值自动后台 |
+| 其他 | — | 默认后台执行 |
+
+用户可通过自然语言覆盖: "后台下载这 50 篇" / "等等，先查这个"
+
+### 2.2 中断行为
+
+用户发新消息时，当前前台任务自动转入后台。iOS 收到 `notification` 消息告知。
+
+### 2.3 Timer 管理
+
+Timer 作为 EventBus 的事件源，触发时投递 `timer_fired` 到 RunLoop：
+
+| 类型 | 创建者 | 示例 |
+|------|--------|------|
+| 系统固定 | daemon 启动注册 | health_check (每20min), cleanup_logs (每天) |
+| LLM 动态 | PlanGraph 调 create_timer tool | "每周一搜 adversarial attack" |
+| 用户手动 | iOS 订阅 / CLI | 用户在 App 设置研究方向 |
+
+---
 
 ---
 
@@ -187,52 +226,36 @@ class QueryState(TypedDict):
 
 ---
 
-## 4. 事件总线设计
+## 4. 事件通信
 
-### 4.1 事件类型
+### 4.1 EventBus vs Redis BRPOP — 互补不冲突
 
-```python
-# Agent 内部消费的事件
-INTERNAL_EVENTS = {
-    "user_message":      "iOS 用户发来新消息",
-    "ios_tool_result":   "iOS 执行工具完成",
-    "celery_progress":   "Celery Worker report() 进度",
-    "celery_done":       "Celery 任务完成",
-    "celery_error":      "Celery 任务失败",
-    "task_progress":     "子Agent 写 JSON 日志后的进度通知",
-    "subscription":      "Celery Beat 订阅检查结果",
-    "trending":          "Celery Beat 热点发现",
-    "health_check":      "定时健康检查",
-    "memory_compress":   "ShortTerm 达到阈值",
-}
-```
+| 维度 | EventBus (asyncio.Queue) | Redis BRPOP |
+|------|-------------------------|-------------|
+| 通信范围 | 同一进程内 | 跨进程 (Celery Worker ↔ Daemon) |
+| 延迟 | 纳秒级 | 毫秒级 |
+| 持久化 | ❌ | ✅ Redis AOF |
+| 适用场景 | PlanGraph↔工具状态↔iOS | Celery Worker→Daemon 进度 |
 
-### 4.2 事件流
+**两者汇入同一个 PriorityQueue**，RunLoop 统一分发。
 
-```
-Celery Worker                  Redis                     Agent 主线程
-    │                            │                          │
-    ├─ report(normal, data) ──→ lpush("agent:events")      │
-    │                            │                          │
-    ├─ report(high, data) ────→ lpush("agent:events") ───→ brpop → 立即喂 LLM
-    │                            │                          │
-    ├─ report(done, result) ──→ lpush("agent:events") ───→ brpop → LangGraph.resume
-    │                            │                          │
-    │                            │                          │
-iOS Client ──WS──→ FastAPI ──→ lpush("agent:events") ───→ brpop → LangGraph.astream
+### 4.2 统一工具调度
 
-子Agent (asyncio 协程)           TaskLogger                  Agent 主线程
-    │                            │                          │
-    ├─ pipeline 阶段进度 ──────→ 写 task .jsonl 文件        │
-    │                            │                          │
-    ├─ 单篇 paper 操作 ────────→ 写 paper_progress 事件     │
-    │                            │                          │
-    ├─ 阶段完成 ──────────────→ 写 stage_done 事件          │
-    │                            │                          │
-    ├─ 全流程完成 ────────────→ 写 task_done 事件 ────────→ 可通知 Agent 主线程
-    │                            │                          │
-iOS Client ──REST──→ FastAPI ──→ 读 task .jsonl 文件 ─────→ 返回进度 JSON
-```
+所有 Tool 调用分两类：
+
+| 类型 | 条件 | 示例 | 方式 |
+|------|------|------|------|
+| 纯内存 | 无 IO/网络 | `read_file`, `get_user_preference`, `list_timers` | 直接调用 |
+| Celery Task | 任何网络/磁盘/LLM | 其余全部 50+ 工具 | `celery.send_task()` + subscribe |
+
+### 4.3 子 Agent → 主 Agent 通知通道
+
+| 通道 | 方向 | 用途 |
+|------|------|------|
+| Redis `agent:events:{agent_id}` | 子→主 | Celery 进度/完成/错误 |
+| TaskLogger JSONL | 子→主/iOS | 结构化审计日志 |
+| EventBus | 子→主 (同进程) | PlanGraph 状态变化 |
+| Redis Pub/Sub `agent:cmd:{agent_id}` | 主→子 | 暂停/取消指令 |
 
 ---
 

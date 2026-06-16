@@ -2,8 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **工作流指导请使用 `/paper-agent` skill** — 包含从意图澄清到文献综述的完整 8 阶段流程。
-> This file is a **reference card**; for operational workflows invoke the `paper-agent` skill.
+> **架构文档索引**: [agent-runloop.md](docs/development/agent-runloop.md) — AgentRunLoop · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议
 
 ## Quick Start
 
@@ -58,6 +57,7 @@ Verify: say **"列出可用文献来源"** → calls `list_sources` tool.
 
 ## Data Flow
 
+### 论文入库流水线 (IngestAgent)
 ```
 search_papers  →  (papers in SQLite)
     → evaluate_papers → filter by relevance_score
@@ -68,10 +68,13 @@ search_papers  →  (papers in SQLite)
 rank_papers      →  (unified_level: A+/A/B/C)
 generate_survey  →  (survey.md report)
 paper_export     →  (references.bib)
+```
 
-# All stages write progress to structured JSON logs:
-#   ~/.paper_search/logs/agent.log  — global agent log
-#   ~/.paper_search/logs/tasks/{task_id}.jsonl — per-task pipeline log
+### 事件流 (AgentRunLoop)
+```
+iOS → WebSocket → RunLoop(prio=0) → PlanGraph
+Tool调用 → Celery Worker → Redis BRPOP → RunLoop(prio=1~2) → PlanGraph → iOS
+Timer  → RunLoop(prio=3) → PlanGraph → 工具执行
 ```
 
 ### Output Structure

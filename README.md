@@ -3,15 +3,18 @@
 > 个人 AI 科研助理 — 24/7 常驻后台，具备记忆、能主动发现知识、能自主决策的终身 Agent。
 
 ```
-iOS 客户端 ←→ WebSocket + REST ←→ FastAPI ←→ LangGraph Plan Graph
-                                        │
-                        ┌───────────────┼───────────────┐
-                        ▼               ▼               ▼
-                  主 Agent         IngestAgent      其他子 Agent
-                 (35 工具)      (7 阶段入库)      (规划中)
-                        │               │
-                        ▼               ▼
-              SQLite + ChromaDB + Redis + Celery
+iOS 客户端 ←→ WebSocket + REST ←→ AgentRunLoop ←→ PlanGraph (主Agent)
+                                 (事件驱动)      │
+                                    │           ├── IngestAgent (7阶段入库)
+                    ┌───────────────┼───────────┼── RADQueryAgent (规划中)
+                    │               │           └── 其他子Agent (规划中)
+                    ▼               ▼
+          EventBus (纳秒)    Redis BRPOP (毫秒)
+          (进程内)            (跨进程 Celery→Daemon)
+                    │               │
+                    └───────┬───────┘
+                            ▼
+              SQLite + ChromaDB + Celery Worker池
 ```
 
 ---
@@ -94,31 +97,36 @@ iOS 客户端 (SwiftUI)
     │  REST API /api/*
     ▼
 FastAPI (:8000)
-    ├── ws_chat handler → LangGraph Plan Graph (astream_events)
-    ├── /api/* REST routes
-    └── /ingest/* IngestAgent endpoints
     │
     ▼
-Agent 守护进程 (daemon.py)
-    ├── PlanGraph — 主 Agent 意图理解→澄清→方案→执行→评估
-    ├── IngestAgent — 论文入库 7 阶段流水线
-    ├── ToolRegistry — 56 个工具
-    └── MemoryManager — 4 层记忆 (ShortTerm/MidTerm/LongTerm/Meta)
+AgentRunLoop (事件驱动主循环, PriorityQueue, 永不阻塞)
+    ├── _ws_source (prio=0) — iOS 用户消息
+    ├── _eventbus_source (prio=1~2) — 进程内状态
+    ├── _redis_source (prio=1~2) — Celery 跨进程通知
+    └── _timer_source (prio=3) — 定时任务
     │
     ▼
-Celery Worker (后台异步)
-    ├── download_task — PDF 下载
-    ├── convert_task — PDF → Markdown
-    ├── index_task — Markdown → ChromaDB
-    └── survey_task — LLM 生成综述
+PlanGraph (主Agent 决策)
+    ├── Parse → Clarify → Plan → Execute → Evaluate
+    ├── Fire-and-Subscribe: 所有慢操作分发到 Celery
+    └── 前台/后台自动判定 + 中断自动转入后台
+    │
+    ▼
+Celery Worker 池 (共享, 多 Agent 复用)
+    ├── 纯内存工具 (read_file 等) → 直接调用
+    └── 其余全部 → celery.send_task() → subscribe 状态
     │
     ▼
 存储层
-    ├── SQLite (agent.db) — 项目/论文/任务/消息
+    ├── SQLite (独立 agent.db per Agent)
     ├── ChromaDB — 6 个向量集合
-    ├── Redis — Celery Broker + 事件总线
+    ├── Redis (共享) — Broker + agent:events:{id} + agent:cmd:{id}
     └── 文件系统 — PDF / Markdown / 日志
 ```
+
+**多 Agent 部署**: 不同端口运行独立 daemon，共享 Redis + Celery Worker 池。
+
+> 详见 [docs/development/agent-runloop.md](docs/development/agent-runloop.md)
 
 ### 子 Agent
 
@@ -214,6 +222,7 @@ paper_agant/
 |------|------|
 | [docs/product/product-spec.md](docs/product/product-spec.md) | 产品规格（15 个场景） |
 | [docs/product/product-architecture-plan.md](docs/product/product-architecture-plan.md) | 产品与架构设计 |
+| [docs/development/agent-runloop.md](docs/development/agent-runloop.md) | **AgentRunLoop** — 事件循环/统一调度/Timer/多Agent |
 | [docs/development/architecture.md](docs/development/architecture.md) | 技术架构（拓扑/Agent/工具/代码组织） |
 | [docs/development/websocket-protocol.md](docs/development/websocket-protocol.md) | WebSocket 协议 v6.0 |
 | [docs/development/agent-manifest.md](docs/development/agent-manifest.md) | Agent Manifest 启动协议 |
