@@ -7,6 +7,7 @@
   3. Error: invalid JSON -> error
   4. Error: non-handshake first -> error
   5. Chat flow: chat -> phase(clarify) / phase(plan) / phase(execute) -> reply
+  6. Task (v7.0): task(started) after plan confirmation, task backgrounding
 
 使用:
     # 先启动服务器:
@@ -191,6 +192,10 @@ class TestWSClient:
                 self._ok("Got phase(execute)")
             elif t == "tool" and s == "server":
                 self._ok(f"Got tool(server): {resp.get('payload',{}).get('name','')} [{resp.get('payload',{}).get('status','')}]")
+            elif t == "task" and s == "started":
+                self._ok(f"Got task(started): {resp.get('payload',{}).get('name','')} [mode={resp.get('payload',{}).get('mode','')}]")
+            elif t == "task" and s == "running":
+                self._ok(f"Got task(running): {resp.get('payload',{}).get('stage','')} [{resp.get('payload',{}).get('stageIndex')}/{resp.get('payload',{}).get('totalStages')}]")
             elif t == "message" and s == "reply":
                 self._ok(f"Got message(reply): {resp.get('payload',{}).get('content','')[:80]}...")
                 break

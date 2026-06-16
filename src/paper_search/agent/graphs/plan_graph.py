@@ -88,18 +88,20 @@ class PlanGraph:
         await graph.aresume(thread_config, {"user_clarification": {...}})
     """
 
-    def __init__(self, llm, tools, memory, db):
+    def __init__(self, llm, tools, memory, db, task_adapter=None):
         """
         Args:
             llm: LLMClientV2 实例
             tools: ToolRegistry 实例
             memory: MemoryManager 实例
             db: AgentDB 实例
+            task_adapter: TaskEventAdapter 实例（可选，用于推送 task WS 消息）
         """
         self._llm = llm
         self._tools = tools
         self._memory = memory
         self._db = db
+        self._task_adapter = task_adapter
         self._graph = None
 
     def compile(self, checkpointer: Optional[SqliteSaver] = None) -> StateGraph:
@@ -363,8 +365,24 @@ class PlanGraph:
         plan = state.get("plan", {}) or {}
         task_id = plan.get("task_id", "unknown")
         user_query = plan.get("original_query", plan.get("refined_query", ""))
+        goal = plan.get("goal", user_query)
+        adapter = self._task_adapter
 
         logger.info(f"execute_plan: delegating to IngestAgent for {task_id}")
+
+        # 更新 DB 任务状态为 running
+        try:
+            self._db.update_agent_task(task_id, status="running")
+        except Exception:
+            pass
+
+        # 构建 on_progress 回调 → task(running) WS 推送
+        async def _on_ingest_progress(stage: str, stage_index: int,
+                                       total_stages: int, current: int, total: int):
+            if adapter:
+                await adapter.on_task_running(
+                    task_id, stage, stage_index, total_stages, current, total,
+                )
 
         try:
             from ..sub_agent import PipelineRunner
@@ -382,7 +400,7 @@ class PlanGraph:
                 db=self._db, llm=self._llm,
                 chroma=chroma, converter=converter, ranker=ranker,
             )
-            ingest = IngestAgent(runner)
+            ingest = IngestAgent(runner, on_progress=_on_ingest_progress)
             ingest_graph = ingest.compile()
 
             config = {"configurable": {"thread_id": f"ingest-{task_id}"}}
@@ -401,6 +419,16 @@ class PlanGraph:
 
             result_summary = ingest_result.get("result", {})
             logger.info(f"IngestAgent complete: {json.dumps(result_summary, default=str)[:300]}")
+
+            # task(done) + update DB
+            if adapter:
+                await adapter.on_task_done(task_id, result_summary)
+            try:
+                self._db.update_agent_task(task_id, status="done",
+                                           total_steps=7, current_step=7)
+            except Exception:
+                pass
+
             return {
                 "plan": {**plan, "execution_results": [result_summary]},
                 "plan_status": "done",
@@ -408,6 +436,15 @@ class PlanGraph:
 
         except Exception as e:
             logger.error(f"IngestAgent execution failed: {e}", exc_info=True)
+
+            # task(failed) + update DB
+            if adapter:
+                await adapter.on_task_failed(task_id, str(e))
+            try:
+                self._db.update_agent_task(task_id, status="failed")
+            except Exception:
+                pass
+
             return {
                 "plan": {**plan, "execution_results": [{"error": str(e)}]},
                 "plan_status": "done",

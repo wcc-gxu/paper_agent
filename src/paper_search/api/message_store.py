@@ -106,6 +106,8 @@ class MessageStore:
         2. review(server→ios) 只回放 window_minutes 内未过期的
         3. error → 全部回放
         4. message(reply) → 回放最近 1 条
+        5. task(running/backgrounded) → 回放最近 20 条
+        6. task(done/failed) → 不回放（已完成/失败的任务不需要回放）
 
         Args:
             agent_id: Agent ID
@@ -124,6 +126,8 @@ class MessageStore:
         now = datetime.now(timezone.utc)
         replay = []
         has_reply = False
+        task_count = 0
+        MAX_TASK_REPLAY = 20
 
         for msg in reversed(all_recent):
             msg_type = msg.get("type", "")
@@ -152,6 +156,14 @@ class MessageStore:
                 if has_reply:
                     continue
                 has_reply = True
+
+            # Rule 5: task replay — done/failed 不回放，其它限制 20 条
+            if msg_type == "task":
+                if msg_sub in ("done", "failed"):
+                    continue  # 已完成/失败的任务不回放
+                task_count += 1
+                if task_count > MAX_TASK_REPLAY:
+                    continue  # 最多回放最近 20 条
 
             # Parse payload from string if needed
             payload = msg.get("payload", {})

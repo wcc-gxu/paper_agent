@@ -159,17 +159,22 @@ CREATE TABLE IF NOT EXISTS ws_messages (
 CREATE INDEX IF NOT EXISTS idx_ws_messages_lookup ON ws_messages(agent_id, session_id, seq);
 """
 
-# 运行时迁移：为旧 papers 表添加新列
+# 运行时迁移：为旧表添加新列（多表支持）
 _MIGRATIONS = [
-    "ALTER TABLE papers ADD COLUMN unified_level TEXT",
-    "ALTER TABLE papers ADD COLUMN reading_level TEXT",
-    "ALTER TABLE papers ADD COLUMN digest TEXT",
-    "ALTER TABLE papers ADD COLUMN method_tags TEXT",
-    "ALTER TABLE papers ADD COLUMN dataset_info TEXT",
-    "ALTER TABLE papers ADD COLUMN code_url TEXT",
-    "ALTER TABLE papers ADD COLUMN markdown_path TEXT",
-    "ALTER TABLE papers ADD COLUMN pdf_path TEXT",
-    "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)",
+    # papers 表迁移
+    ("papers", "ALTER TABLE papers ADD COLUMN unified_level TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN reading_level TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN digest TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN method_tags TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN dataset_info TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN code_url TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN markdown_path TEXT"),
+    ("papers", "ALTER TABLE papers ADD COLUMN pdf_path TEXT"),
+    # agent_tasks 表迁移（v7.0: task 类型 + 后台任务支持）
+    ("agent_tasks", "ALTER TABLE agent_tasks ADD COLUMN mode TEXT DEFAULT 'foreground'"),
+    ("agent_tasks", "ALTER TABLE agent_tasks ADD COLUMN name TEXT"),
+    # 索引
+    ("papers", "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)"),
 ]
 
 
@@ -194,11 +199,13 @@ class AgentDB:
         return self._conn
 
     def _run_migrations(self):
-        """运行缺失列的迁移和索引创建。"""
-        existing = {row[1] for row in self._conn.execute("PRAGMA table_info(papers)")}
-        for sql in _MIGRATIONS:
+        """运行缺失列的迁移和索引创建（多表支持）。"""
+        for item in _MIGRATIONS:
+            table, sql = item[0], item[1]
             if "ADD COLUMN" in sql:
                 col = sql.split("ADD COLUMN ")[1].split(" ")[0]
+                # 检查目标表的现有列
+                existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
                 if col not in existing:
                     try:
                         self._conn.execute(sql)
@@ -415,14 +422,24 @@ class AgentDB:
     # ── Agent 任务管理 ────────────────────────────────────
 
     def create_agent_task(self, task_id: str, user_query: str,
-                          session_id: str = None, max_steps: int = 50) -> str:
-        """创建 Agent 任务."""
+                          session_id: str = None, max_steps: int = 50,
+                          mode: str = "foreground", name: str = "") -> str:
+        """创建 Agent 任务。
+
+        Args:
+            task_id: 任务唯一 ID
+            user_query: 用户原始查询
+            session_id: 关联的 session ID
+            max_steps: 最大执行步数
+            mode: 任务模式 — "foreground" | "background"
+            name: 任务显示名称（用于 iOS 任务卡片）
+        """
         now = self._now()
         self.conn.execute(
             """INSERT INTO agent_tasks
-               (id, session_id, user_query, status, max_steps, created_at, updated_at)
-               VALUES (?,?,?,'pending',?,?,?)""",
-            (task_id, session_id, user_query, max_steps, now, now),
+               (id, session_id, user_query, status, max_steps, mode, name, created_at, updated_at)
+               VALUES (?,?,?,'pending',?,?,?,?,?)""",
+            (task_id, session_id, user_query, max_steps, mode, name, now, now),
         )
         self.conn.commit()
         return task_id
@@ -586,15 +603,53 @@ class AgentDB:
         ).fetchone()
         return row[0] if row else 0
 
+    def set_task_mode(self, task_id: str, mode: str):
+        """设置任务模式（foreground ↔ background，不可逆）。"""
+        self.conn.execute(
+            "UPDATE agent_tasks SET mode=?, updated_at=? WHERE id=?",
+            (mode, self._now(), task_id),
+        )
+        self.conn.commit()
+
+    def get_foreground_task(self, session_id: str) -> Optional[dict]:
+        """获取指定 session 中当前的前台任务（最多 1 个）。"""
+        row = self.conn.execute(
+            "SELECT * FROM agent_tasks "
+            "WHERE session_id=? AND mode='foreground' AND status IN ('pending','running','paused') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def get_active_tasks(self, agent_id: str, session_id: str) -> list[dict]:
-        """获取指定 session 的活跃任务."""
+        """获取指定 session 的活跃任务（含 mode, name 等字段用于 phase/connected）。
+
+        Returns:
+            列表每项: {"id", "name", "mode", "status", "stage", "current_step", "total_steps"}
+        """
         rows = self.conn.execute(
-            "SELECT id, status, current_step, total_steps FROM agent_tasks "
+            "SELECT id, name, mode, status, "
+            "CASE status WHEN 'running' THEN COALESCE((SELECT step_name FROM task_steps "
+            "  WHERE task_steps.task_id = agent_tasks.id AND task_steps.status='in_progress' "
+            "  ORDER BY step_index LIMIT 1), '执行中') ELSE status END as stage, "
+            "current_step, total_steps "
+            "FROM agent_tasks "
             "WHERE session_id=? AND status IN ('pending','running','paused') "
             "ORDER BY created_at DESC",
             (session_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [
+            {
+                "taskId": r["id"],
+                "name": r["name"] or r["id"],
+                "mode": r["mode"] or "foreground",
+                "status": r["status"],
+                "stage": r["stage"],
+                "current": r["current_step"] or 0,
+                "total": r["total_steps"] or 0,
+            }
+            for r in rows
+        ]
 
     def close(self):
         if self._conn:

@@ -68,12 +68,15 @@ class IngestAgent:
         result = await agent.run_single("download", paper_id="...")
     """
 
-    def __init__(self, runner):
+    def __init__(self, runner, on_progress=None):
         """
         Args:
             runner: PipelineRunner 实例
+            on_progress: 可选进度回调 async def(stage, stage_index, total_stages, current, total)
+                         用于推送 task(running) 到 WS
         """
         self.runner = runner
+        self._on_progress = on_progress
         self._graph = None
 
     def compile(self, checkpointer=None):
@@ -112,7 +115,7 @@ class IngestAgent:
         if state.get("is_single_tool") and state.get("single_tool_name") != "search":
             return {}
 
-        await self._notify("search", 1, 7, "搜索论文")
+        await self._notify("搜索论文", 1, 7, "搜索论文", 0, 0)
         papers = await self.runner._search_stage(
             "ingest", state["project_id"], state["user_query"],
             state.get("sources", ["arxiv", "semantic_scholar"]),
@@ -120,6 +123,7 @@ class IngestAgent:
             state.get("max_results", 20),
             None,
         )
+        await self._notify("搜索论文", 1, 7, f"搜索完成: {len(papers)} 篇", len(papers), len(papers))
         return {"papers": papers, "current_stage": "search", "stage_index": 1, "total_stages": 7}
 
     async def _evaluate_node(self, state: IngestState) -> dict:
@@ -130,7 +134,7 @@ class IngestAgent:
         if not papers:
             return {"current_stage": "evaluate"}
 
-        await self._notify("evaluate", 2, 7, "评估论文相关性")
+        await self._notify("评估论文", 2, 7, "评估论文相关性", 0, len(papers))
         evaluations = await self.runner._evaluate_stage(
             "ingest", state["project_id"], state["user_query"], papers, None,
         )
@@ -140,6 +144,8 @@ class IngestAgent:
             p["score"] = ev.get("score", 0)
             p["is_relevant"] = ev.get("is_relevant", False)
 
+        relevant_count = sum(1 for p in papers if p.get("is_relevant", True))
+        await self._notify("评估论文", 2, 7, f"评估完成: {relevant_count} 篇相关", len(papers), len(papers))
         return {"papers": papers, "current_stage": "evaluate", "stage_index": 2}
 
     async def _download_node(self, state: IngestState) -> dict:
@@ -151,11 +157,11 @@ class IngestAgent:
         if not relevant:
             relevant = papers[:10]
 
-        await self._notify("download", 3, 7, f"下载论文 (0/{len(relevant)})")
+        await self._notify("下载论文", 3, 7, f"下载论文 (0/{len(relevant)})", 0, len(relevant))
 
         errors = list(state.get("errors", []))
         for i, paper in enumerate(relevant):
-            await self._notify("download", 3, 7, f"下载论文 ({i+1}/{len(relevant)})")
+            await self._notify("下载论文", 3, 7, f"下载论文 ({i+1}/{len(relevant)})", i + 1, len(relevant))
             result = await self.runner._download_single(
                 "ingest", state["project_id"], paper, None,
             )
@@ -174,11 +180,11 @@ class IngestAgent:
         papers = state.get("papers", [])
         to_convert = [p for p in papers if p.get("download_ok") and p.get("pdf_path")]
 
-        await self._notify("convert", 4, 7, f"转换 PDF ({0}/{len(to_convert)})")
+        await self._notify("转换PDF", 4, 7, f"转换 PDF ({0}/{len(to_convert)})", 0, len(to_convert))
 
         errors = list(state.get("errors", []))
         for i, paper in enumerate(to_convert):
-            await self._notify("convert", 4, 7, f"转换 PDF ({i+1}/{len(to_convert)})")
+            await self._notify("转换PDF", 4, 7, f"转换 PDF ({i+1}/{len(to_convert)})", i + 1, len(to_convert))
             result = await self.runner._convert_single(
                 "ingest", paper["paper_id"], paper["pdf_path"], paper.get("title", ""), None,
             )
@@ -197,11 +203,11 @@ class IngestAgent:
         papers = state.get("papers", [])
         to_index = [p for p in papers if p.get("convert_ok") and p.get("markdown_path")]
 
-        await self._notify("index", 5, 7, f"索引入库 ({0}/{len(to_index)})")
+        await self._notify("索引入库", 5, 7, f"索引入库 ({0}/{len(to_index)})", 0, len(to_index))
 
         errors = list(state.get("errors", []))
         for i, paper in enumerate(to_index):
-            await self._notify("index", 5, 7, f"索引 ({i+1}/{len(to_index)})")
+            await self._notify("索引入库", 5, 7, f"索引 ({i+1}/{len(to_index)})", i + 1, len(to_index))
             result = await self.runner._index_single(
                 "ingest", paper["paper_id"], paper["markdown_path"],
                 paper.get("title", ""), paper.get("abstract", ""),
@@ -221,7 +227,7 @@ class IngestAgent:
         papers = state.get("papers", [])
         indexed = [p for p in papers if p.get("index_ok")]
 
-        await self._notify("rank", 6, 7, "评定期刊等级")
+        await self._notify("期刊评级", 6, 7, "评定期刊等级", len(indexed), len(indexed))
 
         if indexed:
             await self.runner._rank_stage("ingest", state["project_id"], indexed, None)
@@ -232,7 +238,7 @@ class IngestAgent:
         if state.get("is_single_tool") and state.get("single_tool_name") != "survey":
             return {}
 
-        await self._notify("survey", 7, 7, "生成文献综述")
+        await self._notify("生成综述", 7, 7, "生成文献综述", 0, 0)
 
         result = await self.runner._survey_stage(
             "ingest", state["project_id"], state["user_query"], None,
@@ -242,6 +248,8 @@ class IngestAgent:
         errors = state.get("errors", [])
         downloaded = sum(1 for p in papers if p.get("download_ok"))
         indexed = sum(1 for p in papers if p.get("index_ok"))
+
+        await self._notify("生成综述", 7, 7, f"综述完成", 7, 7)
 
         return {
             "current_stage": "survey",
@@ -265,6 +273,12 @@ class IngestAgent:
 
     # ── Helpers ──────────────────────────────────────────
 
-    async def _notify(self, stage: str, index: int, total: int, message: str):
-        """通知进度（可被子类重写以集成 WS 推送）。"""
-        logger.info(f"IngestAgent [{index}/{total}] {stage}: {message}")
+    async def _notify(self, stage: str, index: int, total: int, message: str,
+                       current: int = 0, paper_total: int = 0):
+        """通知进度（通过 on_progress 回调推送 WS，否则仅日志）。"""
+        logger.info(f"    IngestAgent [{index}/{total}] {stage}: {message}")
+        if self._on_progress:
+            try:
+                await self._on_progress(stage, index, total, current, paper_total)
+            except Exception as e:
+                logger.debug(f"IngestAgent on_progress error: {e}")

@@ -129,7 +129,7 @@ app.include_router(router)
 
 @app.websocket("/ws/chat/{agent_id}/{session_id}")
 async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
-    """WebSocket 对话通道 — 完整协议 v6.0 实现.
+    """WebSocket 对话通道 — 完整协议 v7.0 实现.
 
     协议见 docs/development/websocket-protocol.md
     """
@@ -175,13 +175,37 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         await websocket.send_text(text)
         await store.save_envelope(envelope)
 
+    # ── TaskEventAdapter ────────────────────────────────────
+    from ..agent.task_event_adapter import TaskEventAdapter
+
+    async def _task_send_fn(envelope: dict):
+        """TaskEventAdapter 的回调：发送 + 持久化 task/message(notification)。"""
+        await _send_and_store(envelope)
+
+    task_adapter = TaskEventAdapter(
+        agent_id=agent_id, session_id=session_id,
+        send_fn=_task_send_fn,
+    )
+
     async def _handle_chat_message(msg: dict):
         """处理用户 chat 消息 → Plan Graph astream_events()。"""
         nonlocal _pending_graph
 
-        graph = await _get_plan_graph()
+        graph = await _get_plan_graph(task_adapter=task_adapter)
         content = (msg.get("payload") or {}).get("content", "")
         seq = msg.get("seq", 0)
+
+        # ── 前台→后台 切换（v7.0: task 类型）────
+        # 用户发新消息 → 当前前台任务转入后台（不可逆）
+        foreground_task = get_db().get_foreground_task(session_id)
+        if foreground_task:
+            ft_id = foreground_task.get("id", "")
+            try:
+                get_db().set_task_mode(ft_id, "background")
+                get_db().update_agent_task(ft_id, status="running")
+            except Exception:
+                pass
+            await task_adapter.on_task_backgrounded(ft_id, reason="user_new_message")
 
         # 保存用户消息
         await store.save_user_message(agent_id, session_id, seq, msg.get("payload", {}))
@@ -294,7 +318,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         """处理用户 review 回复 → graph.aresume()。"""
         nonlocal _pending_graph
 
-        graph = await _get_plan_graph()
+        graph = await _get_plan_graph(task_adapter=task_adapter)
         msg_sub = msg.get("subType", "")
         payload = msg.get("payload", {})
 
@@ -307,6 +331,14 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         elif msg_sub == "plan":
             confirmed = payload.get("confirmed", False)
             if confirmed:
+                task_id = payload.get("taskId", "")
+                # v7.0: 方案批准 → 立即发送 task(started, mode=foreground)
+                await task_adapter.on_task_started(
+                    task_id=task_id,
+                    name=payload.get("goal", "论文调研"),
+                    mode="foreground",
+                    total_stages=len(payload.get("steps", [])) or 7,
+                )
                 await graph.aresume(
                     _graph_config,
                     {"user_approval": {"confirmed": True, "modifications": payload.get("modifications", {})}},
@@ -319,7 +351,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
 
     async def _handle_tool_result(msg: dict):
         """处理 iOS tool(result) → graph.aresume()。"""
-        graph = await _get_plan_graph()
+        graph = await _get_plan_graph(task_adapter=task_adapter)
         payload = msg.get("payload", {})
         tool_call_id = payload.get("tool_call_id", "")
         content = payload.get("content", "")
@@ -377,15 +409,24 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 active_tasks = get_db().get_active_tasks(agent_id, session_id) if existed else []
                 session_title = (session_data or {}).get("title", None)
 
-                # 发送 phase(connected)
+                # 发送 phase(connected) — v7.0 格式含完整任务卡片信息
                 await _send_and_store(_envelope(
                     type="phase", subType="connected", priority=0, seq=0,
                     payload={
                         "sessionTitle": session_title,
                         "historyCount": history_count,
-                        "activeTasks": [{"taskId": t.get("id", ""), "stage": t.get("status", ""),
-                                        "progress": f"{t.get('current_step', 0)}/{t.get('total_steps', 0)}"}
-                                       for t in active_tasks],
+                        "activeTasks": [
+                            {
+                                "taskId": t.get("taskId", t.get("id", "")),
+                                "name": t.get("name", "未命名任务"),
+                                "mode": t.get("mode", "foreground"),
+                                "stage": t.get("stage", t.get("status", "")),
+                                "current": t.get("current", 0),
+                                "total": t.get("total", 0),
+                                "status": t.get("status", "pending"),
+                            }
+                            for t in active_tasks
+                        ],
                     },
                 ))
                 logger.info(f"Handshake: agent={agent_id}, session={session_id}, existed={existed}, history={history_count}")
@@ -458,8 +499,12 @@ _graph = None
 _saver = None
 _aiosqlite_conn = None
 
-async def _get_plan_graph():
-    """惰性初始化 LangGraph Plan Graph（异步，需要 aiosqlite 连接）。"""
+async def _get_plan_graph(task_adapter=None):
+    """惰性初始化 LangGraph Plan Graph（异步，需要 aiosqlite 连接）。
+
+    Args:
+        task_adapter: TaskEventAdapter 实例（用于 task WS 消息推送）
+    """
     global _graph, _saver, _aiosqlite_conn
     if _graph is None:
         import aiosqlite
@@ -472,7 +517,8 @@ async def _get_plan_graph():
         chroma = get_chroma()
         tools = ToolRegistry.get_instance()
         memory = MemoryManager(db, chroma)
-        pg = PlanGraph(llm=llm, tools=tools, memory=memory, db=db)
+        pg = PlanGraph(llm=llm, tools=tools, memory=memory, db=db,
+                       task_adapter=task_adapter)
         _aiosqlite_conn = await aiosqlite.connect(str(db.db_path))
         await _aiosqlite_conn.execute("PRAGMA journal_mode=WAL")
         await _aiosqlite_conn.execute("PRAGMA busy_timeout=30000")
