@@ -4,191 +4,45 @@
 
 ---
 
-## 1. 连接
+## 一、总纲
+
+### 1.1 WebSocket 地址
 
 ```
 ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
-
-agent_id:  主 Agent 的唯一标识（如 "agent-001"）。一个用户 = 一个 Agent
-session_id: 会话标识。一个 Agent 可以有多个 session（不同研究项目、不同设备）
 ```
 
-### 1.1 默认值（MVP 写死）
-
-| 值 | 说明 |
-|----|------|
-| `agent_id` = `"agent-001"` | 系统启动时自动创建，永久存在 |
-| `session_id` = `"main"` | Agent 创建时附带，默认对话入口 |
-| main session 标题 = `"我的小助理"` | 第一条消息后 LLM 自动更新 |
+| 参数 | 说明 |
+|------|------|
+| `agent_id` | 主 Agent 标识。一个用户 = 一个 Agent。MVP 默认 `"agent-001"` |
+| `session_id` | 会话标识。不同 session 隔离上下文。MVP 默认 `"main"` |
 
 ### 1.2 agent_id 与 session_id
-
-| 概念 | 类比 | 生命周期 | 隔离内容 |
-|------|------|----------|----------|
-| `agent_id` | 你的"科研分身" | 永久 | 所有记忆、论文、偏好 |
-| `session_id` | 你和 Agent 的一次"话题" | 按需创建/归档 | ShortTerm 上下文、MidTerm checkpoint |
 
 ```
 agent-001 (一个用户，一个 Agent)
 │
-├── session: "main"           ← 默认会话 (bootstrap 创建，标题 "新对话")
-│
-├── session: "cv-project"     ← 用户创建的独立会话
-│
-└── session: "temp-abc"       ← 临时会话，关闭后不保留
+├── session: "main"           ← 默认会话
+├── session: "cv-project"     ← 用户创建
+└── session: "temp-abc"       ← 临时会话，关闭丢弃
 ```
 
-### 1.3 连接握手（首条 chat 隐含握手）
+| 概念 | 生命周期 | 隔离内容 |
+|------|----------|----------|
+| `agent_id` — "科研分身" | 永久 | 所有记忆、论文、偏好 |
+| `session_id` — 一次"话题" | 按需创建/归档 | ShortTerm 上下文、MidTerm checkpoint |
 
-**WS 连接建立后，iOS 立即发送第一条 `chat` 消息，不需要等 Server。** `connected` 是 Server 收到首条 chat 后的确认回复，不是前置条件。
+**新建 session**：直连不存在的 session_id → Server 自动创建。也可 REST 创建（见 [REST API](./rest-api.md)）。
 
-```
-iOS → Server:  WS 连接 /ws/chat/agent-001/main
-iOS → Server:  chat({content: "搜 Transformer 论文", seq: 1})   ← 立即发送
+### 1.3 通用信封
 
-Server:
-  1. 收到 chat → 检查 session（不存在则自动创建）
-  2. 发送 connected（确认 session 就绪 + 已有元数据）
-  3. 处理 chat 消息 → LLM 响应
-  4. 如果是 session 第一条消息 → LLM 生成标题 → session_updated
-```
-
-```json
-// Server → iOS（收到第一条 chat 后的确认回复）
-// 已有历史的 session:
-{
-  "role": "assistant", "type": "connected",
-  "agentId": "agent-001", "sessionId": "main", "priority": 2,
-  "timestamp": "2026-06-16T10:30:00.100Z",
-  "payload": {
-    "status": "ok",
-    "sessionTitle": "Transformer 文献调研",    // 历史 session 有标题
-    "historyCount": 42,
-    "activeTasks": [
-      {"taskId": "task-001", "type": "ingest", "stage": "download", "progress": "12/22"}
-    ]
-  }
-}
-
-// 新 session（首条消息，标题尚未生成）:
-{
-  "role": "assistant", "type": "connected",
-  "agentId": "agent-001", "sessionId": "session-new", "priority": 2,
-  "timestamp": "2026-06-16T10:30:00.100Z",
-  "payload": {
-    "status": "ok",
-    "sessionTitle": null,                     // ← 标题尚未生成
-    "historyCount": 0,
-    "activeTasks": []
-  }
-}
-```
-
-> `sessionTitle: null` 表示标题待生成。iOS 此时展示"新对话"占位。
-> Server 处理完第一条 chat 后生成标题 → 推 `session_updated`。
-
-### 1.4 Session 不存在时的自动创建
-
-iOS 连接不存在的 session → 收到首条 chat 时 Server 自动创建，iOS 感知不到差异。
-
-```
-iOS → WS /ws/chat/agent-001/session-not-exist
-iOS → chat({content: "你好", seq: 1})
-
-Server:
-  1. 收到 chat → 查 sessions 表 → 不存在
-  2. 自动创建 session (title=null)
-  3. 发送 connected({sessionTitle: null, historyCount: 0})
-  4. 处理 chat → LLM 生成标题 "初次问候"
-  5. 发送 text_delta × N
-  6. 发送 session_updated({title: "初次问候"})
-  7. 发送 message_stop
-```
-
-**两种获取 session 的方式并存：**
-
-| 方式 | 适用场景 |
-|------|----------|
-| REST `GET /sessions` | iOS 启动时展示对话列表（离线也可看） |
-| WS 直连自动创建 | 用户从通知点进来、深链接、刷新后快速恢复 |
-
-### 1.5 Session 标题更新通知
-
-LLM 生成标题后，Server 通过 WS 推送标题变更：
-
-```json
-{
-  "role": "assistant",
-  "type": "session_updated",
-  "agentId": "agent-001",
-  "sessionId": "main",
-  "priority": 2,
-  "timestamp": "2026-06-16T10:30:05Z",
-  "payload": {
-    "title": "Transformer文献调研"
-  }
-}
-```
-
-iOS 收到后更新对话列表中的标题。priority=2（不推送 APNs）。
-
-### 1.6 当用户需要隔离上下文时
-
-iOS 上点"新建对话" → POST `/api/agents/agent-001/sessions` → 获得 `session_id` → 连接 WS。用户也可以直接连接一个不存在的 session_id → Server 自动创建。
-
-### 1.3 API — 获取 Agent 和 Session 列表
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/agents` | 列出所有 Agent |
-| GET | `/api/agents/{agent_id}` | Agent 详情（含 manifest 摘要） |
-| GET | `/api/agents/{agent_id}/sessions` | 列出 Agent 的所有 session（含标题、最近消息时间） |
-| POST | `/api/agents/{agent_id}/sessions` | 创建新 session → 返回 session_id |
-| PATCH | `/api/agents/{agent_id}/sessions/{id}` | 更新 session（如修改标题） |
-| DELETE | `/api/agents/{agent_id}/sessions/{id}` | 归档/删除 session |
-
-### 1.4 Session 自动标题 — 参考腾讯元宝
-
-腾讯元宝等 App 用第一条消息作为对话标题。服务端在收到 session 的第一条 chat 后，LLM 自动生成标题：
-
-```
-Server 内部:
-  收到 session 第一条消息 →
-  LLM 调用: "为以下对话生成一个 10 字以内的标题: {first_message}" →
-  写入 sessions 表 title 字段 →
-  iOS 通过 GET /sessions 获取标题列表
-```
-
-响应中附带 `title`：
-```json
-{
-  "sessionId": "session-cv-project",
-  "title": "YOLO目标检测调研",
-  "createdAt": "2026-06-16T10:00:00Z",
-  "lastMessageAt": "2026-06-16T15:30:00Z",
-  "messageCount": 42
-}
-```
-
-### 1.5 心跳
-
-| 方向 | 消息 | 间隔 |
-|------|------|------|
-| iOS → Server | `{"type":"ping"}` | 每 30 秒 |
-| Server → iOS | `{"type":"pong"}` | 收到 ping 立即回复 |
-
-客户端 90 秒内未收到任何消息（包括 pong）→ 断开重连。
-
----
-
-## 2. 消息格式
-
-### 通用信封
+所有消息共用此结构。**iOS 端和 Server 端均需持久化全部字段**。
 
 ```json
 {
   "role": "user | assistant",
-  "type": "<msgType>",
+  "type": "<大类>",
+  "subType": "<子类>",
   "agentId": "agent-001",
   "sessionId": "main",
   "seq": 0,
@@ -200,167 +54,163 @@ Server 内部:
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `role` | string | `user` = 客户端发出，`assistant` = 服务端发出 |
-| `type` | string | 消息类型（见 §3） |
-| `agentId` | string | Agent ID（如 `agent-001`）。一个用户 = 一个 Agent |
-| `sessionId` | string | 会话 ID。同一 Agent 可以有多个 session（隔离上下文） |
-| `seq` | int | 消息序列号（仅客户端消息需要）。Server 收到新 `seq` 且大于当前处理中的 `seq` → 放弃当前处理 |
-| `priority` | int | `0`=critical `1`=normal `2`=low |
-| `timestamp` | string | ISO 8601 UTC |
-| `payload` | object | 消息体，按 type 不同 |
+| `role` | string | `user` = 客户端发出，`assistant` = 服务端发出。**持久化必填** |
+| `type` | string | **消息大类**，共 7 种：`heartbeat` / `phase` / `thinking` / `message` / `tool` / `review` / `error` |
+| `subType` | string | **消息子类**，在大类下细分具体行为。见 §1.5 速查表 |
+| `agentId` | string | Agent ID。**持久化必填** |
+| `sessionId` | string | 会话 ID。**持久化必填** |
+| `seq` | int | **仅 `role:"user"` 的消息需要。** 每个 session 的第一条消息必须 `seq=1`，之后严格递增。新 seq > 当前处理中 seq → Server 放弃旧消息。见下文 |
+| `priority` | int | `0`=流式/状态 `1`=普通业务 `2`=阻塞等用户。**Server 据此决定 APNs 推送** |
+| `timestamp` | string | ISO 8601 UTC。**持久化必填** |
+| `payload` | object | 消息体，按 `type`+`subType` 不同（见 §2） |
 
-### priority 规则
+**握手协议**：
 
-| priority | 含义 | 触发 APNs | 示例 |
-|----------|------|-----------|------|
-| `0` critical | 需要用户立即关注 | ✅ 是 | plan 待确认、任务失败、错误 |
-| `1` normal | 有意义的业务消息 | ✅ 是（合并推送）| 阶段完成、tool 结果、完整回复 |
-| `2` low | 流式/心跳/展示 | ❌ 否 | text_delta、thinking_delta、tool_use 展示、ping/pong |
+```
+① iOS → Server:  WebSocket 连接 /ws/chat/{agent_id}/{session_id}
+② iOS → Server:  message(chat, seq=1)               ← 连接后发送的第一条消息，必须夹带握手信息，seq=1
+③ Server:        检查 session 是否存在
+                    ├── 存在 → 从 checkpoint 恢复上下文
+                    └── 不存在 → 自动创建 session
+④ Server → iOS:  phase(connected, seq=1)             ← 握手回复，echo seq=1，含 session 详情
+⑤ 握手完成，进入正常交互
+```
+
+此后每条 `message(chat)` 的 seq=0，表示不是握手信息。
+
+### 1.4 priority 与 APNs 推送
+
+| priority | 含义 | APNs | 典型消息 |
+|----------|------|------|----------|
+| `2` | 阻塞性 — 没有用户指令系统无法继续 | ✅ **立即推送**，每条独立 | review、tool(ios)、error、plan_rejected |
+| `1` | 普通业务 — 有意义但不紧急 | ✅ **合并推送**（≤10min 一条） | message(chat/reply/notification)、tool(result) |
+| `0` | 流式/状态/心跳 — 仅当前连接有效 | ❌ **不推送** | thinking、message(text)、tool(server)、phase、heartbeat |
+
+### 1.5 消息类型速查表（7 大类 × 22 种子类）
+
+| role | type | subType | priority | 用途 | 详述 |
+|------|------|---------|----------|------|------|
+| user | `heartbeat` | `ping` | 0 | 心跳（每 30s） | §1.6 |
+| assistant | `heartbeat` | `pong` | 0 | 心跳回复 | §1.6 |
+| assistant | `phase` | `connected` | 0 | Session 就绪 | §2.1 |
+| assistant | `phase` | `clarify` | 0 | 分析需求中 | §2.1 |
+| assistant | `phase` | `plan` | 0 | 方案已生成 | §2.1 |
+| assistant | `phase` | `execute` | 0 | 执行中 | §2.1 |
+| assistant | `phase` | `verify` | 0 | 验证结果 | §2.1 |
+| assistant | `phase` | `summarize` | 0 | 生成报告 | §2.1 |
+| assistant | `phase` | `paused` | 0 | 已暂停 | §2.1 |
+| assistant | `phase` | `recovering` | 0 | 崩溃恢复 | §2.1 |
+| assistant | `phase` | `done` | 0 | 全部完成 | §2.1 |
+| assistant | `thinking` | — | 0 | LLM 流式思考 | §2.2 |
+| assistant | `message` | `text` | 0 | 流式文本 | §2.3 |
+| user | `message` | `chat` | 1 | 用户输入 | §2.3 |
+| assistant | `message` | `reply` | 1 | 最终回复 | §2.3 |
+| assistant | `message` | `title` | 1 | 标题变更 | §2.3 |
+| assistant | `message` | `notification` | 1 | 后台通知 | §2.3 |
+| assistant | `message` | `plan_rejected` | 2 | Plan 被拒 | §2.3 |
+| assistant | `tool` | `server` | 0 | Server 工具展示 | §2.4 |
+| assistant | `tool` | `ios` | 2 | 请求 iOS 执行 | §2.4 |
+| user | `tool` | `result` | 1 | iOS 工具结果 | §2.4 |
+| assistant | `review` | `clarify` | 2 | 澄清请求 | §2.5 |
+| user | `review` | `clarify` | 2 | 澄清回复 | §2.5 |
+| assistant | `review` | `plan` | 2 | 计划请求 | §2.5 |
+| user | `review` | `plan` | 2 | 计划回复 | §2.5 |
+| user | `review` | `task_control` | 2 | 暂停/恢复/取消 | §2.5 |
+| assistant | `error` | _错误码_ | 2 | 错误通知 | §2.6 |
+
+### 1.6 心跳
+
+```json
+// C→S 每 30s
+{"role":"user","type":"heartbeat","subType":"ping","agentId":"agent-001","sessionId":"main","priority":0,"timestamp":"...","payload":{}}
+
+// S→C 收到立即回复
+{"role":"assistant","type":"heartbeat","subType":"pong","agentId":"agent-001","sessionId":"main","priority":0,"timestamp":"...","payload":{}}
+```
+
+客户端 90s 内未收到任何消息（包括 pong）→ 断开重连。
 
 ---
 
-## 3. 消息类型总览
+## 二、消息类型详述
 
-### 3.0 连接与会话管理
+> 按 7 大类展开。S = Server，C = iOS Client。
 
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `connected` | assistant | 2 | WS 连接建立后 Server 发的第一条消息，含 session 元数据 |
-| `session_updated` | assistant | 2 | session 标题变更 |
-| `ping` | user | 2 | 客户端心跳 |
-| `pong` | assistant | 2 | 服务端心跳回复 |
+### 2.1 phase — 阶段切换
 
-#### connected（Server → iOS，握手）
+**role: assistant** | priority: 0（不推送）
+
+`subType` 即为当前阶段名。连接确认也是一种阶段。
+
+```
+iOS 连接 WS → 立即发 message(chat)（不等 Server）
+Server 收到首条 chat → phase(subType:"connected") → 处理消息 → 后续 phase 通知
+```
 
 ```json
+// 连接确认
 {
-  "role": "assistant", "type": "connected",
-  "agentId": "agent-001", "sessionId": "main", "priority": 2,
+  "role": "assistant", "type": "phase", "subType": "connected",
+  "agentId": "agent-001", "sessionId": "main", "priority": 0,
   "timestamp": "2026-06-16T10:30:00Z",
   "payload": {
-    "agentName": "我的科研助理",
     "sessionTitle": "Transformer 文献调研",
-    "sessionCreatedAt": "2026-06-16T08:00:00Z",
     "historyCount": 42,
-    "activeTasks": []
-  }
-}
-```
-
-> iOS 发第一条 chat 后，Server 回复 `connected` 确认 session 就绪。`sessionTitle: null` 表示标题待 LLM 生成。
-
-#### session_updated（Server → iOS，标题变更）
-
-```json
-{
-  "role": "assistant", "type": "session_updated",
-  "agentId": "agent-001", "sessionId": "main", "priority": 2,
-  "payload": {"title": "Transformer文献调研"}
-}
-```
-
-```json
-// iOS → Server
-{"role":"user","type":"ping","sessionId":"...","priority":2,"timestamp":"...","payload":{}}
-
-// Server → iOS
-{"role":"assistant","type":"pong","sessionId":"...","priority":2,"timestamp":"...","payload":{}}
-```
-
----
-
-### 3.1 对话消息
-
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `chat` | user | 1 | 用户文本消息 |
-| `text_delta` | assistant | 2 | LLM 流式文本（逐 token 或全文。done=true 表示文本块结束） |
-| `thinking_delta` | assistant | 2 | LLM 流式思考，逐 token |
-| `message_stop` | assistant | 1 | 本轮 LLM 回复结束（含完整文本和附件） |
-
-#### chat（iOS → Server）
-
-```json
-{
-  "role": "user",
-  "type": "chat",
-  "agentId": "agent-001",
-  "sessionId": "main",
-  "seq": 1,
-  "priority": 1,
-  "timestamp": "2026-06-16T10:30:00Z",
-  "payload": {
-    "content": "帮我搜索 Transformer 注意力机制的论文",
-    "ios_tools": [
-      {
-        "name": "share_sheet",
-        "description": "打开系统分享菜单",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "text": {"type": "string"},
-            "url": {"type": "string"}
-          },
-          "required": []
-        }
-      }
+    "activeTasks": [
+      {"taskId": "task-001", "stage": "下载论文", "progress": "12/22"}
     ]
   }
 }
-```
 
-> `seq`：每次 chat 消息递增。Server 收到新 chat 且 `seq` > 当前处理中的 `seq` → 放弃当前 clarify/plan/execute 流程，开始新消息。
-> `ios_tools`：iOS 端当前可用的工具列表。每次 chat 消息都带上。
-> `sessionId`：指定对话上下文。不同 session 的 ShortTerm 互不干扰。
-
-#### text_delta（Server → iOS，流式/全文）
-
-**流式模式**（逐 token）：
-```json
+// 执行中进度
 {
-  "role": "assistant", "type": "text_delta",
-  "sessionId": "sess-abc123", "priority": 2,
-  "timestamp": "2026-06-16T10:30:01.500Z",
-  "payload": {"index": 0, "delta": "我来", "done": false}
+  "role": "assistant", "type": "phase", "subType": "execute",
+  "agentId": "agent-001", "sessionId": "main", "priority": 0,
+  "timestamp": "2026-06-16T10:31:00Z",
+  "payload": {
+    "stage": "搜索论文",
+    "stageIndex": 1,
+    "totalStages": 6,
+    "message": "正在搜索 Semantic Scholar...",
+    "detail": {"papersFound": 18, "papersTotal": 30}
+  }
 }
 ```
 
-**流式结束**（最后一条）：
+| payload 字段 | 说明 |
+|-------------|------|
+| `sessionTitle` | 仅 `connected`。`null` = 新 session（标题待 LLM 生成） |
+| `historyCount` | 仅 `connected`。历史消息数 |
+| `activeTasks` | 仅 `connected`。进行中任务 |
+| `stage` / `stageIndex` / `totalStages` | 当前步骤信息 |
+| `message` | 人类可读的进度描述 |
+| `detail` | 结构化进度（可选） |
+
+**subType 枚举与 iOS UI**：
+
+| subType | 含义 | iOS UI 建议 |
+|---------|------|------------|
+| `connected` | Session 就绪 | 恢复对话 UI |
+| `clarify` | 分析需求 | 思考动画 |
+| `plan` | 方案已生成 | —（内容通过 `review` 下发） |
+| `execute` | 执行中 | 进度条 + 当前步骤 |
+| `verify` | 验证结果 | "验证中..." |
+| `summarize` | 生成报告 | 生成动画 |
+| `paused` | 已暂停 | 暂停状态 + 继续按钮 |
+| `recovering` | 崩溃恢复 | "恢复中..." spinner |
+| `done` | 全部完成 | 结果摘要 |
+
+> **Session 自动创建**：iOS 连接不存在的 session → 收到首条 chat 时 Server 自动创建 → `phase(connected, sessionTitle:null)` → LLM 生成标题 → `message(title)`。
+
+### 2.2 thinking — 流式思考
+
+**role: assistant** | **priority: 0**（不推送） | 无 subType
+
 ```json
 {
-  "role": "assistant", "type": "text_delta",
-  "sessionId": "sess-abc123", "priority": 2,
-  "payload": {"index": 0, "delta": "", "done": true}
-}
-```
-
-**非流式模式**（全文一次返回）：
-```json
-{
-  "role": "assistant", "type": "text_delta",
-  "sessionId": "sess-abc123", "priority": 2,
-  "payload": {"index": 0, "delta": "完整回复文本...", "done": true}
-}
-```
-
-| 字段 | 说明 |
-|------|------|
-| `index` | LLM 回复序号（每轮对话可能有多次 tool_use 交替，index 递增） |
-| `delta` | 流式时=当前 token，非流式时=完整文本 |
-| `done` | `true` 表示当前 text block 结束 |
-
-> **注意**：没有单独的 `text_done` 类型。`text_delta(done=true)` 统一表示文本块结束。
-> **流式中断处理**：iOS 重连时，未完成的 `text_delta` 流被丢弃。Server 收到重连信号后等待 LLM 完成 → 直接发 `message_stop` 带完整文本。iOS 重连后丢弃未完成流，展示 `message_stop`。
-
-#### thinking_delta（Server → iOS，流式思考）
-
-```json
-{
-  "role": "assistant",
-  "type": "thinking_delta",
-  "sessionId": "sess-abc123",
-  "priority": 2,
-  "timestamp": "2026-06-16T10:30:01.200Z",
+  "role": "assistant", "type": "thinking",
+  "agentId": "agent-001", "sessionId": "main", "priority": 0,
+  "timestamp": "2026-06-16T10:30:01Z",
   "payload": {
     "delta": "我需要先分析用户的意图...",
     "done": false
@@ -368,398 +218,258 @@ Server 内部:
 }
 ```
 
-> iOS 展示建议：折叠在"思考中..."区域内，默认折叠，用户可展开查看。
+| payload | 说明 |
+|---------|------|
+| `delta` | 当前思考 token |
+| `done` | `true` = 思考块结束 |
 
-#### message_stop（Server → iOS）
+> iOS 折叠展示，默认收起。重连时未完成流丢弃。
+
+### 2.3 message — 内容消息（双向）
+
+**role: assistant 或 user** | priority: 0/1/2（按 subType）
+
+**iOS 只需一个 `onMessage` 处理器，根据 `subType` 分发。**
 
 ```json
+// ===== priority 0：流式 =====
+// 流式文本
 {
-  "role": "assistant",
-  "type": "message_stop",
-  "sessionId": "sess-abc123",
-  "priority": 1,
+  "role": "assistant", "type": "message", "subType": "text",
+  "agentId": "agent-001", "sessionId": "main", "priority": 0,
+  "timestamp": "2026-06-16T10:30:01Z",
+  "payload": {"index": 0, "delta": "我来", "done": false}
+}
+// done=true → 文本块结束
+{"role":"assistant","type":"message","subType":"text","agentId":"agent-001","sessionId":"main","priority":0,
+ "timestamp":"...","payload":{"index":0,"delta":"","done":true}}
+
+// ===== priority 1：普通业务 =====
+// 用户输入
+{
+  "role": "user", "type": "message", "subType": "chat",
+  "agentId": "agent-001", "sessionId": "main", "seq": 1, "priority": 1,
+  "timestamp": "2026-06-16T10:30:00Z",
+  "payload": {
+    "content": "帮我搜索 Transformer 注意力机制的论文",
+    "ios_tools": [{"name":"share_sheet","description":"打开系统分享菜单","parameters":{...}}]
+  }
+}
+
+// 最终回复
+{
+  "role": "assistant", "type": "message", "subType": "reply",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
   "timestamp": "2026-06-16T10:35:00Z",
   "payload": {
     "content": "## 调研结果\n\n找到 48 篇论文，22 篇高相关...",
-    "files": [
-      {"name": "survey.md", "path": "/papers/outputs/proj-xxx/survey.md", "size_bytes": 45200}
-    ]
+    "files": [{"name":"survey.md","path":"/papers/outputs/proj-xxx/survey.md","size_bytes":45200}]
   }
+}
+
+// 标题变更
+{
+  "role": "assistant", "type": "message", "subType": "title",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "timestamp": "2026-06-16T10:30:05Z",
+  "payload": {"title": "Transformer文献调研"}
+}
+
+// 后台通知（任务完成等）
+{
+  "role": "assistant", "type": "message", "subType": "notification",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "timestamp": "2026-06-16T12:00:00Z",
+  "payload": {
+    "title": "入库完成",
+    "body": "Transformer 文献调研：48 篇论文，22 篇高相关已入库",
+    "category": "task_complete",
+    "data": {"taskId": "task-20260616-001"}
+  }
+}
+
+// ===== priority 2：阻塞 =====
+// Plan 被拒绝
+{
+  "role": "assistant", "type": "message", "subType": "plan_rejected",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
+  "timestamp": "2026-06-16T10:30:20Z",
+  "payload": {"taskId": "task-20260616-001", "reason": "请重新制定计划"}
 }
 ```
 
-> LLM 本轮完整回复结束。可能包含文件附件。
+| subType | priority | role | 说明 | payload 关键字段 |
+|---------|----------|------|------|-----------------|
+| `text` | 0 | assistant | 流式/全文文本 | `index`, `delta`, `done` |
+| `chat` | 1 | user | 用户输入 | `content`, `ios_tools` |
+| `reply` | 1 | assistant | 最终回复 | `content`, `files` |
+| `title` | 1 | assistant | 标题变更 | `title` |
+| `notification` | 1 | assistant | 后台任务通知 | `title`, `body`, `category`, `data` |
+| `plan_rejected` | 2 | assistant | Plan 被拒 | `taskId`, `reason` |
 
----
+> **seq**：仅 `chat` 需要，递增。新 seq → Server 放弃当前处理。
+> **流式中断**：重连时丢弃未完成的 `text` 流。LLM 完成后直接发 `reply` 带完整文本。
 
-### 3.2 工具调用
+### 2.4 tool — 工具调用（双向）
 
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `tool_use` | assistant | 1 | Server 请求 iOS 执行工具 |
-| `tool_use_display` | assistant | 2 | Server 工具执行中（iOS 仅展示） |
-| `tool_result` | user | 1 | iOS 回传工具执行结果 |
-
-#### tool_use（Server → iOS，需要 iOS 执行）
-
-```json
-{
-  "role": "assistant",
-  "type": "tool_use",
-  "sessionId": "sess-abc123",
-  "priority": 1,
-  "timestamp": "2026-06-16T10:30:03Z",
-  "payload": {
-    "id": "call_abc123",
-    "name": "share_sheet",
-    "input": {
-      "text": "推荐论文: Attention Is All You Need",
-      "url": "https://arxiv.org/abs/1706.03762"
-    },
-    "location": "ios",
-    "timeout": 30
-  }
-}
-```
-
-| 字段 | 说明 |
-|------|------|
-| `id` | 工具调用唯一 ID，iOS 回传 `tool_result` 时用 |
-| `name` | 工具名称 |
-| `input` | 工具参数 |
-| `location` | `"ios"` = iOS 必须执行并回传结果 |
-| `timeout` | 超时秒数，仅 `location: "ios"` 时有效 |
-
-#### tool_use_display（Server → iOS，仅展示）
+**role: assistant 或 user** | priority: 0/1/2（按 subType）
 
 ```json
+// ===== priority 0：Server 工具展示 =====
 {
-  "role": "assistant",
-  "type": "tool_use_display",
-  "sessionId": "sess-abc123",
-  "priority": 2,
+  "role": "assistant", "type": "tool", "subType": "server",
+  "agentId": "agent-001", "sessionId": "main", "priority": 0,
   "timestamp": "2026-06-16T10:30:03Z",
   "payload": {
+    "id": "call_s1",
     "name": "search_papers",
-    "input": {
-      "keywords": "transformer attention mechanism",
-      "sources": "arxiv,semantic_scholar",
-      "max_results": 20
-    },
-    "location": "server",
+    "input": {"keywords": "transformer attention", "sources": "arxiv,semantic_scholar"},
     "status": "running"
   }
 }
-```
+// 同 id 多次推送：status running → done/failed。iOS 据此 spinner→✓/✗
 
-| 字段 | 说明 |
-|------|------|
-| `location` | `"server"` = iOS 仅展示，不执行 |
-| `status` | `"running"` = 执行中 / `"done"` = 完成 / `"failed"` = 失败 |
-
-> 同一个 server tool 调用会收到多条 `tool_use_display`：status 从 running → done/failed。iOS 可据此显示 spinner → ✓/✗。
-
-#### tool_result（iOS → Server）
-
-```json
+// ===== priority 2：请求 iOS 执行 =====
 {
-  "role": "user",
-  "type": "tool_result",
-  "sessionId": "sess-abc123",
-  "priority": 1,
-  "timestamp": "2026-06-16T10:30:05Z",
+  "role": "assistant", "type": "tool", "subType": "ios",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
+  "timestamp": "2026-06-16T10:30:03Z",
   "payload": {
-    "tool_call_id": "call_abc123",
-    "content": "已成功分享到微信"
+    "id": "call_x1",
+    "name": "share_sheet",
+    "input": {"text": "推荐论文: Attention Is All You Need", "url": "https://arxiv.org/abs/1706.03762"},
+    "timeout": 30
   }
+}
+
+// ===== priority 1：iOS 工具结果 =====
+// 成功
+{
+  "role": "user", "type": "tool", "subType": "result",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "timestamp": "2026-06-16T10:30:05Z",
+  "payload": {"tool_call_id": "call_x1", "content": "已分享到微信"}
+}
+// 失败
+{
+  "role": "user", "type": "tool", "subType": "result",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "timestamp": "2026-06-16T10:30:05Z",
+  "payload": {"tool_call_id": "call_x1", "error": "用户取消"}
 }
 ```
 
-错误时：
+| subType | priority | role | payload 关键字段 |
+|---------|----------|------|-----------------|
+| `server` | 0 | assistant | `id`, `name`, `input`, `status` |
+| `ios` | 2 | assistant | `id`, `name`, `input`, `timeout` |
+| `result` | 1 | user | `tool_call_id`, `content` / `error` |
+
+> **重连时**：`server` 不回放历史，改为发 `phase` 带当前进度。
+
+### 2.5 review — 审批（双向）
+
+**role: assistant（请求）/ user（回复）** | **priority: 2**（立即推送）
+
+一个 `review` 类型承载所有"暂停等用户"的交互。`subType` + `role` 完整区分场景。
+
 ```json
+// ===== Server → iOS：审批请求 =====
+// 澄清问题
 {
-  "role": "user",
-  "type": "tool_result",
-  "sessionId": "sess-abc123",
-  "priority": 1,
+  "role": "assistant", "type": "review", "subType": "clarify",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
   "timestamp": "2026-06-16T10:30:05Z",
-  "payload": {
-    "tool_call_id": "call_abc123",
-    "content": null,
-    "error": "用户取消了分享操作"
-  }
-}
-```
-
----
-
-### 3.3 Plan 流程
-
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `clarify_question` | assistant | 1 | 澄清问题 |
-| `clarify_response` | user | 1 | 用户回答澄清问题 |
-| `plan` | assistant | 1 | 生成的执行计划 |
-| `plan_confirm` | user | 0 | 用户确认/拒绝计划 |
-| `plan_rejected` | assistant | 0 | 计划被拒绝的响应 |
-
-#### clarify_question（Server → iOS）
-
-```json
-{
-  "role": "assistant",
-  "type": "clarify_question",
-  "sessionId": "sess-abc123",
-  "priority": 1,
-  "timestamp": "2026-06-16T10:30:01Z",
   "payload": {
     "message": "为了更准确地搜索，请确认以下问题：",
     "questions": [
-      {
-        "id": "q1",
-        "question": "您关注的是 AI 安全(security)还是功能安全(safety)？",
-        "options": ["AI 安全 (security)", "功能安全 (safety)", "两者都关注"]
-      },
-      {
-        "id": "q2",
-        "question": "时间范围？",
-        "options": ["近 1 年", "近 3 年", "近 5 年", "不限"]
-      }
+      {"id": "q1", "question": "关注 AI 安全还是功能安全？", "options": ["AI 安全", "功能安全", "两者"]},
+      {"id": "q2", "question": "时间范围？", "options": ["近1年", "近3年", "近5年", "不限"]}
     ]
   }
 }
-```
 
-#### clarify_response（iOS → Server）
-
-```json
+// 执行计划
 {
-  "role": "user",
-  "type": "clarify_response",
-  "sessionId": "sess-abc123",
-  "priority": 1,
-  "timestamp": "2026-06-16T10:30:10Z",
-  "payload": {
-    "original_query": "帮我搜索 Transformer 注意力机制",
-    "answers": [
-      {"question_id": "q1", "answer": "AI 安全 (security)"},
-      {"question_id": "q2", "answer": "近 3 年"}
-    ]
-  }
-}
-```
-
-#### plan（Server → iOS）
-
-```json
-{
-  "role": "assistant",
-  "type": "plan",
-  "sessionId": "sess-abc123",
-  "priority": 1,
+  "role": "assistant", "type": "review", "subType": "plan",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
   "timestamp": "2026-06-16T10:30:15Z",
   "payload": {
     "taskId": "task-20260616-001",
     "goal": "Transformer 注意力机制 AI 安全方向文献调研",
     "summary": "分 3 次搜索，预计找到 40-60 篇论文",
     "steps": [
-      {"index": 1, "action": "search", "description": "搜索 adversarial attack on attention", "source": "semantic_scholar", "max_papers": 30},
-      {"index": 2, "action": "search", "description": "搜索 transformer robustness verification", "source": "arxiv", "max_papers": 20},
-      {"index": 3, "action": "evaluate", "description": "LLM 评估相关性，筛选高相关论文"},
+      {"index": 1, "action": "search", "description": "搜索 adversarial attack on attention", "max_papers": 30},
+      {"index": 2, "action": "search", "description": "搜索 transformer robustness verification", "max_papers": 20},
+      {"index": 3, "action": "evaluate", "description": "LLM 评估相关性"},
       {"index": 4, "action": "download", "description": "下载高相关论文 PDF"},
-      {"index": 5, "action": "convert_index", "description": "转换 Markdown 并索引入库"},
-      {"index": 6, "action": "survey", "description": "生成文献综述报告"}
+      {"index": 5, "action": "convert_index", "description": "转换并索引入库"},
+      {"index": 6, "action": "survey", "description": "生成文献综述"}
     ],
-    "markdown": "## 研究方案\n\n### 目标\nTransformer 注意力机制在 AI 安全方向...\n\n### 执行步骤\n1. ..."
+    "markdown": "## 研究方案\n\n..."
   }
 }
-```
 
-#### plan_confirm（iOS → Server）
-
-```json
-// 确认
+// ===== iOS → Server：审批回复 =====
+// 回答澄清
 {
-  "role": "user",
-  "type": "plan_confirm",
-  "sessionId": "sess-abc123",
-  "priority": 0,
-  "timestamp": "2026-06-16T10:30:20Z",
+  "role": "user", "type": "review", "subType": "clarify",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
+  "timestamp": "2026-06-16T10:30:10Z",
+  "payload": {
+    "answers": [
+      {"question_id": "q1", "answer": "AI 安全"},
+      {"question_id": "q2", "answer": "近3年"}
+    ]
+  }
+}
+
+// 确认/拒绝/修改计划
+{
+  "role": "user", "type": "review", "subType": "plan",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
   "payload": {
     "taskId": "task-20260616-001",
     "confirmed": true,
-    "modifications": null
+    "modifications": {"steps": [{"index": 1, "max_papers": 50}]}
   }
 }
 
-// 拒绝
+// 任务控制（替代旧版 task_control）
 {
-  "role": "user",
-  "type": "plan_confirm",
-  "sessionId": "sess-abc123",
-  "priority": 0,
-  "timestamp": "2026-06-16T10:30:20Z",
-  "payload": {
-    "taskId": "task-20260616-001",
-    "confirmed": false,
-    "reason": "搜索范围太窄了"
-  }
-}
-
-// 修改后确认
-{
-  "role": "user",
-  "type": "plan_confirm",
-  "sessionId": "sess-abc123",
-  "priority": 0,
-  "timestamp": "2026-06-16T10:30:20Z",
-  "payload": {
-    "taskId": "task-20260616-001",
-    "confirmed": true,
-    "modifications": {
-      "steps": [
-        {"index": 1, "max_papers": 50}
-      ]
-    }
-  }
+  "role": "user", "type": "review", "subType": "task_control",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
+  "payload": {"taskId": "task-20260616-001", "action": "pause"}
 }
 ```
 
----
-
-### 3.4 进度与状态
-
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `status` | assistant | 1 | 任务进度更新 |
-| `notification` | assistant | 0/1 | 通知（含 APNs 推送） |
-
-#### status（Server → iOS）
-
-```json
-{
-  "role": "assistant",
-  "type": "status",
-  "sessionId": "sess-abc123",
-  "priority": 1,
-  "timestamp": "2026-06-16T10:31:00Z",
-  "payload": {
-    "taskId": "task-20260616-001",
-    "phase": "execute",
-    "stage": "搜索论文",
-    "stageIndex": 1,
-    "totalStages": 6,
-    "message": "正在搜索 Semantic Scholar (第 1/3 轮)...",
-    "detail": {
-      "papersFound": 18,
-      "papersTotal": 30,
-      "currentPaper": "Attention Is All You Need"
-    }
-  }
-}
-```
-
-| phase | 触发时机 | iOS UI 建议 |
-|-------|---------|------------|
-| `preparing` | Plan 确认后，子 Agent 初始化中 | 展示"准备中..."spinner |
-| `clarify` | 正在分析需求 | 展示思考动画 |
-| `plan` | 方案已生成 | 展示方案卡片 |
-| `execute` | 正在执行 | 展示进度条 + 当前步骤 |
-| `verify` | 正在验证结果 | 展示"验证中..." |
-| `summarize` | 正在生成报告 | 展示生成动画 |
-| `paused` | 任务已暂停 | 展示暂停状态 + 继续按钮 |
-| `recovering` | 系统重启恢复中 | 展示"恢复中..."spinner |
-| `done` | 全部完成 | 展示结果摘要 |
-
-#### notification（Server → iOS）
-
-```json
-{
-  "role": "assistant",
-  "type": "notification",
-  "sessionId": "sess-abc123",
-  "priority": 0,
-  "timestamp": "2026-06-16T12:00:00Z",
-  "payload": {
-    "title": "入库完成",
-    "body": "Transformer 文献调研完成：48 篇论文，22 篇高相关已入库",
-    "category": "task_complete",
-    "data": {
-      "taskId": "task-20260616-001",
-      "projectId": "proj-xxx"
-    }
-  }
-}
-```
-
-> `priority: 0` → 触发 APNs。`priority: 1` → 合并推送（多条合并为一条"有 N 条新消息"）。`priority: 2` → 不推送。
-
----
-
-### 3.5 控制指令
-
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `task_control` | user | 0 | 暂停/恢复/取消任务 |
-| `task_control_ack` | assistant | 0 | 控制指令确认 |
-
-#### task_control（iOS → Server）
-
-```json
-{
-  "role": "user",
-  "type": "task_control",
-  "sessionId": "sess-abc123",
-  "priority": 0,
-  "timestamp": "2026-06-16T10:35:00Z",
-  "payload": {
-    "taskId": "task-20260616-001",
-    "action": "pause"
-  }
-}
-```
+| subType | role（请求） | role（回复） | payload 关键字段 |
+|---------|------------|------------|-----------------|
+| `clarify` | assistant → `questions[]` | user ← `answers[]` | 请求: `message`, `questions` / 回复: `answers` |
+| `plan` | assistant → `steps[]` | user ← `confirmed` | 请求: `taskId`, `goal`, `steps`, `markdown` / 回复: `taskId`, `confirmed`, `modifications?`, `reason?` |
+| `task_control` | — | user → `action` | `taskId`, `action`（pause/resume/cancel） |
 
 | action | 说明 |
 |--------|------|
-| `pause` | 暂停任务（当前阶段完成后暂停） |
-| `resume` | 恢复已暂停的任务 |
+| `pause` | 当前阶段完成后暂停 |
+| `resume` | 恢复已暂停任务 |
 | `cancel` | 取消任务 |
 
-#### task_control_ack（Server → iOS）
+Server 确认控制后通过 `phase(paused)` 或 `message(reply)` 反馈。
+
+> **重连时**：未过期（<30min）的 Server review 重新发送。过期忽略。
+> **被拒后**：Server 发 `message(plan_rejected, priority:2)`，立即推送。
+
+### 2.6 error — 错误
+
+**role: assistant** | **priority: 2**（立即推送） | subType = 错误码
 
 ```json
 {
-  "role": "assistant",
-  "type": "task_control_ack",
-  "sessionId": "sess-abc123",
-  "priority": 0,
-  "timestamp": "2026-06-16T10:35:01Z",
-  "payload": {
-    "taskId": "task-20260616-001",
-    "action": "pause",
-    "status": "ok",
-    "message": "任务将在当前阶段完成后暂停"
-  }
-}
-```
-
----
-
-### 3.6 错误
-
-| type | role | priority | 说明 |
-|------|------|----------|------|
-| `error` | assistant | 0/1 | 错误通知 |
-
-```json
-{
-  "role": "assistant",
-  "type": "error",
-  "sessionId": "sess-abc123",
-  "priority": 0,
+  "role": "assistant", "type": "error", "subType": "TOOL_TIMEOUT",
+  "agentId": "agent-001", "sessionId": "main", "priority": 2,
   "timestamp": "2026-06-16T10:32:00Z",
   "payload": {
-    "code": "TOOL_TIMEOUT",
     "message": "iOS 工具 'share_sheet' 在 30s 内未响应",
     "toolCallId": "call_abc123",
     "recoverable": true
@@ -767,222 +477,168 @@ Server 内部:
 }
 ```
 
-| code | 说明 | recoverable |
-|------|------|-------------|
-| `TOOL_TIMEOUT` | iOS 工具超时未响应 | true |
-| `TOOL_EXPIRED` | tool_result 迟于超时到达，已被忽略 | true |
+| subType | 说明 | recoverable |
+|---------|------|-------------|
+| `TOOL_TIMEOUT` | iOS 工具超时 | true |
+| `TOOL_EXPIRED` | tool_result 到达太晚 | true |
 | `TOOL_NOT_FOUND` | iOS 声明的工具不存在 | true |
-| `SESSION_EXPIRED` | 会话 ID 无效 | false (需重连) |
+| `SESSION_EXPIRED` | session 无效 | false（需重连） |
 | `TASK_FAILED` | 任务执行失败 | true |
 | `INTERNAL_ERROR` | 服务端内部错误 | false |
 | `AGENT_NOT_FOUND` | agent_id 不存在 | false |
 | `RATE_LIMITED` | 请求速率限制 | true |
 
+> **重连时**：error 全部回放。
+
 ---
 
-## 4. Session 内存隔离
+## 三、连接生命周期
+
+### 3.1 连接握手
+
+```
+iOS → Server:  WS 连接 /ws/chat/agent-001/main
+iOS → Server:  message(chat, seq:1)              ← 立即发送，不等 Server
+
+Server:
+  1. 收到 chat → 检查 session（不存在则自动创建）
+  2. 发送 phase(connected)                        ← 握手确认
+  3. 处理 chat → LLM 响应
+  4. 首条消息 → LLM 生成标题 → message(title)
+```
+
+### 3.2 状态机
+
+| 状态 | WS 消息 | APNs |
+|------|---------|------|
+| `connected` | ✅ 所有 priority | ❌ |
+| `disconnected` | ❌ | priority 2 立即推 / priority 1 合并推 |
+| `reconnecting` | phase(recovering) | ❌ |
+
+### 3.3 完整流程
+
+```
+iOS 连接 WS
+    │
+    ▼
+iOS → message(chat, seq:1)                         ← 立即发送
+    │
+    ▼
+Server: 检查有效性
+    │  ├── agent 不存在 → error(AGENT_NOT_FOUND)
+    │  ├── session 无效 → error(SESSION_EXPIRED)
+    │  └── 有效 → phase(connected)                  ← 握手
+    │
+    ▼
+Server: 检查历史
+    │  ├── 未完成任务 → phase(recovering) → 恢复
+    │  └── 未完成流式 → 丢弃 → LLM 完成后 message(reply)
+    │
+    ▼
+正常交互: message(chat) ↔ thinking / message(text) / tool / review / phase
+    │
+    ▼
+iOS 断开 → Server 继续执行 → 按 priority 分流:
+    priority 2 → APNs 立即推送
+    priority 1 → APNs 合并推送 + Redis 缓存
+    priority 0 → 丢弃
+    │
+    ▼
+iOS 重连 → phase(connected) → Redis 回放 → 正常交互
+```
+
+### 3.4 重连事件处理
+
+| 事件 | 处理 |
+|------|------|
+| 未完成的 `thinking` / `message(text)` 流 | 丢弃。LLM 完成后发 `message(reply)` |
+| `tool(server)` 历史 | 不回放。发 `phase` 带当前进度 |
+| `review`（Server→iOS，未过期 <30min） | 重新发送 |
+| `error` | 全部回放 |
+| 已完成任务 | 最近 1 条 `message(reply)`，其余合并通知 |
+
+### 3.5 后台切换
+
+```
+进入后台 → ~30s 后 WS 断开 → priority 2 立即推 / priority 1 合并推
+进入前台 → 重连 WS → 停止 APNs → §3.4 流程
+```
+
+### 3.6 崩溃恢复
+
+```
+崩溃: Redis AOF（<1s 丢失窗口）+ LangGraph checkpoint（<1 节点丢失）
+重启: LangGraph 恢复 → Celery Worker 重入队
+重连: phase(recovering) → 继续执行
+```
+
+---
+
+## 四、Session 内存隔离
 
 | 记忆层 | main session | 命名 session | temp session |
 |--------|-------------|-------------|-------------|
-| ShortTerm | ✅ 独立窗口，重启恢复 | ✅ 独立窗口 | ✅ 当前窗口，断开丢弃 |
-| MidTerm (checkpoint) | ✅ LangGraph 自动 | ✅ 可选 | ❌ |
-| LongTerm (对话摘要) | ✅ 自动写入 agent_conversations | ⚠️ 用户手动 promote | ❌ |
-| LongTerm (论文/RAD) | ✅ 全局共享 | ✅ 全局共享 | ✅ 全局共享 |
-| MetaMemory (偏好) | ✅ 学习 | ❌ | ❌ |
-| 术语库 | ✅ 全局共享 | ✅ 全局共享 | ✅ 全局共享 |
-
-**规则**：main session 是持久入口；命名 session 默认不写 LongTerm（避免随口问题变永久记忆），用户说"记住"才 promote；temp session 断开即丢弃。RAD 层不做 session 隔离——所有 session 搜论文结果一致。
+| ShortTerm | ✅ 独立，重启恢复 | ✅ 独立 | ✅ 断开丢弃 |
+| MidTerm | ✅ LangGraph 自动 | ✅ 可选 | ❌ |
+| LongTerm (对话) | ✅ 自动 | ⚠️ 用户 promote | ❌ |
+| LongTerm (论文) | ✅ 全局共享 | ✅ 全局共享 | ✅ 全局共享 |
+| MetaMemory | ✅ 学习 | ❌ | ❌ |
 
 ---
 
-## 5. 完整交互示例
+## 五、完整交互示例
 
 ```
-# 1. 连接 + 首条消息（隐含握手）
-iOS → Server:  WebSocket /ws/chat/agent-001/main 连接建立
-iOS → Server:  chat({content:"搜 Transformer 注意力机制论文", seq:1})
-                ← 立即发送，不等 Server
+# 1. 连接 + 首条消息
+C→S:  message(chat, seq:1, priority:1)
+        {"role":"user","type":"message","subType":"chat","content":"搜 Transformer 论文",...}
 
-# 2. Server 确认
-Server → iOS:  connected({sessionTitle:"Transformer文献调研", historyCount:42})
+# 2. 握手
+S→C:  phase(connected, priority:0)
+        {"role":"assistant","type":"phase","subType":"connected","sessionTitle":"...",...}
 
-# 3. Agent 开始回复
-Server → iOS:
-  {"role":"assistant","type":"thinking_delta","priority":2,"payload":{"delta":"用户想搜索论文...","done":false}}
-Server → iOS:
-  {"role":"assistant","type":"thinking_delta","priority":2,"payload":{"delta":"需要先澄清搜索范围","done":true}}
-Server → iOS:
-  {"role":"assistant","type":"text_delta","priority":2,"payload":{"delta":"我来帮你","done":false}}
-Server → iOS:
-  {"role":"assistant","type":"text_delta","priority":2,"payload":{"delta":"明确一下需求","done":true}}
+# 3. 思考 + 文本流（priority=0）
+S→C:  thinking  →  {"role":"assistant","type":"thinking","delta":"分析意图...","done":false}
+S→C:  message(text) → {"role":"assistant","type":"message","subType":"text","delta":"我来帮你","done":false}
+S→C:  message(text) → {"role":"assistant","type":"message","subType":"text","delta":"","done":true}
 
-# 4. 澄清问题
-Server → iOS:
-  {"role":"assistant","type":"clarify_question","priority":1,"payload":{"questions":[{"id":"q1","question":"..."}]}}
+# 4. 澄清（priority=2，阻塞）
+S→C:  review(clarify) → {"role":"assistant","type":"review","subType":"clarify","questions":[...]}
+C→S:  review(clarify) → {"role":"user","type":"review","subType":"clarify","answers":[...]}
 
-# 5. 用户回答
-iOS → Server:
-  {"role":"user","type":"clarify_response","priority":1,"payload":{"answers":[{"question_id":"q1","answer":"..."}]}}
+# 5. 计划（priority=2，阻塞）
+S→C:  review(plan) → {"role":"assistant","type":"review","subType":"plan","taskId":"t1","steps":[...]}
+C→S:  review(plan) → {"role":"user","type":"review","subType":"plan","taskId":"t1","confirmed":true}
 
-# 6. 生成计划
-Server → iOS:
-  {"role":"assistant","type":"plan","priority":1,"payload":{"taskId":"task-001","steps":[...]}}
+# 6. 执行（priority=0 展示 + priority=2 iOS工具）
+S→C:  phase(execute, stageIndex:1, totalStages:6)
+S→C:  tool(server) → {"role":"assistant","type":"tool","subType":"server","status":"running"}
+S→C:  tool(server) → {"role":"assistant","type":"tool","subType":"server","status":"done"}
+S→C:  tool(ios)    → {"role":"assistant","type":"tool","subType":"ios","id":"x1","name":"share_sheet"}
+C→S:  tool(result) → {"role":"user","type":"tool","subType":"result","tool_call_id":"x1","content":"已分享"}
+S→C:  phase(execute, stageIndex:3)
 
-# 7. 用户确认
-iOS → Server:
-  {"role":"user","type":"plan_confirm","priority":0,"payload":{"taskId":"task-001","confirmed":true}}
+# 7. 用户取消任务（priority=2）
+C→S:  review(task_control) → {"role":"user","type":"review","subType":"task_control","action":"cancel"}
+S→C:  phase(paused)
 
-# 8. 执行中 — Server 工具展示
-Server → iOS:
-  {"role":"assistant","type":"status","priority":1,"payload":{"phase":"execute","stage":"搜索","stageIndex":1,"totalStages":6}}
-Server → iOS:
-  {"role":"assistant","type":"tool_use_display","priority":2,"payload":{"name":"search_papers","location":"server","status":"running"}}
-Server → iOS:
-  {"role":"assistant","type":"tool_use_display","priority":2,"payload":{"name":"search_papers","location":"server","status":"done"}}
-Server → iOS:
-  {"role":"assistant","type":"status","priority":1,"payload":{"phase":"execute","stage":"下载","stageIndex":3,"totalStages":6}}
-
-# 9. 可能穿插 iOS 工具调用
-Server → iOS:
-  {"role":"assistant","type":"tool_use","priority":1,"payload":{"id":"call_x1","name":"share_sheet","location":"ios","timeout":30,...}}
-iOS → Server:
-  {"role":"user","type":"tool_result","priority":1,"payload":{"tool_call_id":"call_x1","content":"已分享"}}
-
-# 10. 完成
-Server → iOS:
-  {"role":"assistant","type":"message_stop","priority":1,"payload":{"content":"## 调研结果\n...","files":[...]}}
+# 8. 完成
+S→C:  message(reply, priority:1)
+        {"role":"assistant","type":"message","subType":"reply","content":"## 结果\n...","files":[...]}
 ```
 
 ---
 
-## 6. 连接生命周期
+## 六、iOS 本地 Tool 配置
 
-```
-iOS 连接 WS(/ws/chat/{agent_id}/{session_id})
-    │
-    ▼
-Server: 检查 agent_id + session_id 有效性
-    │  ├── agent 不存在 → error(AGENT_NOT_FOUND)
-    │  ├── session 无效 → error(SESSION_EXPIRED) → iOS 重新创建 session
-    │  └── 有效 → 从 LangGraph checkpoint 恢复该 session 的状态
-    │
-    ▼
-Server: 检查连接状态
-    │  ├── 有未完成任务 → status(phase:"recovering") → 恢复进度
-    │  ├── 有已完成任务 → notification(最近1条) + 聚合通知
-    │  └── 有未完成流式 → 丢弃 delta 缓存 → 等 LLM 完成 → message_stop
-    │
-    ▼
-正常交互: chat ↔ text_delta / thinking_delta / tool_use / status / message_stop
-    │
-    ▼
-iOS 断开 (进入后台 / 网络切换 / 主动关闭):
-    Server 标记连接状态 = disconnected
-    Agent 继续执行未完成任务
-    事件按 priority 分流:
-      priority 0 → APNs 推送
-      priority 1 → APNs 合并推送 + Redis 缓存
-      priority 2 → 丢弃（不缓存，不推送）
-    │
-    ▼
-iOS 重连:
-    Server 标记连接状态 = connected
-    停止 APNs 推送（用户已在线）
-    Redis 回放 priority 1 缓存事件
-    创建 HistoryAgent 处理过期消息
-    正常交互
-```
+每次 `message(chat)` 携带可用工具列表。Server 通过 `tool(ios)` 请求执行。
 
-### 5.1 连接状态
-
-Server 内部维护每条 WebSocket 连接的状态：
-
-| 状态 | 含义 | WS 消息 | APNs |
-|------|------|---------|------|
-| `connected` | 正常连接 | ✅ 所有 priority | ❌ |
-| `disconnected` | 已断开 | ❌ | priority 0/1 |
-| `reconnecting` | 正在重连恢复 | status(phase:"recovering") | ❌ |
-
-### 5.2 重连时的事件处理
-
-| 事件类型 | 处理方式 |
-|----------|----------|
-| 未完成的 `text_delta` 流 | 丢弃。LLM 完成后直接发 `message_stop` |
-| 未完成的 `thinking_delta` 流 | 丢弃。不缓存、不回放 |
-| `tool_use_display` (server) | 不回放。重连后发一条 `status` 带当前阶段 |
-| `notification` (已完成任务) | 只回放最近 1 条 `message_stop`，更早的合并为 "你离开期间完成了 N 个任务" |
-| `clarify_question` | 如果未过期（< 30 分钟），重新发送。否则忽略 |
-| `plan` | 如果未过期（< 30 分钟），重新发送。否则忽略 |
-| `error` | 全部回放（用户需要知道出了什么错） |
-
-### 5.3 后台切换与 APNs 降级
-
-```
-iOS 进入后台 (app 挂起):
-  1. iOS 有 ~30 秒可以继续收 WS 消息
-  2. 30 秒后系统断开 WS 连接
-  3. Server 检测到 disconnect → 切换为 APNs 模式
-
-iOS 进入前台 (app 激活):
-  1. iOS 重新建立 WS 连接 (相同 sessionId)
-  2. Server 检测到 reconnect → 停止 APNs → 走 5.2 重连流程
-
-APNs 推送规则:
-  - priority 0: 每条独立推送 (如 "任务失败"、"Plan 待确认")
-  - priority 1: 合并推送 (最多每 10 分钟一条，如 "有 5 条新消息")
-  - priority 2: 不推送
-```
-
-### 5.4 消息序列号 (seq) 与取消
-
-```
-iOS 发送消息时必须带递增的 `seq`:
-
-iOS → chat(seq=1, "搜 Transformer")
-iOS → chat(seq=2, "不对，搜 BERT")            ← seq=2 > 1
-iOS → chat(seq=3, "算了看看库里有什么")       ← seq=3 > 2
-
-Server:
-  收到 seq=1 → 开始处理 (parse_intent)
-  收到 seq=2 → seq > current_seq → 放弃 seq=1 的处理 → 开始 seq=2
-  收到 seq=3 → seq > current_seq → 放弃 seq=2 的处理 → 开始 seq=3
-
-Server 只处理最新的 seq 消息。之前的处理被取消（checkpoint 不回滚）。
-```
-
-### 5.5 进程崩溃恢复
-
-```
-[Server 崩溃]
-  1. Agent 进程终止
-  2. Redis AOF 保证崩溃前 1 秒内的事件已持久化
-  3. LangGraph checkpoint (SQLite) 保证最后完成节点的状态已保存
-
-[Server 重启]
-  1. LangGraph 从 SQLite checkpoint 恢复 Plan Graph 状态
-  2. Redis AOF 自动恢复事件队列
-  3. Celery Worker 重启，未完成的任务重新入队
-
-[iOS 重连]
-  1. Server → status(phase:"recovering", message:"系统正在恢复...")
-  2. 从 checkpoint 恢复 → 检查与 iOS 最后状态的差异
-  3. Server → status(phase:"execute", message:"重新开始阶段 3...")
-  4. 继续执行
-
-数据丢失窗口: 崩溃前最后 1 秒 (AOF appendfsync everysec)。
-            上一个 checkpoint 之后完成但未 checkpoint 的节点（通常 1 个节点）。
-```
-
----
-
-## 7. iOS 本地 Tool 配置
-
-每次 `chat` 消息携带当前可用的 iOS 工具列表：
+### 工具定义格式
 
 ```json
 {
   "name": "share_sheet",
-  "description": "打开系统分享菜单，分享文本/链接/文件",
+  "description": "打开系统分享菜单",
   "parameters": {
     "type": "object",
     "properties": {
@@ -994,14 +650,17 @@ Server 只处理最新的 seq 消息。之前的处理被取消（checkpoint 不
 }
 ```
 
-| iOS Tool | 说明 |
-|----------|------|
+### 可用 Tool
+
+| Tool | 说明 |
+|------|------|
 | `share_sheet` | 系统分享菜单 |
 | `open_url` | Safari 打开 URL |
 | `save_file` | 保存文件到本地 |
-| `pick_file` | 从文件选择器选取文件（如上传 PDF） |
+| `pick_file` | 从文件选择器选取文件 |
 | `notification_permission` | 请求通知权限 |
 
 ---
 
-> 版本: v2.4 | 握手修正：首条chat隐含握手, connected变确认为回复, sessionTitle可为null | 2026-06-16
+> **版本**: v6.0 | 7 大类（type）+ 子类（subType）。priority: 0=流式 1=普通 2=阻塞。APNs: 0不推 1合并 2立即 | 2026-06-16
+> **配套文档**: [REST API](./rest-api.md)
