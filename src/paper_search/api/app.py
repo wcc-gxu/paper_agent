@@ -1,4 +1,4 @@
-"""FastAPI 应用 — Paper Agent REST + WebSocket + SSE.
+"""FastAPI 应用 — Paper Agent REST + WebSocket.
 
 启动方式:
     uvicorn paper_search.api.app:app --host 0.0.0.0 --port 8000

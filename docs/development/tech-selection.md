@@ -171,7 +171,7 @@ papers_fulltext = chromadb.Collection(
 ```
 P0: Semantic Scholar → 元数据主来源 (2亿+，完整摘要 + AI排序 + 引用关系 + OA PDF)
 P1: arXiv + PubMed (并行补充，预印本 + 生物医学)
-P2: OpenAlex + ScienceDirect (广度补充，免费无key + 爱思唯尔)
+P2: OpenAlex（Semantic Scholar 降级方案，免费无 Key）+ ScienceDirect（爱思唯尔）
 P3: IEEE Xplore + CNKI (按需，工程 + 中文)
 ```
 
@@ -253,6 +253,7 @@ providers/
 | 向量数据库 | ChromaDB | 保持 |
 | 关系数据库 | SQLite | 保持 |
 | 搜索引擎 | 6 个 Provider (arxiv/s2/pubmed/ieee/sciencedirect/cnki) | 保持 |
+| 通用搜索 | 火山引擎联网搜索 API (500次/月) + web_fetch 降级 | 新增 |
 | 部署 | Docker + docker-compose | 新增 |
 | PDF 转换 | pymupdf4llm | 保持 |
 | Embedding 模型 | OpenAIEmbeddings (text-embedding-3-small) | 替换本地模型 |

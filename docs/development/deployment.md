@@ -127,6 +127,7 @@ LLM_DEFAULT_MODEL=deepseek-v4-pro
 SEMANTIC_SCHOLAR_API_KEY=your_key
 ELSEVIER_API_KEY=your_key
 IEEE_API_KEY=your_key
+WEB_SEARCH_API_KEY=your_key
 
 # ── Redis ───────────────────────────────
 REDIS_URL=redis://redis:6379/0
@@ -140,7 +141,7 @@ AGENT_DATA_DIR=/root/.paper_search
 # ── Agent 配置 ───────────────────────────
 AGENT_MAX_STEPS=50
 AGENT_MAX_AUTO_RETRIES=2
-AGENT_SHORT_TERM_MAX_TOKENS=8000
+AGENT_SHORT_TERM_MAX_TOKENS=16000
 AGENT_IOS_TOOL_DEFAULT_TIMEOUT=30
 
 # ── Celery 配置 ──────────────────────────

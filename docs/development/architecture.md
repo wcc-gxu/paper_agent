@@ -29,7 +29,7 @@
               │  │  启动/恢复/迁移               │   │
               │  └──────────────────────────────┘   │
               │  ┌──────────────────────────────┐   │
-              │  │  AgentRegistry (7 种子Agent)   │   │
+              │  │  AgentRegistry (6 种子Agent)  │   │
               │  │  IngestAgent / RADQueryAgent  │   │
               │  │  ClusteringAgent /            │   │
               │  │  CitationChaseAgent /         │   │
@@ -245,52 +245,234 @@ src/paper_search/agent/tool_registry.py
     │
     ├── 注册: @register_tool / registry.register_direct()
     ├── 查询: get() / get_by_category() / get_by_tag()
-    ├── 导出: to_langchain() / to_anthropic() / to_mcp()
+    ├── 导出: to_langchain() / to_anthropic()
     │
     └── 每个工具标记:
         ├── location: "server" | "ios"
-        ├── category: search | download | convert | index | analyze | export | manage | kb | subscription
+        ├── category: search | download | convert | index | analyze | export | manage | kb | subscription | system | network | memory | ios
         ├── is_idempotent: bool (重试安全)
         ├── is_long_running: bool (→ Celery)
         └── progress_report: bool (→ TaskLogger JSON 日志)
 ```
 
-### 5.2 工具列表
+### 5.2 全系统工具清单
+
+#### 5.2.1 主 Agent 工具（35 个）
+
+**通用工具（6 个）**
+
+| 工具 | 实现 | 功能 |
+|------|------|------|
+| `read_file` | Python `open()` | 读取文件（论文 MD、日志、配置） |
+| `write_file` | Python `open()` | 写入文件（报告、BibTeX、配置） |
+| `edit_file` | Python 字符串替换 | 精确编辑文件 |
+| `glob_files` | Python `pathlib.glob` | 文件模式匹配 |
+| `grep_content` | Python `re` / ripgrep | 文件内容搜索 |
+| `bash_exec` | `subprocess.run` | Shell 命令（pip/apt/git/curl/ffmpeg） |
+
+**网络工具（2 个）**
+
+| 工具 | 实现 | 功能 |
+|------|------|------|
+| `web_search` | 火山引擎联网搜索 API（httpx） | 通用网页/图片搜索，500 次/月免费 |
+| `web_fetch` | httpx + BeautifulSoup | 抓取单个 URL → Markdown |
+
+> `web_search` 降级链：火山引擎 → web_fetch（httpx 直接抓取）→ bash_exec("curl ...")
+
+**系统运维（10 个）**
+
+| 工具 | 功能 |
+|------|------|
+| `service_start` | 启动 agent / celery_worker / redis |
+| `service_stop` | 停止服务 |
+| `service_status` | 查看运行状态 |
+| `docker_compose_up` | Docker 一键启动 |
+| `docker_compose_down` | Docker 停止 |
+| `apt_install` | Ubuntu 系统依赖安装 |
+| `pip_install` | Python 包安装 |
+| `env_config` | 读写 .env 配置 |
+| `log_view` | 查看 agent.log / task .jsonl |
+| `health_check` | 全面健康检查（Providers + LLM + DB + Redis） |
+
+**记忆管理（7 个）**
+
+| 工具 | 内存层 | 功能 |
+|------|--------|------|
+| `search_memory` | LongTerm | 搜索历史对话（agent_conversations） |
+| `summarize_memory` | ShortTerm→LongTerm | LLM 压缩旧对话为摘要 |
+| `delete_memory` | ShortTerm | 删除冗余消息 |
+| `extract_to_long_term` | ShortTerm→LongTerm | 提取持久知识 |
+| `tag_memory` | ShortTerm | 给消息打标签 |
+| `get_user_preference` | MetaMemory | 获取用户偏好 |
+| `list_collections` | ChromaDB | 列出所有集合 |
+
+**iOS 自动工具（9 个）**
+
+> 一次授权后 Agent 可直接调用，无需用户交互。
+
+| 工具 | 首次授权 | Agent 使用场景 |
+|------|---------|---------------|
+| `ios_file_read` | 文件访问 | 读取本地论文、报告 |
+| `ios_file_write` | 文件访问 | 保存报告、BibTeX 到本地 |
+| `ios_file_list` | 文件访问 | 列出已下载文件 |
+| `ios_calendar_add` | 日历 | "提醒我周五前读完这篇" → 事件 |
+| `ios_calendar_read` | 日历 | 了解空闲时段 |
+| `ios_reminder_add` | 提醒事项 | 设置研究提醒 |
+| `ios_notification_local` | 通知 | 每日论文推送、任务完成通知 |
+| `ios_device_info` | 无 | 设备型号/系统版本/存储/网络状态 |
+| `ios_location_get` | 位置 | 查会议地点距离、获取时区 |
+
+> iOS 交互工具（share_sheet, open_url, pick_file, save_file_dialog, notification_permission）由 iOS 端自行实现，Agent 通过 `tool(ios, priority:2)` 请求触发，详参见 WebSocket 协议文档。
+
+**直接查询（3 个）**
+
+| 工具 | 功能 |
+|------|------|
+| `paper_status` | 查看项目/论文进度 |
+| `list_sources` | 检查搜索来源可用性 |
+| `get_paper_abstract` | 仅读摘要（省 token） |
+
+#### 5.2.2 子 Agent 工具（19 个，去重）
+
+| 工具 | 同步/异步 | 归属子 Agent |
+|------|----------|-------------|
+| `search_papers` | 同步 | IngestAgent, CitationChaseAgent |
+| `batch_search` | 同步 | IngestAgent |
+| `download_paper` | 异步(Celery) | IngestAgent, CitationChaseAgent |
+| `convert_paper` | 异步(Celery) | IngestAgent, CitationChaseAgent |
+| `index_paper` | 异步(Celery) | IngestAgent, CitationChaseAgent |
+| `evaluate_papers` | 同步(LLM) | IngestAgent, CitationChaseAgent |
+| `rank_papers` | 同步 | IngestAgent |
+| `generate_survey` | 异步(Celery) | IngestAgent |
+| `paper_export` | 同步 | IngestAgent |
+| `paper_clean` | 同步 | IngestAgent |
+| `citation_chase` | 同步 | CitationChaseAgent |
+| `search_library` | 同步(ChromaDB) | RADQueryAgent, ClusteringAgent, TranslationAgent |
+| `search_knowledge` | 同步(ChromaDB) | RADQueryAgent, TranslationAgent |
+| `read_paper` | 同步(文件) | RADQueryAgent, CitationChaseAgent |
+| `extract_knowledge` | 异步(Celery) | IngestAgent, RADQueryAgent, ClusteringAgent, TranslationAgent |
+| `find_related` | 同步(ChromaDB) | RADQueryAgent |
+| `discover_gaps` | 同步 | RADQueryAgent |
+| `build_glossary` | 同步(LLM) | TranslationAgent |
+| `translate_query` | 同步(LLM) | TranslationAgent |
+
+### 5.3 Tool × Agent 分配矩阵
+
+| Tool | 主Agent | Ingest | RADQuery | Cluster | CitationChase | History | Translation |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| search_papers | — | ✅ | — | — | ✅ | — | — |
+| batch_search | — | ✅ | — | — | — | — | — |
+| download_paper | — | ✅ | — | — | ✅ | — | — |
+| convert_paper | — | ✅ | — | — | ✅ | — | — |
+| index_paper | — | ✅ | — | — | ✅ | — | — |
+| evaluate_papers | — | ✅ | — | — | ✅ | — | — |
+| rank_papers | — | ✅ | — | — | — | — | — |
+| generate_survey | — | ✅ | — | — | — | — | — |
+| paper_export | — | ✅ | — | — | — | — | — |
+| paper_status | ✅ | ✅ | — | — | — | — | — |
+| paper_clean | — | ✅ | — | — | — | — | — |
+| citation_chase | — | — | — | — | ✅ | — | — |
+| list_sources | ✅ | ✅ | — | — | — | — | — |
+| search_library | — | — | ✅ | ✅ | — | — | ✅ |
+| search_knowledge | — | — | ✅ | — | — | — | ✅ |
+| read_paper | — | — | ✅ | — | ✅ | — | — |
+| get_paper_abstract | ✅ | — | ✅ | — | — | — | — |
+| list_collections | ✅ | — | ✅ | ✅ | — | ✅ | — |
+| extract_knowledge | — | ✅ | ✅ | ✅ | — | — | ✅ |
+| find_related | — | — | ✅ | — | — | — | — |
+| discover_gaps | — | — | ✅ | — | — | — | — |
+| search_memory | ✅ | — | ✅ | — | — | ✅ | — |
+| summarize_memory | ✅ | — | — | — | — | ✅ | — |
+| delete_memory | ✅ | — | — | — | — | ✅ | — |
+| extract_to_long_term | ✅ | — | — | — | — | ✅ | — |
+| tag_memory | ✅ | — | — | — | — | ✅ | — |
+| get_user_preference | ✅ | — | — | — | — | — | — |
+| build_glossary | — | — | — | — | — | — | ✅ |
+| translate_query | — | — | — | — | — | — | ✅ |
+| web_search | ✅ | — | — | — | — | — | — |
+| web_fetch | ✅ | — | — | — | — | — | — |
+| read_file | ✅ | — | — | — | — | — | — |
+| write_file | ✅ | — | — | — | — | — | — |
+| edit_file | ✅ | — | — | — | — | — | — |
+| glob_files | ✅ | — | — | — | — | — | — |
+| grep_content | ✅ | — | — | — | — | — | — |
+| bash_exec | ✅ | — | — | — | — | — | — |
+| service_start | ✅ | — | — | — | — | — | — |
+| service_stop | ✅ | — | — | — | — | — | — |
+| service_status | ✅ | — | — | — | — | — | — |
+| docker_compose_up | ✅ | — | — | — | — | — | — |
+| docker_compose_down | ✅ | — | — | — | — | — | — |
+| apt_install | ✅ | — | — | — | — | — | — |
+| pip_install | ✅ | — | — | — | — | — | — |
+| env_config | ✅ | — | — | — | — | — | — |
+| log_view | ✅ | — | — | — | — | — | — |
+| health_check | ✅ | — | — | — | — | — | — |
+| ios_file_read | ✅ | — | — | — | — | — | — |
+| ios_file_write | ✅ | — | — | — | — | — | — |
+| ios_file_list | ✅ | — | — | — | — | — | — |
+| ios_calendar_add | ✅ | — | — | — | — | — | — |
+| ios_calendar_read | ✅ | — | — | — | — | — | — |
+| ios_reminder_add | ✅ | — | — | — | — | — | — |
+| ios_notification_local | ✅ | — | — | — | — | — | — |
+| ios_device_info | ✅ | — | — | — | — | — | — |
+| ios_location_get | ✅ | — | — | — | — | — | — |
+
+### 5.4 子 Agent 执行模式
+
+每个子 Agent 支持两种执行模式：
+
+| 模式 | 说明 | 示例 |
+|------|------|------|
+| **Single Tool** | 主 Agent 调用子 Agent 执行单个 tool | "下载这篇论文" → IngestAgent.single(download_paper) |
+| **ExecuteGraph** | 子 Agent 运行完整的 LangGraph StateGraph | "调研 Transformer 安全方向" → IngestAgent.ExecuteGraph() |
 
 ```
-Server 工具 (Agent 进程内或 Celery 执行):
-  search_papers         → Engine.search()          [同步] [进度✓]
-  download_paper        → Celery Task              [异步] [进度✓]
-  convert_paper         → Celery Task              [异步] [进度✓]
-  index_paper           → Celery Task              [异步] [进度✓]
-  evaluate_papers       → LLMClientV2              [同步] [进度✓]
-  rank_papers           → JournalRanker            [同步] [进度✓]
-  generate_survey       → Celery Task              [异步] [进度✓]
-  paper_export          → 格式化                   [同步]
-  paper_status          → DB 查询                  [同步]
-  paper_clean           → DB 操作                  [同步]
-  batch_search          → Engine.batch_search()    [同步] [进度✓]
-  citation_chase        → Semantic Scholar API     [同步]
-  list_sources          → Engine.health_check()    [同步]
-  extract_knowledge     → LLM + DB                 [异步] [进度✓]
-  search_knowledge      → ChromaDB                 [同步]
-  search_library        → ChromaDB                 [同步]
-  read_paper            → 文件读取                 [同步]
-  get_paper_abstract    → DB 查询                  [同步]
-  search_memory         → ChromaDB conversations   [同步]
-  list_collections      → ChromaDB                 [同步]
-  get_user_preference   → MetaMemory               [同步]
-  summarize_memory      → LLM 压缩                [同步]
-  delete_memory         → ShortTerm 操作          [同步]
-  extract_to_long_term  → LongTermMemory           [同步]
-  tag_memory            → ShortTerm 操作          [同步]
-
-iOS 工具 (客户端声明, 发 tool_use 给 iOS 执行):
-  share_sheet, open_url, save_file, ...
-  (每次用户消息携带当前可用列表)
+主 Agent 收到用户请求
+  │
+  ├── 简单操作 → 主 Agent 直接调用 tool
+  │     ├── "检查论文入库进度" → paper_status
+  │     ├── "复制这篇的引用"    → ios_clipboard_write
+  │     └── "最近有什么 AI 安全新论文" → web_search
+  │
+  ├── Single Tool → 主 Agent → 子 Agent.single(tool)
+  │     ├── "下载这篇论文" → IngestAgent.single(download_paper)
+  │     └── "对抗攻击的英文关键词" → TranslationAgent.single(translate_query)
+  │
+  └── ExecuteGraph → 主 Agent → 子 Agent.ExecuteGraph()
+        ├── "调研 Transformer 安全方向" → IngestAgent.ExecuteGraph()
+        │     └── Celery Worker 后台执行，主 Agent 继续对话
+        │     └── 进度通过 phase(execute) 实时推送 iOS
+        ├── "分析这些论文的研究方向" → ClusteringAgent.ExecuteGraph()
+        ├── "这篇论文引用了哪些后续工作" → CitationChaseAgent.ExecuteGraph()
+        └── Agent 重启 → HistoryAgent.ExecuteGraph()
 ```
+
+### 5.5 web_search 降级链
+
+```
+用户问题需要联网事实核查
+  │
+  ├── 1. 优先: 火山引擎 web_search（500 次/月免费）
+  │     └── 成功 → 返回结构化结果
+  │
+  ├── 2. 降级: web_fetch（httpx 直接抓取目标 URL）
+  │     └── 已知 URL 时直接获取，或火山额度耗尽后
+  │
+  └── 3. 兜底: bash_exec("curl ...")
+        └── 以上均不可用时的最终降级
+```
+
+**火山引擎 API 配置**：
+
+| 项目 | 值 |
+|------|-----|
+| 端点 | `https://open.feedcoopapi.com/search_api/web_search` |
+| 认证 | `Bearer $WEB_SEARCH_API_KEY` |
+| 免费额度 | 500 次/月 |
+| 建议并发 | ≤ 5 |
 
 ---
+
 
 ## 6. 代码组织
 

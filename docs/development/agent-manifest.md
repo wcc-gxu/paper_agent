@@ -66,7 +66,7 @@
   },
   "memory": {
     "short_term": {
-      "max_tokens": 8000
+      "max_tokens": 16000
     },
     "mid_term": {
       "db_path": "~/.paper_search/agent.db",
@@ -83,8 +83,8 @@
         "papers_fulltext",
         "agent_conversations",
         "agent_knowledge",
-        "agent_terminology",
-        "agent_expressions"
+        "agent_expressions",
+        "agent_learnings"
       ],
       "sqlite_tables": ["knowledge_entries", "user_profile", "daily_expressions"]
     },

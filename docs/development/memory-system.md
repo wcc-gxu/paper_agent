@@ -50,7 +50,7 @@
 class ShortTermMemory:
     _turns: deque[ConversationTurn]  # 滑动窗口, max_turns=50
     _summary: str                     # 被压缩的旧对话摘要
-    max_tokens: int = 8000            # 触发压缩阈值
+    max_tokens: int = 16000           # 触发压缩阈值
 ```
 
 ### 3.2 LLM 压缩流程
@@ -125,6 +125,7 @@ papers_abstract       — 论文摘要索引 (快速筛选)
 papers_fulltext       — 论文全文分块索引 (深度检索)
 agent_conversations   — [NEW] 压缩后的对话摘要
 agent_knowledge       — 结构化的知识条目 (已有 knowledge_entries)
+agent_expressions     — [NEW] 学术术语中英对照（含 agent_terminology）+ 研究表达语料
 agent_learnings       — [NEW] "用户偏好 X"、"检索 Y 好于 Z"
 ```
 

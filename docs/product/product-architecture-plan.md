@@ -6,7 +6,7 @@
 
 ## Context
 
-当前 `paper_agant` 已具备论文搜索、下载、转换、索引、评估、排名、综述生成等基础能力（10 个 CLI + 8 个 MCP 工具），但缺少一个**完整的智能 Agent 层**来协调这些工具，实现真正的"科研助理"体验。
+当前 `paper_agant` 已具备论文搜索、下载、转换、索引、评估、排名、综述生成等基础能力（13 个 CLI 工具），但缺少一个**完整的智能 Agent 层**来协调这些工具，实现真正的"科研助理"体验。
 
 本方案基于 88 个结构化问题的讨论结果，覆盖需求→产品→架构→技术→难点→开发计划 6 大维度。
 
@@ -51,23 +51,23 @@
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                  Vue WebUI                       │
+│                  iOS 客户端                      │
 │  对话界面 │ 论文管理 │ 知识库浏览 │ 任务面板      │
 ├─────────────────────────────────────────────────┤
-│          REST API + WebSocket + SSE              │
+│          REST API + WebSocket                   │
 ├─────────────────────────────────────────────────┤
 │           Python Agent Engine (核心)             │
 │  Prompt优化 │ Agent Loop │ Tool Registry │ Memory │
 ├─────────────────────────────────────────────────┤
-│           CLI Tools (10个) + MCP Server          │
+│           CLI Tools (13个)                       │
 │  search │ download │ convert │ index │ ...       │
 ├─────────────────────────────────────────────────┤
-│     SQLite + ChromaDB + 文件系统                  │
+│     SQLite + ChromaDB + Redis(AOF) + 文件系统    │
 └─────────────────────────────────────────────────┘
 ```
 
 - **后端核心**：Python 单体服务，FastAPI + WebSocket
-- **客户端**：iOS（主），REST 扩展接口
+- **客户端**：iOS（主客户端），Vue WebUI（远期规划）
 - **交互协议**：WebSocket（全双工实时通信）+ REST（数据查询）
 - **消息格式**：自定义信封（role/type/subType/agentId/sessionId/seq/priority/timestamp/payload），7 大类 × 22 种子类
 - **WS 协议**：详见 `docs/development/websocket-protocol.md`
@@ -142,14 +142,15 @@
 
 ```
                       ┌─────────────┐
-                      │  Vue WebUI  │ (后续版本)
+                      │  iOS 客户端  │
+                      │  (主客户端)  │
+                      │  Vue WebUI  │ (远期规划)
                       └──────┬──────┘
-                             │ REST + WS + SSE
+                             │ REST + WS
                       ┌──────┴──────┐
                       │  FastAPI    │
                       │  - REST API │
                       │  - WS Chat  │
-                      │  - SSE Push │
                       └──────┬──────┘
                              │
               ┌──────────────┴──────────────┐
@@ -175,8 +176,8 @@
           ┌──────────────────┼──────────────────┐
           │                  │                  │
    ┌──────┴──────┐   ┌──────┴──────┐   ┌──────┴──────┐
-   │  CLI Tools  │   │  MCP Server │   │  Providers  │
-   │  (10 CLIs)  │   │  (8 tools)  │   │  (6 sources)│
+   │  CLI Tools  │   │  Providers  │
+   │  (13 CLIs)  │   │  (6 sources)│
    └─────────────┘   └─────────────┘   └─────────────┘
                              │
           ┌──────────────────┼──────────────────┐
@@ -240,7 +241,7 @@ class ToolDef:
     is_idempotent: bool          # 是否幂等（用于重试）
 ```
 
-所有工具（CLI + MCP + 新增）注册到统一 Registry，Agent 按需加载。
+所有工具（主 Agent 35 个 + 子 Agent 19 个，去重 ~32 个）注册到统一 ToolRegistry，Agent 按需加载。
 
 #### 3.2.4 Loop 状态机
 
@@ -290,14 +291,14 @@ class ToolDef:
 
 | 层级 | 技术选型 | 理由 |
 |------|----------|------|
-| Web 框架 | FastAPI | 原生 REST+WS+SSE，异步，生态成熟 |
+| Web 框架 | FastAPI | 原生 REST+WS，异步，生态成熟 |
 | 任务队列 | Celery + Redis | 长时间任务异步执行，重试/监控 |
 | 数据库 | SQLite | 零配置，单用户够用，预留 user_id 给多用户 |
 | 向量存储 | ChromaDB | 现有方案，继续使用 |
 | LLM 协议 | Anthropic Messages API 兼容 | 火山引擎默认，可切换供应商 |
 | 消息格式 | JSON (Anthropic tool-use 格式) | Function Calling 模式 |
 | 部署 | Docker 单容器 + pip install | 二选一 |
-| 前端 | Vue SPA（后续） | MVP 阶段 CLI + MCP |
+| 前端 | iOS（主客户端） | Vue WebUI 远期规划 |
 
 ### 4.2 LLM 客户端升级
 
@@ -521,7 +522,7 @@ WebSocket:
 | 收敛保证 | 🟠 严重 | 步数上限 + 自动重试上限 + 降级策略 |
 | 长期任务稳定性 | 🟠 严重 | 检查点+智能恢复+幂等重放 |
 | 引用追踪完整性 | 🟡 中等 | citation_chase 补全 + Semantic Scholar API + 多源引用 |
-| CNKI 脆弱性 | 🟡 中等 | 增加 Google Scholar/DBLP/OpenAlex 等新来源降低单点依赖 |
+| CNKI 脆弱性 | 🟡 中等 | 增加 OpenAlex（Semantic Scholar 降级方案）/ DBLP 等新来源降低单点依赖 |
 | 跨领域知识关联 | 🟡 中等 | 后续版本通过知识图谱实现，MVP 用向量相似度 |
 
 ### 5.2 错误处理策略表
@@ -548,10 +549,10 @@ WebSocket:
 | 一键自动搜集入库 | P0 | 关键词 → 搜索 → 下载 → 转换 → 索引 全自动 |
 | 知识库 RAG 问答 | P0 | ChromaDB + Reranker + LLM |
 | 引用追踪增强 | P1 | citation_chase 补全，真正的引用网络 |
-| 搜索覆盖增强 | P1 | 新增 Google Scholar / DBLP / OpenAlex 支持 |
+| 搜索覆盖增强 | P1 | 新增 OpenAlex（Semantic Scholar 降级方案）/ DBLP 支持 |
 | LLM 客户端升级 | P1 | Anthropic 兼容多供应商 + 流式 + 重试 |
-| MCP Tools 补全 | P2 | convert/index/evaluate/rank/survey 暴露为 MCP |
-| FastAPI + WebSocket | P2 | REST+WS+SSE API 层 |
+| Tool Use 补全 | P2 | 确保 13 个 CLI 工具均已适配 ToolRegistry |
+| FastAPI + WebSocket | P2 | REST+WS API 层 |
 | Vue WebUI | P3 | 后续版本，MVP 阶段 CLI + MCP |
 
 ### 6.2 开发阶段（2-3个月集中开发）
@@ -561,7 +562,7 @@ WebSocket:
 - Tool Registry 统一注册中心
 - Memory System（4层记忆的基础实现）
 - 数据库 schema 扩展（增加 knowledge/citations/checkpoints 表）
-- 补充 MCP Tools
+- 补充 ToolRegistry 工具
 
 **Phase 2: Agent 核心（3-4周）**
 - Agentic Loop 引擎（Plan-then-Execute + 状态机）
@@ -583,7 +584,7 @@ WebSocket:
 - 综述自动更新
 
 **Phase 5: API + 交互（2-3周）**
-- FastAPI REST + WebSocket + SSE
+- FastAPI REST + WebSocket
 - JSON + Markdown 双格式 Plan 输出
 - 进度全透明推送
 - 研究方向订阅（Cron 轮询）

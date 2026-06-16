@@ -7,8 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, UploadFile, File
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..config import get_papers_dir, get_markdown_dir, get_outputs_dir
@@ -30,17 +30,6 @@ class SearchRequest(BaseModel):
     year_from: Optional[int] = None
     year_to: Optional[int] = None
     max_results: int = 20
-    project_id: Optional[str] = None
-
-
-class AutoPipelineRequest(BaseModel):
-    keywords: str
-    sources: list[str] = ["arxiv", "semantic_scholar"]
-    year_from: Optional[int] = None
-    year_to: Optional[int] = None
-    max_papers: int = 30
-    auto_download: bool = True
-    auto_extract_knowledge: bool = True
     project_id: Optional[str] = None
 
 
@@ -249,17 +238,6 @@ async def upload_paper(file: UploadFile = File(...), project_id: Optional[str] =
         "title": file.filename,
         "pdf_path": str(pdf_path),
         "markdown_path": str(md_path) if md_path else None,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════
-# Auto Pipeline
-# ═══════════════════════════════════════════════════════════════
-
-@router.post("/pipeline/auto")
-async def run_auto_pipeline(req: AutoPipelineRequest, background_tasks: BackgroundTasks):
-    """[REWRITE PENDING] 一键自动搜集入库 — 将由 IngestAgent 替代."""
-    raise HTTPException(status_code=501, detail="AutoPipeline removed. Pending IngestAgent rewrite.")
     }
 
 
@@ -509,53 +487,3 @@ async def delete_subscription(subscription_id: str):
     )
     db.conn.commit()
     return {"success": True, "message": f"Subscription {subscription_id} deleted"}
-
-
-# ═══════════════════════════════════════════════════════════════
-# SSE Progress Stream (DEPRECATED)
-# ═══════════════════════════════════════════════════════════════
-#
-# 协议 v6.0 已不再使用 SSE — 所有实时进度推送通过 WebSocket phase 消息。
-# 此端点保留用于向后兼容，将在下一主版本移除。
-# 参见 docs/development/websocket-protocol.md §2.1
-
-@router.get("/tasks/{task_id}/events", deprecated=True)
-async def task_events(task_id: str):
-    """[DEPRECATED] SSE 任务事件流 — 已由 WebSocket phase 消息替代."""
-    import asyncio
-
-    async def event_generator():
-        db = _get_db()
-        last_step = -1
-        for _ in range(300):  # 最多5分钟
-            task = db.get_agent_task(task_id)
-            if task is None:
-                yield f"data: {_json.dumps({'type': 'error', 'message': 'Task not found'})}\n\n"
-                return
-
-            status = task.get("status", "")
-            steps = db.get_task_steps(task_id)
-
-            # 检查是否有新步骤
-            for s in steps:
-                if s.get("step_index", -1) > last_step:
-                    last_step = s["step_index"]
-                    yield f"data: {_json.dumps({'type': 'step_update', 'step': s}, default=str)}\n\n"
-
-            yield f"data: {_json.dumps({'type': 'heartbeat', 'status': status, 'current_step': task.get('current_step', 0), 'total_steps': task.get('total_steps', 0)}, default=str)}\n\n"
-
-            if status in ("completed", "completed_with_issues", "failed", "cancelled"):
-                yield f"data: {_json.dumps({'type': 'done', 'status': status})}\n\n"
-                return
-
-            await asyncio.sleep(2)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
