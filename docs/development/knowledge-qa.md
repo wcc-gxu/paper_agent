@@ -991,7 +991,57 @@ ChromaDB Collection: agent_terminology
 
 ---
 
-## 27. 最终技术决策（2026-06-15 定稿）
+## 27. Agent Manifest — 身份证与启动协议
+
+### 用途
+
+`agent_manifest.json` 是 Agent 的身份证 + 启动说明书。不是记忆的一部分——记忆在 MemGPT 中。
+
+### 核心字段
+
+- `agent.agent_id`：全局唯一标识，首次启动生成
+- `runtime`：启动入口、Plan Graph 路径、checkpoint 位置、LLM 配置
+- `memory`：4 层记忆的存储位置（SQLite 表、ChromaDB collections）
+- `sessions`：活跃 session 列表
+- `migration`：版本兼容性 + 数据校验
+
+### 启动流程
+
+```
+manifest 存在 → 验证兼容 → 初始化组件 → 从 checkpoint 恢复 → 加载 MemGPT → 就绪
+manifest 不存在 → 创建主 Agent → 初始化空白 DB/ChromaDB → 写 manifest → 就绪
+```
+
+详见 `docs/development/agent-manifest.md`。
+
+## 28. Session 设计 — agent_id + session_id 双层
+
+### 连接格式
+
+```
+ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
+```
+
+一个 Agent 多个 session（隔离上下文）：
+
+| 记忆层 | main session | 命名 session | temp session |
+|--------|-------------|-------------|-------------|
+| ShortTerm | ✅ 独立 | ✅ 独立 | ✅ 当前，断开丢弃 |
+| LongTerm | ✅ 自动写 | ⚠️ 手动 promote | ❌ |
+| RAD | ✅ 全局共享 | ✅ 全局共享 | ✅ 全局共享 |
+| MetaMemory | ✅ 学习 | ❌ | ❌ |
+
+### API
+
+- `GET /api/agents` — Agent 列表
+- `GET /api/agents/{id}/sessions` — Session 列表（含自动生成的标题）
+- `POST /api/agents/{id}/sessions` — 创建新 session
+
+### 自动标题
+
+参考腾讯元宝：第一条消息后 LLM 自动生成 ≤10 字标题写入 sessions 表。
+
+## 29. 最终技术决策（2026-06-16 定稿）
 
 ### 搜索来源
 
@@ -1046,4 +1096,4 @@ BaseChatModel 实现 (VolcanoChatModel):
 
 ---
 
-> 版本: v1.5 | 新增 TranslationAgent + 术语库、Redis灾备、文档全面审计修复 | 2026-06-15
+> 版本: v1.6 | Agent Manifest、agent_id+session_id、Session内存隔离、启动协议 | 2026-06-16

@@ -84,6 +84,7 @@ paper_export     →  (references.bib)
 └── *.md                    # Full-text Markdown per paper
 
 ~/.paper_search/
+├── agent_manifest.json     # Agent 身份证 — 启动/恢复/迁移
 ├── agent.db                # SQLite: projects, papers, project_papers, journal_ranks
 ├── chroma/                 # ChromaDB: papers_abstract + papers_fulltext collections
 └── logs/

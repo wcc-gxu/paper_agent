@@ -25,6 +25,10 @@
               │  │  Plan Graph + Execute Graph  │   │
               │  └──────────────────────────────┘   │
               │  ┌──────────────────────────────┐   │
+              │  │  Agent Manifest (身份证)      │   │
+              │  │  启动/恢复/迁移               │   │
+              │  └──────────────────────────────┘   │
+              │  ┌──────────────────────────────┐   │
               │  │  AgentRegistry (7 种子Agent)   │   │
               │  │  IngestAgent / RADQueryAgent  │   │
               │  │  ClusteringAgent /            │   │
@@ -57,6 +61,7 @@
   │  Broker     │   │  长任务执行  │   │  ChromaDB   │
   │  Beat定时   │   │             │   │  PDF/MD文件 │
   └─────────────┘   └──────┬──────┘   │  JSON 日志  │
+                           │          │  Manifest   │
                            │          │  (tasks/)   │
                     ┌──────┴──────┐   └─────────────┘
                     │  Providers  │
@@ -419,4 +424,4 @@ src/paper_search/
 
 ---
 
-> 版本: v1.2 | 多Agent拆分、State分治、overall_evaluate循环、TranslationAgent
+> 版本: v1.3 | Manifest启动协议、agent_id+session_id双层、Session内存隔离 | 2026-06-16
