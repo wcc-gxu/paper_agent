@@ -123,11 +123,24 @@
 
 | 路径 | 类型 | 说明 |
 |------|------|------|
+### 默认值（MVP 写死）
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `agent.agent_id` | `"agent-001"` | MVP 单 Agent |
+| `agent.display_name` | `"我的科研助理"` | iOS 对话列表展示 |
+| `owner.user_id` | `"user-default"` | MVP 单用户 |
+| `sessions.default` | `"main"` | 默认会话 |
+| `sessions.active[0]` | `"main"` | 首次创建 |
+| main session 标题 | `"新对话"` | 第一条消息后 LLM 自动更新 |
+
+| 路径 | 类型 | 说明 |
+|------|------|------|
 | `manifest_version` | string | Manifest 格式版本，用于向前兼容 |
-| `agent.agent_id` | string | 全局唯一。格式: `agent-{序号}` |
-| `agent.type` | string | `main` = 主 Agent（用户对话入口）。未来扩展: `specialist` = 领域专家 Agent |
+| `agent.agent_id` | string | 全局唯一。格式: `agent-{序号}`。MVP = `agent-001` |
+| `agent.type` | string | `main` = 主 Agent（用户对话入口）。MVP = `main` |
 | `agent.status` | string | `active` / `paused` / `archived` |
-| `owner.user_id` | string | 绑定用户。MVP 单用户 = `user-default` |
+| `owner.user_id` | string | 绑定用户。MVP = `user-default` |
 | `runtime.plan_graph.thread_id` | string | LangGraph checkpoint 的 thread_id，重启恢复用 |
 | `runtime.checkpoint.backend` | string | 当前仅 `sqlite`。未来可扩展 `postgres` |
 | `runtime.llm` | object | 该 Agent 绑定的 LLM 配置（可不同于系统默认） |
@@ -238,7 +251,7 @@ async def resume_agent(m: AgentManifest):
 
 
 async def create_main_agent(data_dir: Path):
-    agent_id = "agent-001"
+    agent_id = "agent-001"          # MVP 写死
     
     m = AgentManifest(
         manifest_version="1.0",
@@ -249,12 +262,25 @@ async def create_main_agent(data_dir: Path):
             created_at=datetime.utcnow().isoformat(),
             status="active"
         ),
+        sessions=SessionsInfo(
+            default="main",
+            active=["main"],
+            archived=[]
+        ),
         ...
     )
     
     # 初始化所有数据库表
     db = AgentDB(data_dir / "agent.db")
     db.initialize_schema()
+    
+    # 创建默认 main session
+    db.create_session(
+        session_id="main",
+        agent_id="main",
+        title="新对话",         # ← 第一条消息后 LLM 更新
+        created_at=datetime.utcnow().isoformat()
+    )
     
     # 初始化 ChromaDB collections
     chroma = ChromaStoreV2(data_dir / "chroma")
