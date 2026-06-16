@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json as _json
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -309,51 +310,60 @@ async def knowledge_related(paper_id: str, top_k: int = 10):
 
 @router.post("/tasks")
 async def create_task(query: str = Query(..., description="研究需求")):
-    """[REWRITE PENDING] 创建 Agent 任务 — 将由 Plan Graph 替代."""
-    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
-
-
-@router.get("/tasks")
-async def list_tasks(session_id: Optional[str] = None, limit: int = 20):
-    """列出 Agent 任务."""
+    """创建 Agent 任务。返回 task_id，可通过 WS 或 REST 触发执行。"""
+    import uuid as _uuid
     db = _get_db()
-    tasks = db.list_agent_tasks(session_id=session_id, limit=limit)
-    return {"total": len(tasks), "tasks": tasks}
-
-
-@router.get("/tasks/{task_id}")
-async def get_task(task_id: str):
-    """获取任务详情."""
-    db = _get_db()
-    task = db.get_agent_task(task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    steps = db.get_task_steps(task_id)
-    return {"task": task, "steps": steps}
+    task_id = f"task-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{_uuid.uuid4().hex[:4]}"
+    db.create_agent_task(task_id=task_id, user_query=query)
+    return {"task_id": task_id, "status": "pending", "query": query}
 
 
 @router.post("/tasks/{task_id}/confirm")
 async def confirm_task(task_id: str, req: PlanConfirmRequest):
-    """[REWRITE PENDING] 确认并执行任务."""
-    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
+    """确认任务方案 — 更新 plan 状态，触发执行。"""
+    db = _get_db()
+    task = db.get_agent_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    if req.confirmed:
+        db.update_agent_task(task_id, status="running",
+                            plan_json=_json.dumps(req.modifications) if req.modifications else None)
+        return {"task_id": task_id, "status": "running"}
+    db.update_agent_task(task_id, status="cancelled")
+    return {"task_id": task_id, "status": "cancelled", "reason": "user rejected"}
 
 
 @router.post("/tasks/{task_id}/pause")
 async def pause_task(task_id: str):
-    """[REWRITE PENDING] 暂停任务."""
-    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
+    """暂停任务 — 当前阶段完成后暂停。"""
+    db = _get_db()
+    task = db.get_agent_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    db.update_agent_task(task_id, status="paused")
+    return {"task_id": task_id, "status": "paused"}
 
 
 @router.post("/tasks/{task_id}/resume")
 async def resume_task(task_id: str):
-    """[REWRITE PENDING] 恢复任务."""
-    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
+    """恢复已暂停的任务。"""
+    db = _get_db()
+    task = db.get_agent_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    db.update_agent_task(task_id, status="running")
+    return {"task_id": task_id, "status": "running"}
 
 
 @router.delete("/tasks/{task_id}")
 async def cancel_task(task_id: str):
-    """[REWRITE PENDING] 取消任务."""
-    raise HTTPException(status_code=501, detail="AgentLoop removed. Pending LangGraph Plan Graph rewrite.")
+    """取消任务。"""
+    db = _get_db()
+    task = db.get_agent_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+    db.update_agent_task(task_id, status="cancelled")
+    return {"task_id": task_id, "status": "cancelled"}
 
 
 # ═══════════════════════════════════════════════════════════════

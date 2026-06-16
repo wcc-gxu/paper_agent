@@ -133,6 +133,30 @@ CREATE INDEX IF NOT EXISTS idx_citations_source ON citations(source_paper_id);
 CREATE INDEX IF NOT EXISTS idx_citations_target ON citations(target_paper_id);
 CREATE INDEX IF NOT EXISTS idx_agent_tasks_session ON agent_tasks(session_id);
 CREATE INDEX IF NOT EXISTS idx_task_steps_task ON task_steps(task_id);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    title TEXT DEFAULT '新对话',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (agent_id, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS ws_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    seq INTEGER DEFAULT 0,
+    role TEXT NOT NULL,
+    type TEXT NOT NULL,
+    subtype TEXT DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '{}',
+    priority INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL,
+    is_replay INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ws_messages_lookup ON ws_messages(agent_id, session_id, seq);
 """
 
 # 运行时迁移：为旧 papers 表添加新列
@@ -160,8 +184,10 @@ class AgentDB:
     @property
     def conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
             self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(SCHEMA)
             self._run_migrations()
             self._conn.commit()
@@ -476,6 +502,99 @@ class AgentDB:
             (task_id, step_index),
         ).fetchone()
         return dict(row) if row else None
+
+    # ── Session CRUD ───────────────────────────────────────
+
+    def create_session(self, agent_id: str, session_id: str, title: str = "新对话") -> str:
+        """创建新会话。幂等（INSERT OR IGNORE）."""
+        now = self._now()
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sessions (agent_id, session_id, title, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (agent_id, session_id, title, now, now),
+        )
+        self.conn.commit()
+        return session_id
+
+    def get_session(self, agent_id: str, session_id: str) -> Optional[dict]:
+        """获取会话详情."""
+        row = self.conn.execute(
+            "SELECT * FROM sessions WHERE agent_id=? AND session_id=?",
+            (agent_id, session_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def update_session_title(self, agent_id: str, session_id: str, title: str):
+        """更新会话标题."""
+        self.conn.execute(
+            "UPDATE sessions SET title=?, updated_at=? WHERE agent_id=? AND session_id=?",
+            (title, self._now(), agent_id, session_id),
+        )
+        self.conn.commit()
+
+    def list_sessions(self, agent_id: str) -> list[dict]:
+        """列出某 Agent 的所有会话."""
+        rows = self.conn.execute(
+            "SELECT * FROM sessions WHERE agent_id=? ORDER BY updated_at DESC",
+            (agent_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── WS 消息持久化 ──────────────────────────────────────
+
+    def save_ws_message(self, agent_id: str, session_id: str, seq: int,
+                        role: str, type_: str, subtype: str = "",
+                        payload: dict | str = None, priority: int = 0) -> int:
+        """保存 WS 消息到持久化表."""
+        import json as _json
+        if payload is None:
+            payload = {}
+        payload_str = _json.dumps(payload, ensure_ascii=False, default=str) if not isinstance(payload, str) else payload
+        cursor = self.conn.execute(
+            """INSERT INTO ws_messages (agent_id, session_id, seq, role, type, subtype, payload, priority, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (agent_id, session_id, seq, role, type_, subtype, payload_str, priority, self._now()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_ws_messages_for_replay(self, agent_id: str, session_id: str,
+                                    since_seq: int = 0, limit: int = 200) -> list[dict]:
+        """获取重连回放消息。排除 priority=0 流式消息."""
+        rows = self.conn.execute(
+            """SELECT * FROM ws_messages
+               WHERE agent_id=? AND session_id=? AND seq > ? AND priority > 0
+               ORDER BY seq ASC LIMIT ?""",
+            (agent_id, session_id, since_seq, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_last_user_seq(self, agent_id: str, session_id: str) -> int:
+        """获取指定 session 中最后一条用户消息的 seq."""
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM ws_messages "
+            "WHERE agent_id=? AND session_id=? AND role='user'",
+            (agent_id, session_id),
+        ).fetchone()
+        return row[0] if row else 0
+
+    def get_history_count(self, agent_id: str, session_id: str) -> int:
+        """获取指定 session 的历史消息数."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM ws_messages WHERE agent_id=? AND session_id=?",
+            (agent_id, session_id),
+        ).fetchone()
+        return row[0] if row else 0
+
+    def get_active_tasks(self, agent_id: str, session_id: str) -> list[dict]:
+        """获取指定 session 的活跃任务."""
+        rows = self.conn.execute(
+            "SELECT id, status, current_step, total_steps FROM agent_tasks "
+            "WHERE session_id=? AND status IN ('pending','running','paused') "
+            "ORDER BY created_at DESC",
+            (session_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self):
         if self._conn:

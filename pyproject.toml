@@ -32,6 +32,8 @@ pubmed = ["biopython>=1.83", "metapub>=0.6"]
 playwright = ["playwright>=1.40"]
 # CLI output formatting
 rich = ["rich>=13"]
+# Agent Framework
+agent = ["langgraph>=0.2.0", "langgraph-checkpoint-sqlite>=1.0.0", "langchain-core>=0.3.0"]
 # Web API
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 # CAPTCHA handling (CNKI)
@@ -49,6 +51,9 @@ all = [
     "pytesseract>=0.3",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    "langgraph>=0.2.0",
+    "langgraph-checkpoint-sqlite>=1.0.0",
+    "langchain-core>=0.3.0",
 ]
 
 [build-system]

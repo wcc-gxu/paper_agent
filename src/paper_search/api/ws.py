@@ -94,5 +94,37 @@ class WebSocketManager:
             for conns in sessions.values()
         )
 
+    async def send_and_persist(self, agent_id: str, session_id: str,
+                                envelope: dict, store=None) -> int:
+        """发送 WS 消息并持久化到 MessageStore。
+
+        Args:
+            agent_id: Agent ID
+            session_id: Session ID
+            envelope: 协议信封
+            store: MessageStore 实例（若为 None 则只发送不持久化）
+
+        Returns:
+            持久化消息的 DB 行 ID，或 0
+        """
+        msg_id = 0
+        if store is not None:
+            try:
+                msg_id = await store.save_envelope(envelope)
+            except Exception as e:
+                logger.warning(f"Failed to persist message: {e}")
+
+        import json
+        text = json.dumps(envelope, ensure_ascii=False, default=str)
+        sessions = self._connections.get(agent_id, {})
+        conns = sessions.get(session_id, [])
+        for ws in conns:
+            try:
+                await ws.send_text(text)
+            except Exception as e:
+                logger.warning(f"WS send failed: agent={agent_id}, session={session_id}, error={e}")
+
+        return msg_id
+
 
 ws_manager = WebSocketManager()
