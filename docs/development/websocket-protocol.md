@@ -14,25 +14,25 @@ ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
 
 | 参数 | 说明 |
 |------|------|
-| `agent_id` | 主 Agent 标识。一个用户 = 一个 Agent。MVP 默认 `"agent-001"` |
-| `session_id` | 会话标识。不同 session 隔离上下文。MVP 默认 `"main"` |
+| `agent_id` | Agent 部署实例标识。每个 Agent 独立进程、端口、DB。默认 `"agent-001"` |
+| `session_id` | 会话标识。一期固定 `"main"` |
 
 ### 1.2 agent_id 与 session_id
 
+一期每个 Agent 只有默认会话。多 Agent 通过不同端口部署独立 daemon 进程实现隔离。
+
 ```
-agent-001 (一个用户，一个 Agent)
-│
-├── session: "main"           ← 默认会话
-├── session: "cv-project"     ← 用户创建
-└── session: "temp-abc"       ← 临时会话，关闭丢弃
+agent-001 :8000  →  session: "main"
+agent-cv  :8001  →  session: "main"
+agent-nlp :8002  →  session: "main"
 ```
 
 | 概念 | 生命周期 | 隔离内容 |
 |------|----------|----------|
-| `agent_id` — "科研分身" | 永久 | 所有记忆、论文、偏好 |
-| `session_id` — 一次"话题" | 按需创建/归档 | ShortTerm 上下文、MidTerm checkpoint |
+| `agent_id` — 部署实例 | 永久 | 独立进程、DB、Chromadb、PlanGraph checkpoint |
+| `session_id` — 固定 "main" | 一期唯一 | 所有对话上下文 |
 
-**新建 session**：直连不存在的 session_id → Server 自动创建。也可 REST 创建（见 [REST API](./rest-api.md)）。
+> **多 session 和多 Agent 的完整设计见 [agent-runloop.md](agent-runloop.md)。** 一期 Agent 内不区分 session，所有对话共享 ShortTerm。
 
 ### 1.3 通用信封
 
@@ -55,7 +55,7 @@ agent-001 (一个用户，一个 Agent)
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `role` | string | `user` = 客户端发出，`assistant` = 服务端发出。**持久化必填** |
-| `type` | string | **消息大类**，共 7 种：`heartbeat` / `phase` / `thinking` / `message` / `tool` / `review` / `error` |
+| `type` | string | **消息大类**，共 8 种：`heartbeat` / `phase` / `thinking` / `message` / `tool` / `review` / `error` / `task` |
 | `subType` | string | **消息子类**，在大类下细分具体行为。见 §1.5 速查表 |
 | `agentId` | string | Agent ID。**持久化必填** |
 | `sessionId` | string | 会话 ID。**持久化必填** |
@@ -83,10 +83,10 @@ agent-001 (一个用户，一个 Agent)
 | priority | 含义 | APNs | 典型消息 |
 |----------|------|------|----------|
 | `2` | 阻塞性 — 没有用户指令系统无法继续 | ✅ **立即推送**，每条独立 | review、tool(ios)、error、plan_rejected |
-| `1` | 普通业务 — 有意义但不紧急 | ✅ **合并推送**（≤10min 一条） | message(chat/reply/notification)、tool(result) |
+| `1` | 普通业务 — 有意义但不紧急 | ✅ **合并推送**（≤10min 一条） | message(chat/reply/notification)、tool(result)、task |
 | `0` | 流式/状态/心跳 — 仅当前连接有效 | ❌ **不推送** | thinking、message(text)、tool(server)、phase、heartbeat |
 
-### 1.5 消息类型速查表（7 大类 × 22 种子类）
+### 1.5 消息类型速查表（8 大类 × 27 种子类）
 
 | role | type | subType | priority | 用途 | 详述 |
 |------|------|---------|----------|------|------|
@@ -117,6 +117,11 @@ agent-001 (一个用户，一个 Agent)
 | user | `review` | `plan` | 2 | 计划回复 | §2.5 |
 | user | `review` | `task_control` | 2 | 暂停/恢复/取消 | §2.5 |
 | assistant | `error` | _错误码_ | 2 | 错误通知 | §2.6 |
+| assistant | `task` | `started` | 1 | 任务创建 | §2.7 |
+| assistant | `task` | `running` | 1 | 任务进度 | §2.7 |
+| assistant | `task` | `backgrounded` | 1 | 转入后台（不可逆） | §2.7 |
+| assistant | `task` | `done` | 1 | 任务完成 | §2.7 |
+| assistant | `task` | `failed` | 1 | 任务失败 | §2.7 |
 
 ### 1.6 心跳
 
@@ -157,7 +162,8 @@ Server 收到首条 chat → phase(subType:"connected") → 处理消息 → 后
     "sessionTitle": "Transformer 文献调研",
     "historyCount": 42,
     "activeTasks": [
-      {"taskId": "task-001", "stage": "下载论文", "progress": "12/22"}
+      {"taskId": "task-001", "name": "入库 Transformer", "mode": "background",
+       "stage": "下载论文", "current": 12, "total": 22, "status": "running"}
     ]
   }
 }
@@ -490,6 +496,93 @@ Server 确认控制后通过 `phase(paused)` 或 `message(reply)` 反馈。
 
 > **重连时**：error 全部回放。
 
+### 2.7 task — 后台任务（单向）
+
+**role: assistant** | **priority: 1**（合并推送）
+
+`task` 是独立的第 8 种消息类型。驱动 iOS 聊天列表的任务进度卡片。
+
+**mode 状态机**：
+```
+foreground ──→ background   （用户发新消息时自动触发）
+   │               │
+   │               │  不可逆：background 不能切回 foreground
+   │               │
+   └─── done ──────┘
+   └─── failed
+```
+
+```json
+// 任务创建
+{
+  "role": "assistant", "type": "task", "subType": "started",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "payload": {
+    "taskId": "task-20260616-001",
+    "name": "入库 Transformer 安全方向",
+    "mode": "foreground",
+    "totalStages": 7
+  }
+}
+
+// 进度更新（前台/后台通用）
+{
+  "role": "assistant", "type": "task", "subType": "running",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "payload": {
+    "taskId": "task-20260616-001",
+    "mode": "foreground",
+    "stage": "下载论文",
+    "stageIndex": 3,
+    "totalStages": 7,
+    "current": 34,
+    "total": 50
+  }
+}
+
+// 转入后台（不可逆）
+{
+  "role": "assistant", "type": "task", "subType": "backgrounded",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "payload": {
+    "taskId": "task-20260616-001",
+    "reason": "user_new_message"
+  }
+}
+
+// 任务完成
+{
+  "role": "assistant", "type": "task", "subType": "done",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "payload": {
+    "taskId": "task-20260616-001",
+    "result": {"totalPaper": 50, "downloaded": 48, "failed": 2}
+  }
+}
+
+// 任务失败
+{
+  "role": "assistant", "type": "task", "subType": "failed",
+  "agentId": "agent-001", "sessionId": "main", "priority": 1,
+  "payload": {
+    "taskId": "task-20260616-001",
+    "error": "下载阶段：3 篇论文 PDF 不可获取"
+  }
+}
+```
+
+| subType | mode 影响 | payload 关键字段 |
+|---------|----------|-----------------|
+| `started` | 携带初始 mode | `taskId`, `name`, `mode`, `totalStages` |
+| `running` | 不变 | `taskId`, `stage`, `stageIndex`, `current`, `total` |
+| `backgrounded` | foreground→background | `taskId`, `reason` |
+| `done` | 结束 | `taskId`, `result` |
+| `failed` | 结束 | `taskId`, `error` |
+
+> **不可逆**：`backgrounded` 一旦发送，`mode` 永久为 `background`。后续 `running` 消息不再携带 `mode: foreground`。
+> **重连时**：`done` / `failed` 不回放。`running` / `backgrounded` 回放最近 20 条。
+> **前台→后台触发条件**：用户在当前有前台任务时发送新 `message(chat)`。
+
 ---
 
 ## 三、连接生命周期
@@ -544,7 +637,10 @@ iOS 断开 → Server 继续执行 → 按 priority 分流:
     priority 0 → 丢弃
     │
     ▼
-iOS 重连 → phase(connected) → Redis 回放 → 正常交互
+前台任务（用户在等）→ task(backgrounded) → 缓存到 Redis
+    │
+    ▼
+iOS 重连 → phase(connected) → 回放未完成的 task → 正常交互
 ```
 
 ### 3.4 重连事件处理
@@ -556,6 +652,8 @@ iOS 重连 → phase(connected) → Redis 回放 → 正常交互
 | `review`（Server→iOS，未过期 <30min） | 重新发送 |
 | `error` | 全部回放 |
 | 已完成任务 | 最近 1 条 `message(reply)`，其余合并通知 |
+| `task(running/backgrounded)` | 回放最近 20 条（含当前进度） |
+| `task(done/failed)` | 不回放 |
 
 ### 3.5 后台切换
 
@@ -567,22 +665,27 @@ iOS 重连 → phase(connected) → Redis 回放 → 正常交互
 ### 3.6 崩溃恢复
 
 ```
-崩溃: Redis AOF（<1s 丢失窗口）+ LangGraph checkpoint（<1 节点丢失）
-重启: LangGraph 恢复 → Celery Worker 重入队
+崩溃: LangGraph checkpoint（AsyncSqliteSaver，<1 节点丢失）
+       Celery task 继续执行（独立 Worker 进程不受影响）
+       EventBus 进程内事件丢失（stream/thinking 丢弃，重连后 phase 重放状态）
+重启: LangGraph 从 checkpoint 恢复 → Celery Worker 重入队
 重连: phase(recovering) → 继续执行
 ```
 
 ---
 
-## 四、Session 内存隔离
+## 四、一期内存隔离
 
-| 记忆层 | main session | 命名 session | temp session |
-|--------|-------------|-------------|-------------|
-| ShortTerm | ✅ 独立，重启恢复 | ✅ 独立 | ✅ 断开丢弃 |
-| MidTerm | ✅ LangGraph 自动 | ✅ 可选 | ❌ |
-| LongTerm (对话) | ✅ 自动 | ⚠️ 用户 promote | ❌ |
-| LongTerm (论文) | ✅ 全局共享 | ✅ 全局共享 | ✅ 全局共享 |
-| MetaMemory | ✅ 学习 | ❌ | ❌ |
+一期每个 Agent 只有 `session: "main"`。多任务通过 `taskId` 区分。
+
+| 记忆层 | 存储 | 生命周期 |
+|--------|------|----------|
+| ShortTerm | 进程内存 | 当前对话窗口 |
+| MidTerm | LangGraph checkpoint (SQLite) | 任务级，崩溃可恢复 |
+| LongTerm | ChromaDB + SQLite | 永久 |
+| MetaMemory | SQLite | 永久 |
+
+> **多 Agent 隔离**：不同端口部署独立 daemon，独立 SQLite + PlanGraph checkpoint。详见 [agent-runloop.md](agent-runloop.md) §8。
 
 ---
 
@@ -625,6 +728,27 @@ S→C:  phase(paused)
 # 8. 完成
 S→C:  message(reply, priority:1)
         {"role":"assistant","type":"message","subType":"reply","content":"## 结果\n...","files":[...]}
+
+# 9. 新任务创建 + 进度（🆕 v7.0）
+S→C:  task(started) → {"role":"assistant","type":"task","subType":"started",
+        "payload":{"taskId":"t2","name":"入库 Transformer","mode":"foreground","totalStages":7}}
+S→C:  task(running) → {"role":"assistant","type":"task","subType":"running",
+        "payload":{"taskId":"t2","stage":"搜索论文","stageIndex":1,"current":18,"total":50}}
+
+# 10. 用户发新消息 → 前台任务自动转入后台（🆕 v7.0）
+C→S:  message(chat) → {"role":"user","type":"message","subType":"chat",
+        "payload":{"content":"顺便帮我查一下 attention 机制"}}
+S→C:  task(backgrounded) → {"role":"assistant","type":"task","subType":"backgrounded",
+        "payload":{"taskId":"t2","reason":"user_new_message"}}
+S→C:  message(notification) → {"title":"转入后台","body":"入库任务已转入后台",
+        "category":"task_backgrounded"}
+S→C:  (处理新消息: thinking → message(text) → message(reply)...)
+
+# 11. 后台任务完成（🆕 v7.0）
+S→C:  task(running) → {"role":"assistant","type":"task","subType":"running",
+        "payload":{"taskId":"t2","stage":"生成综述","stageIndex":7,"current":48,"total":50}}
+S→C:  task(done) → {"role":"assistant","type":"task","subType":"done",
+        "payload":{"taskId":"t2","result":{"total":50,"downloaded":48,"failed":2}}}
 ```
 
 ---
@@ -662,5 +786,5 @@ S→C:  message(reply, priority:1)
 
 ---
 
-> **版本**: v6.0 | 7 大类（type）+ 子类（subType）。priority: 0=流式 1=普通 2=阻塞。APNs: 0不推 1合并 2立即 | 2026-06-16
-> **配套文档**: [REST API](./rest-api.md)
+> **版本**: v7.0 | 8 大类（type）+ 27 子类（subType）。新增 task 类型（5 子类）。priority: 0=流式 1=普通 2=阻塞。foreground→background 单向不可逆。APNs: 0不推 1合并 2立即 | 2026-06-16
+> **配套文档**: [agent-runloop.md](agent-runloop.md) · [REST API](./rest-api.md)
