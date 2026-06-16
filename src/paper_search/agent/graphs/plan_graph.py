@@ -359,57 +359,60 @@ class PlanGraph:
         return {}
 
     async def _execute_plan(self, state: MainAgentState) -> dict:
-        """Stage 4: 执行方案 — 遍历 sub_tasks，调用工具。"""
+        """Stage 4: 执行方案 — 委托 IngestAgent 入库。"""
         plan = state.get("plan", {}) or {}
-        sub_tasks = plan.get("sub_tasks", [])
         task_id = plan.get("task_id", "unknown")
+        user_query = plan.get("original_query", plan.get("refined_query", ""))
 
-        logger.info(f"execute_plan: executing {len(sub_tasks)} sub-tasks for {task_id}")
+        logger.info(f"execute_plan: delegating to IngestAgent for {task_id}")
 
-        results = []
-        for st in sub_tasks:
-            step_idx = st.get("id", st.get("index", 0))
-            step_name = st.get("name", st.get("description", f"step_{step_idx}"))
-            keywords = st.get("keywords", [])
-            action = st.get("action", "search")
+        try:
+            from ..sub_agent import PipelineRunner
+            from ..graphs.ingest_graph import IngestAgent
+            from ..pdf_converter import PDFConverter
+            from ..journal_ranker import JournalRanker
+            from ..chroma_store import ChromaStoreV2
 
-            # 持久化步骤开始
-            try:
-                self._db.add_task_step(
-                    task_id=task_id,
-                    step_index=int(step_idx) if isinstance(step_idx, (int, str)) and str(step_idx).isdigit() else len(results) + 1,
-                    step_name=str(step_name),
-                    action=str(action),
-                    tool_name="search_papers" if action == "search" else action,
-                    tool_args={"keywords": keywords[:3] if keywords else []},
-                )
-            except Exception as e:
-                logger.warning(f"Failed to save step: {e}")
+            converter = PDFConverter(max_concurrent=2)
+            ranker = JournalRanker()
+            chroma = ChromaStoreV2()
 
-            # 调用工具执行搜索
-            if action == "search":
-                kw = " AND ".join(keywords[:2]) if keywords else plan.get("original_query", "")
-                result = await self._execute_search(kw, plan)
+            runner = PipelineRunner(
+                engine=None,  # 由 IngestAgent 的 _search_node 内部创建
+                db=self._db, llm=self._llm,
+                chroma=chroma, converter=converter, ranker=ranker,
+            )
+            ingest = IngestAgent(runner)
+            ingest_graph = ingest.compile()
 
-                try:
-                    self._db.update_task_step(
-                        task_id=task_id,
-                        step_index=int(step_idx) if isinstance(step_idx, int) else len(results),
-                        status="done",
-                        result_summary=result.get("summary", ""),
-                        metrics=json.dumps({"papers_found": result.get("total", 0)}),
-                    )
-                except Exception:
-                    pass
+            config = {"configurable": {"thread_id": f"ingest-{task_id}"}}
+            ingest_result = await ingest_graph.ainvoke(
+                {
+                    "project_id": task_id,
+                    "user_query": user_query,
+                    "sources": plan.get("suggested_sources", ["arxiv", "semantic_scholar"]),
+                    "year_from": 2022,
+                    "max_results": 20,
+                    "is_single_tool": False,
+                    "single_tool_name": "",
+                },
+                config=config,
+            )
 
-                results.append({"step": step_idx, "name": str(step_name), "result": result})
-            else:
-                results.append({"step": step_idx, "name": str(step_name), "status": "skipped"})
+            result_summary = ingest_result.get("result", {})
+            logger.info(f"IngestAgent complete: {json.dumps(result_summary, default=str)[:300]}")
+            return {
+                "plan": {**plan, "execution_results": [result_summary]},
+                "plan_status": "done",
+            }
 
-        return {
-            "plan": {**plan, "execution_results": results},
-            "plan_status": "done",
-        }
+        except Exception as e:
+            logger.error(f"IngestAgent execution failed: {e}", exc_info=True)
+            return {
+                "plan": {**plan, "execution_results": [{"error": str(e)}]},
+                "plan_status": "done",
+                "error": str(e),
+            }
 
     async def _overall_evaluate(self, state: MainAgentState) -> dict:
         """Stage 5: LLM 评估执行结果。"""

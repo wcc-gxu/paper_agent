@@ -367,6 +367,114 @@ async def cancel_task(task_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════
+# IngestAgent — 论文入库
+# ═══════════════════════════════════════════════════════════════
+
+
+class IngestRequest(BaseModel):
+    user_query: str
+    sources: list[str] = ["arxiv", "semantic_scholar"]
+    year_from: int = 2022
+    max_results: int = 20
+    project_id: Optional[str] = None
+
+
+@router.post("/ingest/start")
+async def start_ingest(req: IngestRequest):
+    """触发 IngestAgent.ExecuteGraph() → 后台执行，返回 task_id 用于查询进度。"""
+    import uuid as _uuid
+    db = _get_db()
+
+    pid = req.project_id or db.create_project(user_query=req.user_query)
+    task_id = f"task-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{_uuid.uuid4().hex[:4]}"
+
+    db.create_agent_task(task_id=task_id, user_query=req.user_query, session_id=pid)
+
+    # 异步启动 IngestAgent（不阻塞响应）
+    import asyncio
+    asyncio.create_task(_run_ingest(task_id, pid, req.user_query, req.sources, req.year_from, req.max_results))
+
+    return {
+        "task_id": task_id,
+        "project_id": pid,
+        "status": "started",
+        "query": req.user_query,
+    }
+
+
+async def _run_ingest(task_id: str, project_id: str, user_query: str,
+                       sources: list[str], year_from: int, max_results: int):
+    """后台执行 IngestAgent。"""
+    try:
+        from ..agent.sub_agent import PipelineRunner
+        from ..agent.graphs.ingest_graph import IngestAgent
+        from ..agent.pdf_converter import PDFConverter
+        from ..agent.journal_ranker import JournalRanker
+        from ..agent.chroma_store import ChromaStoreV2
+        from ..engine import PaperSearchEngine
+        from ..config import Config
+        from .app import get_db, get_llm
+
+        db = get_db()
+        llm = get_llm()
+        engine = PaperSearchEngine(Config())
+
+        runner = PipelineRunner(
+            engine=engine, db=db, llm=llm,
+            chroma=ChromaStoreV2(),
+            converter=PDFConverter(max_concurrent=2),
+            ranker=JournalRanker(),
+        )
+        ingest = IngestAgent(runner)
+        graph = ingest.compile()
+
+        config = {"configurable": {"thread_id": f"ingest-{task_id}"}}
+        result = await graph.ainvoke(
+            {
+                "project_id": project_id,
+                "user_query": user_query,
+                "sources": sources,
+                "year_from": year_from,
+                "max_results": max_results,
+                "is_single_tool": False,
+                "single_tool_name": "",
+            },
+            config=config,
+        )
+
+        db.update_agent_task(task_id, status="completed",
+                            plan_json=_json.dumps(result.get("result", {})))
+        logger.info(f"IngestAgent task {task_id} completed")
+
+    except Exception as e:
+        logger.error(f"IngestAgent task {task_id} failed: {e}", exc_info=True)
+        try:
+            from .app import get_db
+            get_db().update_agent_task(task_id, status="failed")
+        except Exception:
+            pass
+
+
+@router.get("/ingest/progress/{task_id}")
+async def ingest_progress(task_id: str):
+    """查询入库进度（读取 task.jsonl 日志）。"""
+    from pathlib import Path
+    from ..agent.task_logger import TaskLogger
+
+    log_dir = Path.home() / ".paper_search" / "logs" / "tasks"
+    tlog = TaskLogger(log_dir, task_id)
+    progress = tlog.get_progress()
+    events = tlog.read_events()
+
+    return {
+        "task_id": task_id,
+        "progress": progress,
+        "event_count": len(events),
+        "latest_events": events[-20:] if events else [],
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
 # Projects
 # ═══════════════════════════════════════════════════════════════
 
