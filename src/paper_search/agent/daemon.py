@@ -279,491 +279,374 @@ class AgentBootstrap:
 
 
 class AgentRunLoop:
-    """事件驱动主循环 — PriorityQueue + 4 事件源。
+    """事件驱动主循环 — Tick-Polling 模式 (对齐 iOS CFRunLoop)。
 
-        ┌──────────────────────────────────────────┐
-        │        AgentRunLoop (PriorityQueue)       │
-        │                                          │
-        │  4 个事件源 (后台协程，互不阻塞):          │
-        │  ┌──────────┐ ┌───────────┐ ┌─────────┐  │
-        │  │_ws_source│ │_redis_src │ │_timer   │  │
-        │  │(prio=0)  │ │(prio=1~2) │ │(prio=3) │  │
-        │  └────┬─────┘ └─────┬─────┘ └────┬────┘  │
-        │       │              │            │       │
-        │       └──────────────┴────────────┘       │
-        │                     │                     │
-        │                     ▼                     │
-        │         while running:                    │
-        │           priority, seq, event = queue    │
-        │           dispatch(event)                 │
-        └──────────────────────────────────────────┘
+    源检查顺序 = 优先级:
+      Source 0: WebSocket (用户交互) — pop_nowait() 逐条 ≤5/tick
+      Source 1: Redis LPOP (Celery 结果) — pop_nowait() 逐条 ≤3/tick
+      Source 2: Pub/Sub drain (子Agent 报告) — drain() 批量合并
+      Source 3: Timer pop_fired (定时任务) — 所有到期
+
+    所有源都空时 → sleep(TICK=16ms) → 对齐 iOS mach_msg(timeout)
     """
 
-    def __init__(self, graph, bus, db, manifest_data: dict,
+    TICK = 1 / 60  # 16.7ms
+    MAX_WS_PER_TICK = 5
+    MAX_REDIS_PER_TICK = 3
+
+    def __init__(self, graph, db, manifest_data: dict,
                  redis_url: str = "redis://localhost:6379/0",
                  agent_id: str = "agent-001",
                  plan_graph=None):
-        self._graph = graph               # CompiledStateGraph
-        self._plan_graph = plan_graph     # PlanGraph 实例 (用于 set_report_listener)
-        self._bus = bus
+        self._graph = graph
+        self._plan_graph = plan_graph
         self._db = db
         self._manifest_data = manifest_data
         self._redis_url = redis_url
         self._agent_id = agent_id
 
-        # 事件源
+        # 事件源 (tick-polling 模式直接持有)
+        from .event_bus import WSMessageQueue
+        self._ws_source = WSMessageQueue()
         self._redis_source = None
         self._report_listener = None
         self._timer_source = None
-        self._ws_source = None  # 由 ws_handler 通过 set_ws_source() 注入
+
+        # Observer
+        from .event_bus import Observer
+        self._observer = Observer()
 
         # 状态
         self._running = False
-        self._shutdown_event = asyncio.Event()
-
-        # WS 回调 (由 ws_handler 设置)
         self._ws_send_fn: Optional[Any] = None
 
     @property
     def running(self) -> bool:
         return self._running
 
-    def set_ws_source(self, ws_queue: asyncio.Queue):
-        """由 ws_handler 注入 WebSocket 消息队列。
-
-        ws_handler 将接收到的 WS 消息放入此队列，
-        AgentRunLoop 从中取出并投递到 EventBus (prio=0)。
-        """
-        self._ws_source = ws_queue
-        logger.info("WebSocket source injected")
-
     def set_ws_send_fn(self, send_fn):
-        """注入 WebSocket 发送回调。"""
         self._ws_send_fn = send_fn
+
+    # ── 启动/停止 ─────────────────────────────────────
 
     async def start(self):
         """启动 AgentRunLoop 和所有事件源。"""
-        logger.info("AgentRunLoop starting...")
+        logger.info("AgentRunLoop starting (tick-polling mode)...")
         self._running = True
 
-        # 1. 启动 EventBus
-        await self._bus.start()
-
-        # 2. 启动 Redis 事件源 (Celery Worker 进度)
         from .event_bus import RedisEventSource, SubAgentReportListener, TimerEventSource, TimerDef
-        self._redis_source = RedisEventSource(
-            self._bus, self._redis_url, self._agent_id,
-        )
-        await self._redis_source.start()
 
-        # 3. 启动 SubAgent 实时报告监听 (Redis Pub/Sub)
-        self._report_listener = SubAgentReportListener(
-            self._bus, self._redis_url,
-        )
-        await self._report_listener.start()
+        # Source 1: Redis LPOP (Celery 结果)
+        self._redis_source = RedisEventSource(self._redis_url, self._agent_id)
 
-        # ── 将 report_listener 绑定到 PlanGraph (延迟绑定) ──
+        # Source 2: Pub/Sub (子Agent 报告)
+        self._report_listener = SubAgentReportListener(self._redis_url)
+        self._report_listener.start()
+
+        # Source 3: Timer
+        self._timer_source = TimerEventSource()
+        self._timer_source.start()
+        self._timer_source.register(TimerDef(
+            name="health_check", interval_seconds=1200, timer_type="health_check"))
+        self._timer_source.register(TimerDef(
+            name="cleanup_logs", interval_seconds=86400, timer_type="cleanup"))
+
+        # 绑定 report_listener 到 PlanGraph
         if self._plan_graph and hasattr(self._plan_graph, 'set_report_listener'):
             self._plan_graph.set_report_listener(self._report_listener)
             logger.info("Report listener bound to PlanGraph")
 
-        # 4. 启动 Timer 事件源 (注册系统定时器)
-        self._timer_source = TimerEventSource(self._bus)
-        await self._timer_source.start()
-
-        # 注册系统定时器
-        self._timer_source.register(TimerDef(
-            name="health_check",
-            interval_seconds=1200,  # 20 min
-            timer_type="health_check",
-        ))
-        self._timer_source.register(TimerDef(
-            name="cleanup_logs",
-            interval_seconds=86400,  # 1 day
-            timer_type="cleanup",
-        ))
-
-        # 5. 启动 WebSocket 源 (如有注入)
-        if self._ws_source is not None:
-            logger.info("WebSocket source active")
-
-        logger.info("AgentRunLoop started — consuming events")
-
-        # 进入主循环
+        logger.info("AgentRunLoop started — tick-polling")
         await self._run_loop()
 
     async def stop(self):
         """优雅关闭。"""
         logger.info("AgentRunLoop stopping...")
         self._running = False
-        self._shutdown_event.set()
-
-        # 停止事件源
-        if self._redis_source:
-            await self._redis_source.stop()
-        if self._report_listener:
-            await self._report_listener.stop()
         if self._timer_source:
             await self._timer_source.stop()
-
-        # 停止 EventBus
-        await self._bus.stop()
-
+        if self._report_listener:
+            self._report_listener.stop()
         logger.info("AgentRunLoop stopped")
 
+    # ── 主循环 (Tick-Polling) ──────────────────────────
+
     async def _run_loop(self):
-        """主循环 — 消费 PriorityQueue 中的事件。
+        """Tick-Polling 主循环 — 对齐 iOS CFRunLoop。
 
-        设计原则 (对齐 iOS RunLoop):
-          - 所有事件源 → 同一个 PriorityQueue
-          - 纯阻塞 pop() — queue 空时 asyncio 挂起，零 CPU
-          - Timer/Redis/WS 任何源有数据 → push() → queue 有数据 → pop() 自然唤醒
-          - 没有事件时 100% 休眠，不轮询
-          - shutdown → stop() → bus.push(SYSTEM_SHUTDOWN) → pop() 唤醒 → 退出
-
-        优先级保证:
-          prio=0 (用户消息) > prio=1 (celery_done) > prio=2 (progress) > prio=3 (timer)
-          低 prio 值优先出队，用户消息永不被大量 progress 事件饿死。
+        每 tick: 按优先级顺序检查每个源
+          - WS:   逐条 ≤5/tick
+          - Redis: 逐条 ≤3/tick
+          - PubSub: drain() 批量合并
+          - Timer:  pop_fired() 所有到期
+          - Observer: 心跳超时检查
+          - 全部空 → sleep(TICK)
         """
-        from .event_bus import (
-            EventType, UserMessageEvent, UserClarificationEvent, UserApprovalEvent,
-            CeleryDoneEvent, CeleryErrorEvent, CeleryProgressEvent, TimerFiredEvent,
-        )
-
-        # 启动 WS 消息转发协程 (后台持续运行)
-        if self._ws_source is not None:
-            asyncio.create_task(self._forward_ws_messages())
-
         while self._running:
-            try:
-                # 纯阻塞等待 — 无事件时 asyncio 自动挂起协程
-                # 任何源 push() 后自然唤醒
-                priority, seq, event = await self._bus.pop()
+            handled = False
 
-                event_type = event.type
-                if priority <= 1:  # prio=0/1 打 INFO，prio=2/3 打 DEBUG (降噪)
-                    logger.info(f"[RunLoop] prio={priority} seq={seq} type={event_type}")
-                else:
-                    logger.debug(f"[RunLoop] prio={priority} seq={seq} type={event_type}")
-
-                # ── 分发事件 ──────────────────────────────
-
-                if event_type == EventType.SYSTEM_SHUTDOWN:
-                    logger.info("Shutdown event received")
+            # ═══ Source 0: WebSocket (用户交互) ═══
+            for _ in range(self.MAX_WS_PER_TICK):
+                msg = self._ws_source.pop_nowait()
+                if msg is None:
                     break
+                await self._dispatch_ws_message(msg)
+                handled = True
 
-                elif event_type == EventType.USER_MESSAGE:
-                    await self._handle_user_message(event)
+            # ═══ Source 1: Redis LPOP (Celery 完成/错误) ═══
+            for _ in range(self.MAX_REDIS_PER_TICK):
+                event = self._redis_source.pop_nowait()
+                if event is None:
+                    break
+                await self._handle_celery_result(event)
+                handled = True
 
-                elif event_type == EventType.USER_CLARIFICATION:
-                    await self._handle_clarification(event)
+            # ═══ Source 2: Pub/Sub (子Agent 实时报告) ═══
+            reports = self._report_listener.drain()
+            if reports:
+                merged = self._merge_reports(reports)
+                for report in merged:
+                    await self._handle_report(report)
+                handled = True
 
-                elif event_type == EventType.USER_APPROVAL:
-                    await self._handle_approval(event)
+            # ═══ Source 3: Timer (定时任务) ═══
+            fired = self._timer_source.pop_fired()
+            for timer in fired:
+                await self._handle_timer(timer)
+            if fired:
+                handled = True
 
-                elif event_type == EventType.CELERY_DONE:
-                    await self._handle_celery_done(event)
+            # ═══ Observer: 心跳超时检查 ═══
+            timed_out = self._observer.check_timeouts()
+            for tid in timed_out:
+                await self._handle_sub_agent_lost(tid)
 
-                elif event_type == EventType.CELERY_ERROR:
-                    await self._handle_celery_error(event)
+            # ═══ 休眠 (对齐 iOS mach_msg(timeout)) ═══
+            if not handled:
+                await asyncio.sleep(self.TICK)
 
-                elif event_type == EventType.CELERY_PROGRESS:
-                    await self._handle_celery_progress(event)
+    # ── 数据批处理 ─────────────────────────────────────
 
-                elif event_type == EventType.TIMER_FIRED:
-                    await self._handle_timer_fired(event)
-
-                else:
-                    logger.debug(f"Unknown event type: {event_type}")
-
-                # 推送给订阅者
-                await self._bus.publish_to_subscribers(event)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"AgentRunLoop dispatch error: {e}", exc_info=True)
-
-    # ── WS 消息转发协程 ─────────────────────────────────
-
-    async def _forward_ws_messages(self):
-        """将 WebSocket 消息队列中的消息转发到 EventBus。
-
-        后台协程 — 阻塞等待 WS 消息，有消息就推到 EventBus prio=0。
-        WS 断开时 ws_source 会被设置为 None，协程自然退出。
-        """
-        from .event_bus import UserMessageEvent, UserClarificationEvent, UserApprovalEvent
-
-        while self._running and self._ws_source is not None:
-            try:
-                ws_msg = await self._ws_source.get()  # 纯阻塞，有消息才醒
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(0.1)
+    @staticmethod
+    def _merge_reports(reports: list) -> list:
+        """同一 task_id 的进度合并为一条 summary，保留最新 stage/进度。"""
+        from .event_bus import ProgressReport
+        by_task: dict[str, ProgressReport] = {}
+        lifecycles = []
+        for r in reports:
+            if r.is_lifecycle:
+                lifecycles.append(r)
                 continue
+            tid = r.task_id
+            if tid not in by_task:
+                by_task[tid] = r
+            else:
+                # 保留最新的进度
+                existing = by_task[tid]
+                if r.paper_index > existing.paper_index:
+                    existing.paper_index = r.paper_index
+                    existing.paper_total = r.paper_total
+                    existing.stage = r.stage or existing.stage
+                    existing.stage_index = r.stage_index or existing.stage_index
+                    existing.status = r.status or existing.status
+        return lifecycles + list(by_task.values())
 
-            sub_type = ws_msg.get("subType", "")
-            payload = ws_msg.get("payload", {})
-            agent_id = ws_msg.get("agentId", self._agent_id)
-            session_id = ws_msg.get("sessionId", "main")
+    # ── 分发 ──────────────────────────────────────────
 
-            if sub_type == "chat":
-                await self._bus.push(UserMessageEvent(
-                    content=payload.get("text", ""),
-                    raw_envelope=ws_msg,
-                    agent_id=agent_id,
-                    session_id=session_id,
-                ))
-            elif sub_type == "clarify":
-                await self._bus.push(UserClarificationEvent(
-                    answers=payload.get("answers", []),
-                    agent_id=agent_id,
-                    session_id=session_id,
-                ))
-            elif sub_type == "approve":
-                await self._bus.push(UserApprovalEvent(
-                    confirmed=payload.get("confirmed", False),
-                    modifications=payload.get("modifications", {}),
-                    agent_id=agent_id,
-                    session_id=session_id,
-                ))
+    async def _dispatch_ws_message(self, msg: dict):
+        """分发 WebSocket 消息到 PlanGraph。"""
+        from .event_bus import EventType
+        sub_type = msg.get("subType", "")
+        payload = msg.get("payload", {})
+        session_id = msg.get("sessionId", "main")
+
+        if sub_type == "chat":
+            await self._handle_user_message(
+                session_id, payload.get("text", ""), msg)
+        elif sub_type == "clarify":
+            await self._handle_clarification(
+                session_id, payload.get("answers", []))
+        elif sub_type == "approve":
+            await self._handle_approval(
+                session_id, payload.get("confirmed", False),
+                payload.get("modifications", {}))
 
     # ── 事件处理器 ──────────────────────────────────────
 
-    async def _handle_user_message(self, event):
-        """处理用户消息 → 启动/恢复 PlanGraph。"""
-        session_id = getattr(event, 'session_id', 'main')
-        config = {
-            "configurable": {
-                "thread_id": f"{self._agent_id}-plan-{session_id}",
-            },
-        }
-
+    async def _handle_user_message(self, session_id: str, content: str, raw: dict):
+        config = {"configurable": {"thread_id": f"{self._agent_id}-plan-{session_id}"}}
         try:
-            # 启动 PlanGraph 处理
             result = await self._graph.ainvoke(
-                {"messages": [{"role": "user", "content": event.content}]},
-                config=config,
-            )
+                {"messages": [{"role": "user", "content": content}]},
+                config=config)
             await self._dispatch_graph_output(result, session_id)
         except Exception as e:
             logger.error(f"PlanGraph invocation failed: {e}", exc_info=True)
 
-    async def _handle_clarification(self, event):
-        """处理用户澄清回答 → aresume PlanGraph。"""
-        session_id = getattr(event, 'session_id', 'main')
-        config = {
-            "configurable": {
-                "thread_id": f"{self._agent_id}-plan-{session_id}",
-            },
-        }
-
+    async def _handle_clarification(self, session_id: str, answers: list):
+        config = {"configurable": {"thread_id": f"{self._agent_id}-plan-{session_id}"}}
         try:
             result = await self._graph.aresume(
-                config,
-                {"user_clarification": {"answers": event.answers}},
-            )
+                config, {"user_clarification": {"answers": answers}})
             await self._dispatch_graph_output(result, session_id)
         except Exception as e:
             logger.error(f"PlanGraph aresume (clarify) failed: {e}", exc_info=True)
 
-    async def _handle_approval(self, event):
-        """处理用户审批 → aresume PlanGraph。"""
-        session_id = getattr(event, 'session_id', 'main')
-        config = {
-            "configurable": {
-                "thread_id": f"{self._agent_id}-plan-{session_id}",
-            },
-        }
-
+    async def _handle_approval(self, session_id: str, confirmed: bool, modifications: dict):
+        config = {"configurable": {"thread_id": f"{self._agent_id}-plan-{session_id}"}}
         try:
             result = await self._graph.aresume(
-                config,
-                {"user_approval": {
-                    "confirmed": event.confirmed,
-                    "modifications": event.modifications,
-                }},
-            )
+                config, {"user_approval": {"confirmed": confirmed,
+                                           "modifications": modifications}})
             await self._dispatch_graph_output(result, session_id)
         except Exception as e:
             logger.error(f"PlanGraph aresume (approval) failed: {e}", exc_info=True)
 
-    async def _handle_celery_done(self, event: CeleryDoneEvent):
-        """处理 Celery 任务完成。"""
-        logger.info(f"Celery done: task={event.agent_task_id} agent={event.agent_type}")
-        # 通过 WS 推送完成通知
+    async def _handle_celery_result(self, event):
+        """处理 Celery 完成/错误。"""
+        from .event_bus import CeleryResultEvent
+        if event.is_error:
+            logger.error(f"Celery error: task={event.agent_task_id} err={event.error[:200]}")
+            if self._ws_send_fn:
+                await self._ws_send_fn({
+                    "role": "assistant", "type": "task", "subType": "failed",
+                    "agentId": self._agent_id, "sessionId": "main",
+                    "seq": 0, "priority": 1, "timestamp": _now(),
+                    "payload": {"taskId": event.agent_task_id, "error": event.error},
+                })
+        else:
+            logger.info(f"Celery done: task={event.agent_task_id}")
+            if self._ws_send_fn:
+                await self._ws_send_fn({
+                    "role": "assistant", "type": "task", "subType": "done",
+                    "agentId": self._agent_id, "sessionId": "main",
+                    "seq": 0, "priority": 1, "timestamp": _now(),
+                    "payload": {"taskId": event.agent_task_id, "result": event.result},
+                })
+
+    async def _handle_report(self, report):
+        """处理子Agent 报告 (含生命周期 + 进度)。"""
+        from .event_bus import ProgressReport
+        tid = report.task_id
+
+        if report.is_lifecycle:
+            lt = report.lifecycle_type
+            if lt == "started":
+                self._observer.on_agent_started(tid, report.agent_type)
+            elif lt == "done":
+                self._observer.on_agent_done(tid)
+                if self._report_listener:
+                    await self._report_listener.unsubscribe(tid)
+            elif lt == "failed":
+                self._observer.on_agent_failed(tid, report.data.get("error", ""))
+                if self._report_listener:
+                    await self._report_listener.unsubscribe(tid)
+        else:
+            self._observer.on_agent_report(tid)
+
+        # WS 推送进度
         if self._ws_send_fn:
             await self._ws_send_fn({
-                "role": "assistant",
-                "type": "task",
-                "subType": "done",
-                "agentId": self._agent_id,
-                "sessionId": getattr(event, 'session_id', 'main'),
-                "seq": event.seq,
-                "priority": event.priority,
-                "timestamp": _now(),
+                "role": "assistant", "type": "task", "subType": "running",
+                "agentId": self._agent_id, "sessionId": "main",
+                "seq": 0, "priority": 2, "timestamp": _now(),
                 "payload": {
-                    "taskId": event.agent_task_id,
-                    "result": event.result,
+                    "taskId": tid,
+                    "stage": report.stage,
+                    "stageIndex": report.stage_index,
+                    "totalStages": report.total_stages,
+                    "current": report.paper_index,
+                    "total": report.paper_total,
                 },
             })
 
-    async def _handle_celery_error(self, event: CeleryErrorEvent):
-        """处理 Celery 任务失败。"""
-        logger.error(f"Celery error: task={event.agent_task_id} error={event.error[:200]}")
-        if self._ws_send_fn:
-            await self._ws_send_fn({
-                "role": "assistant",
-                "type": "task",
-                "subType": "failed",
-                "agentId": self._agent_id,
-                "sessionId": getattr(event, 'session_id', 'main'),
-                "seq": event.seq,
-                "priority": event.priority,
-                "timestamp": _now(),
-                "payload": {
-                    "taskId": event.agent_task_id,
-                    "error": event.error,
-                },
-            })
-
-    async def _handle_celery_progress(self, event: CeleryProgressEvent):
-        """处理 Celery 进度 → WS 推送。"""
-        if self._ws_send_fn:
-            await self._ws_send_fn({
-                "role": "assistant",
-                "type": "task",
-                "subType": "running",
-                "agentId": self._agent_id,
-                "sessionId": getattr(event, 'session_id', 'main'),
-                "seq": event.seq,
-                "priority": event.priority,
-                "timestamp": _now(),
-                "payload": {
-                    "taskId": event.agent_task_id,
-                    "stage": event.stage,
-                    "stageIndex": event.stage_index,
-                    "totalStages": event.total_stages,
-                    "current": event.current,
-                    "total": event.total,
-                },
-            })
-
-    async def _handle_timer_fired(self, event: TimerFiredEvent):
+    async def _handle_timer(self, timer):
         """处理定时触发事件。"""
-        logger.info(f"Timer fired: {event.timer_name} (type={event.timer_type})")
-
-        if event.timer_type == "health_check":
+        logger.info(f"Timer fired: {timer.timer_name} (type={timer.timer_type})")
+        if timer.timer_type == "health_check":
             await self._run_health_check()
-        elif event.timer_type == "cleanup":
+        elif timer.timer_type == "cleanup":
             await self._run_cleanup()
-        elif event.timer_type == "subscription":
-            # TODO: 检查订阅方向的新论文
-            pass
 
-    async def _run_health_check(self):
-        """执行系统健康检查。"""
-        ok = True
-        status = {}
-
-        # 检查 DB
-        try:
-            self._db.conn.execute("SELECT 1")
-            status["db"] = "ok"
-        except Exception as e:
-            status["db"] = f"error: {e}"
-            ok = False
-
-        # 检查 Redis
-        if self._redis_source:
-            try:
-                self._redis_source.redis.ping()
-                status["redis"] = "ok"
-            except Exception as e:
-                status["redis"] = f"error: {e}"
-                ok = False
-
-        logger.info(f"Health check: {'OK' if ok else 'FAILED'} — {json.dumps(status)}")
-
-    async def _run_cleanup(self):
-        """清理过期日志。"""
-        log_dir = Path.home() / ".paper_search" / "logs" / "tasks"
-        if log_dir.exists():
-            cutoff = datetime.now(timezone.utc).timestamp() - 30 * 86400  # 30 days
-            count = 0
-            for f in log_dir.glob("*.jsonl"):
-                if f.stat().st_mtime < cutoff:
-                    f.unlink()
-                    count += 1
-            if count:
-                logger.info(f"Cleanup: removed {count} old task logs")
-
-    # ── PlanGraph 输出分发 ──────────────────────────────
+    async def _handle_sub_agent_lost(self, task_id: str):
+        """处理子Agent 心跳超时。"""
+        self._observer.on_agent_failed(task_id, "heartbeat_timeout")
+        if self._report_listener:
+            await self._report_listener.unsubscribe(task_id)
+        if self._ws_send_fn:
+            await self._ws_send_fn({
+                "role": "assistant", "type": "task", "subType": "failed",
+                "agentId": self._agent_id, "sessionId": "main",
+                "seq": 0, "priority": 1, "timestamp": _now(),
+                "payload": {"taskId": task_id, "error": "Sub-agent lost (heartbeat timeout)"},
+            })
 
     async def _dispatch_graph_output(self, result, session_id: str):
-        """将 PlanGraph 输出转为 WS 协议消息并发送。
-
-        PlanGraph 节点可能设置:
-          - pending_review → 转为 review(clarify/plan/permissions) WS 消息
-          - plan_status → 转为 phase 消息
-          - error → 转为 error 消息
-        """
+        """将 PlanGraph 输出转为 WS 消息。"""
         if result is None:
             return
-
-        # 检查 pending_review
         pending_review = result.get("pending_review")
         if pending_review and isinstance(pending_review, dict):
             await self._send_ws({
                 "role": "assistant",
                 "type": pending_review.get("type", "review"),
                 "subType": pending_review.get("subType", "clarify"),
-                "agentId": self._agent_id,
-                "sessionId": session_id,
-                "seq": 0,
-                "priority": 0,
-                "timestamp": _now(),
+                "agentId": self._agent_id, "sessionId": session_id,
+                "seq": 0, "priority": 0, "timestamp": _now(),
                 "payload": pending_review.get("payload", {}),
             })
 
-        # 检查错误
-        error = result.get("error")
-        if error:
-            await self._send_ws({
-                "role": "assistant",
-                "type": "error",
-                "subType": "error",
-                "agentId": self._agent_id,
-                "sessionId": session_id,
-                "seq": 0,
-                "priority": 0,
-                "timestamp": _now(),
-                "payload": {"message": str(error)},
-            })
-
-        # 检查 plan_status 变更
         plan_status = result.get("plan_status", "")
         if plan_status:
             await self._send_ws({
-                "role": "assistant",
-                "type": "phase",
-                "subType": plan_status,
-                "agentId": self._agent_id,
-                "sessionId": session_id,
-                "seq": 0,
-                "priority": 0,
-                "timestamp": _now(),
-                "payload": {"planStatus": plan_status},
+                "role": "assistant", "type": "phase",
+                "subType": plan_status, "agentId": self._agent_id,
+                "sessionId": session_id, "seq": 0, "priority": 0,
+                "timestamp": _now(), "payload": {"planStatus": plan_status},
+            })
+
+        error = result.get("error")
+        if error:
+            await self._send_ws({
+                "role": "assistant", "type": "error", "subType": "error",
+                "agentId": self._agent_id, "sessionId": session_id,
+                "seq": 0, "priority": 0, "timestamp": _now(),
+                "payload": {"message": str(error)},
             })
 
     async def _send_ws(self, envelope: dict):
-        """发送 WS 消息。"""
         if self._ws_send_fn:
             try:
                 await self._ws_send_fn(envelope)
             except Exception as e:
                 logger.error(f"WS send failed: {e}")
+
+    async def _run_health_check(self):
+        status = {}
+        try:
+            self._db.conn.execute("SELECT 1")
+            status["db"] = "ok"
+        except Exception as e:
+            status["db"] = f"error: {e}"
+        if self._redis_source:
+            try:
+                self._redis_source.redis.ping()
+                status["redis"] = "ok"
+            except Exception as e:
+                status["redis"] = f"error: {e}"
+        logger.info(f"Health check: {json.dumps(status)}")
+
+    async def _run_cleanup(self):
+        log_dir = Path.home() / ".paper_search" / "logs" / "sub_agents"
+        if log_dir.exists():
+            cutoff = datetime.now(timezone.utc).timestamp() - 30 * 86400
+            count = 0
+            for f in log_dir.glob("**/*.jsonl"):
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    count += 1
+            if count:
+                logger.info(f"Cleanup: removed {count} old task logs")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -799,14 +682,9 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
     logger.info(f"  Graph: {type(result['graph']).__name__}")
     logger.info(f"  State: {'restored' if result['state'] else 'fresh'}")
 
-    # 创建 EventBus
-    from .event_bus import EventBus
-    bus = EventBus()
-
-    # 创建 AgentRunLoop
+    # 创建 AgentRunLoop (tick-polling 模式)
     loop = AgentRunLoop(
         graph=result["graph"],
-        bus=bus,
         db=result["db"],
         manifest_data=manifest,
         redis_url=redis,

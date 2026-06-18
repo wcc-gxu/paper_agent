@@ -224,6 +224,11 @@ class ExecuteGraph:
         if keywords:
             user_query = f"{user_query} {' '.join(keywords)}"
 
+        # ── 发布 agent_started ──
+        if self._report_listener:
+            self._report_listener.publish_lifecycle(
+                task_id, "agent_started", agent_type="ingest")
+
         try:
             result = await ingest_graph.ainvoke({
                 "project_id": task_id,
@@ -235,6 +240,12 @@ class ExecuteGraph:
                 "single_tool_name": sub_task.get("single_tool_name", ""),
             }, config=config)
 
+            # ── 发布 agent_done ──
+            if self._report_listener:
+                self._report_listener.publish_lifecycle(
+                    task_id, "agent_done", agent_type="ingest",
+                    extra={"result": result.get("result", {})})
+
             return {
                 "action": "ingest",
                 "agent": "ingest",
@@ -243,6 +254,11 @@ class ExecuteGraph:
             }
         except Exception as e:
             logger.error(f"IngestAgent failed: {e}", exc_info=True)
+            # ── 发布 agent_failed ──
+            if self._report_listener:
+                self._report_listener.publish_lifecycle(
+                    task_id, "agent_failed", agent_type="ingest",
+                    extra={"error": str(e)})
             return {"action": "ingest", "agent": "ingest", "error": str(e)}
 
     async def _run_citation_chase(self, task_id: str, sub_task: dict, plan: dict) -> dict:

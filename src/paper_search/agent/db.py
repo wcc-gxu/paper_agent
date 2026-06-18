@@ -223,6 +223,30 @@ class AgentDB:
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    def write_lock(self):
+        """文件锁 contextmanager — 多进程写互斥。
+
+        用法:
+            with db.write_lock():
+                db.conn.execute("INSERT ...")
+                db.conn.commit()
+        """
+        from contextlib import contextmanager
+        import fcntl
+
+        @contextmanager
+        def _lock():
+            lock_path = self.db_path.with_suffix(".db.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            lock_file = open(str(lock_path), 'w')
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
+        return _lock()
+
     def _paper_id(self, paper) -> str:
         """生成论文唯一 ID: DOI > arxiv_id > pmid > 标题 SHA256。"""
         import hashlib

@@ -64,20 +64,7 @@ class TaskEventAdapter:
         }
 
     async def _emit(self, envelope: dict, event_type: str = ""):
-        """发送信封（EventBus 优先，降级到 send_fn）。"""
-        if self._bus is not None:
-            try:
-                from .event_bus import CeleryProgressEvent, Priority
-                await self._bus.push(CeleryProgressEvent(
-                    agent_id=self.agent_id,
-                    session_id=self.session_id,
-                    agent_type="ingest",
-                    data=envelope.get("payload", {}),
-                ), priority=envelope.get("priority", Priority.CELERY_PROGRESS))
-                return
-            except Exception as e:
-                logger.debug(f"EventBus push failed, falling back to send_fn: {e}")
-
+        """发送信封 — 直接回调 send_fn。tick-polling 模式下不经过 EventBus。"""
         if self._send is not None:
             try:
                 await self._send(envelope)
