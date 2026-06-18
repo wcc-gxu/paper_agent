@@ -3,7 +3,7 @@
 > 个人 AI 科研助理 — 24/7 常驻后台，具备记忆、能主动发现知识、能自主决策的终身 Agent。
 
 ```
-iOS 客户端 ←→ WebSocket + REST ←→ AgentRunLoop ←→ PlanGraph (主Agent)
+iOS 客户端 ←→ WebSocket/REST ←→ AgentRunLoop ←→ PlanGraph (主Agent)
                                  (事件驱动)      │
                                     │           ├── IngestAgent (7阶段入库)
                     ┌───────────────┼───────────┼── RADQueryAgent (规划中)
