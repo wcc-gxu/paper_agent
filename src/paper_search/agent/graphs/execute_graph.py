@@ -65,7 +65,8 @@ class ExecuteGraph:
 
     def __init__(self, db, llm, tools, task_adapter=None,
                  celery_app=None, redis_url: str = "redis://localhost:6379/0",
-                 agent_id: str = "agent-001"):
+                 agent_id: str = "agent-001",
+                 report_listener=None):
         self._db = db
         self._llm = llm
         self._tools = tools
@@ -73,6 +74,7 @@ class ExecuteGraph:
         self._celery_app = celery_app
         self._redis_url = redis_url
         self._agent_id = agent_id
+        self._report_listener = report_listener  # SubAgentReportListener 实例
 
     async def dispatch(self, task_id: str, plan: dict) -> dict:
         """根据 plan 分发到对应子 Agent(s) 并等待完成。
@@ -119,14 +121,23 @@ class ExecuteGraph:
     async def _execute_sub_task(self, task_id: str, sub_task: dict,
                                 step_index: int, total_steps: int,
                                 plan: dict) -> dict:
-        """执行单个子任务 → 通过 Celery 或直接调用。
+        """执行单个子任务 → 订阅实时报告 + 通过 Celery 或直接调用。
 
         根据 sub_task 的 action 字段路由到对应的子 Agent。
+        执行前订阅 agent:reports:{task_id}，执行后取消订阅。
         """
         action = sub_task.get("action", "search")
         agent_type = sub_task.get("agent", self._resolve_agent(action))
 
         logger.info(f"  Step {step_index}/{total_steps}: action={action} agent={agent_type}")
+
+        # ── 订阅子 Agent 实时报告 ──
+        if self._report_listener:
+            try:
+                await self._report_listener.subscribe(task_id)
+                logger.debug(f"Subscribed to agent:reports:{task_id}")
+            except Exception as e:
+                logger.warning(f"Failed to subscribe to reports: {e}")
 
         # 通知 task(running)
         if self._task_adapter:
@@ -137,20 +148,30 @@ class ExecuteGraph:
             except Exception:
                 pass
 
+        result = None
         if agent_type == "ingest":
-            return await self._run_ingest(task_id, sub_task, plan)
+            result = await self._run_ingest(task_id, sub_task, plan)
         elif agent_type == "citation_chase":
-            return await self._run_citation_chase(task_id, sub_task, plan)
+            result = await self._run_citation_chase(task_id, sub_task, plan)
         elif agent_type == "rad_query":
-            return await self._run_rad_query(task_id, sub_task, plan)
+            result = await self._run_rad_query(task_id, sub_task, plan)
         elif agent_type == "clustering":
-            return await self._run_clustering(task_id, sub_task, plan)
+            result = await self._run_clustering(task_id, sub_task, plan)
         elif agent_type == "translation":
-            return await self._run_translation(task_id, sub_task, plan)
+            result = await self._run_translation(task_id, sub_task, plan)
         elif agent_type == "history":
-            return await self._run_history(task_id, sub_task, plan)
+            result = await self._run_history(task_id, sub_task, plan)
         else:
-            return {"action": action, "agent": agent_type, "error": f"Unknown agent: {agent_type}"}
+            result = {"action": action, "agent": agent_type, "error": f"Unknown agent: {agent_type}"}
+
+        # ── 取消订阅 ──
+        if self._report_listener:
+            try:
+                await self._report_listener.unsubscribe(task_id)
+            except Exception as e:
+                logger.warning(f"Failed to unsubscribe from reports: {e}")
+
+        return result
 
     def _resolve_agent(self, action: str) -> str:
         """根据 action 类型推断子 Agent。"""

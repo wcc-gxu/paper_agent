@@ -43,7 +43,8 @@ class PipelineRunner:
 
     def __init__(self, engine, db, llm, chroma, converter, ranker,
                  task_logger_cls=None, reporter=None,
-                 on_progress: Optional[Callable] = None):
+                 on_progress: Optional[Callable] = None,
+                 agent_type: str = "ingest"):
         """
         Args:
             engine: PaperSearchEngine 实例
@@ -55,6 +56,7 @@ class PipelineRunner:
             task_logger_cls: TaskLogger 类（用于创建实例）
             reporter: Reporter 实例
             on_progress: 进度回调 async def(stage, data)
+            agent_type: 子 Agent 类型 (用于日志分目录)
         """
         self.engine = engine
         self.db = db
@@ -65,6 +67,7 @@ class PipelineRunner:
         self._task_logger_cls = task_logger_cls
         self._reporter = reporter
         self._on_progress = on_progress
+        self.agent_type = agent_type
 
     # ══════════════════════════════════════════════════════════
     # ExecuteGraph — 完整 7 阶段流水线
@@ -84,7 +87,7 @@ class PipelineRunner:
         task_id = f"task-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{uuid.uuid4().hex[:4]}"
 
         from .task_logger import TaskLogger
-        log_dir = Path.home() / ".paper_search" / "logs" / "tasks"
+        log_dir = Path.home() / ".paper_search" / "logs" / "sub_agents" / self.agent_type
         tlog = TaskLogger(log_dir, task_id)
 
         tlog.task_start(task_id, project_id, {
@@ -181,7 +184,7 @@ class PipelineRunner:
         task_id = f"single-{tool_name}-{uuid.uuid4().hex[:6]}"
 
         from .task_logger import TaskLogger
-        log_dir = Path.home() / ".paper_search" / "logs" / "tasks"
+        log_dir = Path.home() / ".paper_search" / "logs" / "sub_agents" / self.agent_type
         tlog = TaskLogger(log_dir, task_id)
 
         tlog.task_start(task_id, "", {"tool": tool_name, "kwargs": kwargs})

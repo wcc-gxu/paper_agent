@@ -160,8 +160,8 @@ class AgentBootstrap:
         manifest_data["agent"]["updated_at"] = _now()
         self.manifest.save(manifest_data)
 
-        return {"manifest": manifest_data, "graph": self._graph, "state": state,
-                "db": self._db, "memory": self._memory, "tools": self._tools}
+        return {"manifest": manifest_data, "graph": self._graph, "plan_graph": pg,
+                "state": state, "db": self._db, "memory": self._memory, "tools": self._tools}
 
     # ── 首次创建 ────────────────────────────────────────
 
@@ -269,8 +269,8 @@ class AgentBootstrap:
         self.manifest.save(manifest_data)
         logger.info(f"Manifest created: {self.manifest.path}")
 
-        return {"manifest": manifest_data, "graph": self._graph, "state": None,
-                "db": self._db, "memory": self._memory, "tools": self._tools}
+        return {"manifest": manifest_data, "graph": self._graph, "plan_graph": pg,
+                "state": None, "db": self._db, "memory": self._memory, "tools": self._tools}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -301,8 +301,10 @@ class AgentRunLoop:
 
     def __init__(self, graph, bus, db, manifest_data: dict,
                  redis_url: str = "redis://localhost:6379/0",
-                 agent_id: str = "agent-001"):
-        self._graph = graph
+                 agent_id: str = "agent-001",
+                 plan_graph=None):
+        self._graph = graph               # CompiledStateGraph
+        self._plan_graph = plan_graph     # PlanGraph 实例 (用于 set_report_listener)
         self._bus = bus
         self._db = db
         self._manifest_data = manifest_data
@@ -360,6 +362,11 @@ class AgentRunLoop:
         )
         await self._report_listener.start()
 
+        # ── 将 report_listener 绑定到 PlanGraph (延迟绑定) ──
+        if self._plan_graph and hasattr(self._plan_graph, 'set_report_listener'):
+            self._plan_graph.set_report_listener(self._report_listener)
+            logger.info("Report listener bound to PlanGraph")
+
         # 4. 启动 Timer 事件源 (注册系统定时器)
         self._timer_source = TimerEventSource(self._bus)
         await self._timer_source.start()
@@ -405,25 +412,39 @@ class AgentRunLoop:
         logger.info("AgentRunLoop stopped")
 
     async def _run_loop(self):
-        """主循环 — 消费 PriorityQueue 中的事件。"""
+        """主循环 — 消费 PriorityQueue 中的事件。
+
+        设计原则 (对齐 iOS RunLoop):
+          - 所有事件源 → 同一个 PriorityQueue
+          - 纯阻塞 pop() — queue 空时 asyncio 挂起，零 CPU
+          - Timer/Redis/WS 任何源有数据 → push() → queue 有数据 → pop() 自然唤醒
+          - 没有事件时 100% 休眠，不轮询
+          - shutdown → stop() → bus.push(SYSTEM_SHUTDOWN) → pop() 唤醒 → 退出
+
+        优先级保证:
+          prio=0 (用户消息) > prio=1 (celery_done) > prio=2 (progress) > prio=3 (timer)
+          低 prio 值优先出队，用户消息永不被大量 progress 事件饿死。
+        """
         from .event_bus import (
             EventType, UserMessageEvent, UserClarificationEvent, UserApprovalEvent,
             CeleryDoneEvent, CeleryErrorEvent, CeleryProgressEvent, TimerFiredEvent,
         )
 
-        # 启动 WS 消息转发协程
+        # 启动 WS 消息转发协程 (后台持续运行)
         if self._ws_source is not None:
             asyncio.create_task(self._forward_ws_messages())
 
         while self._running:
             try:
-                # 从 EventBus 获取下一个事件（带超时，可响应 shutdown）
-                priority, seq, event = await asyncio.wait_for(
-                    self._bus.pop(), timeout=1.0
-                )
+                # 纯阻塞等待 — 无事件时 asyncio 自动挂起协程
+                # 任何源 push() 后自然唤醒
+                priority, seq, event = await self._bus.pop()
 
                 event_type = event.type
-                logger.debug(f"[RunLoop] prio={priority} seq={seq} type={event_type}")
+                if priority <= 1:  # prio=0/1 打 INFO，prio=2/3 打 DEBUG (降噪)
+                    logger.info(f"[RunLoop] prio={priority} seq={seq} type={event_type}")
+                else:
+                    logger.debug(f"[RunLoop] prio={priority} seq={seq} type={event_type}")
 
                 # ── 分发事件 ──────────────────────────────
 
@@ -458,8 +479,6 @@ class AgentRunLoop:
                 # 推送给订阅者
                 await self._bus.publish_to_subscribers(event)
 
-            except asyncio.TimeoutError:
-                continue  # 无事件，继续循环
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -468,13 +487,20 @@ class AgentRunLoop:
     # ── WS 消息转发协程 ─────────────────────────────────
 
     async def _forward_ws_messages(self):
-        """将 WebSocket 消息队列中的消息转发到 EventBus。"""
+        """将 WebSocket 消息队列中的消息转发到 EventBus。
+
+        后台协程 — 阻塞等待 WS 消息，有消息就推到 EventBus prio=0。
+        WS 断开时 ws_source 会被设置为 None，协程自然退出。
+        """
         from .event_bus import UserMessageEvent, UserClarificationEvent, UserApprovalEvent
 
         while self._running and self._ws_source is not None:
             try:
-                ws_msg = await asyncio.wait_for(self._ws_source.get(), timeout=1.0)
-            except asyncio.TimeoutError:
+                ws_msg = await self._ws_source.get()  # 纯阻塞，有消息才醒
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.1)
                 continue
 
             sub_type = ws_msg.get("subType", "")
@@ -785,6 +811,7 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
         manifest_data=manifest,
         redis_url=redis,
         agent_id=agent_id,
+        plan_graph=result.get("plan_graph"),
     )
 
     # 注册信号处理

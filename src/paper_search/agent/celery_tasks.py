@@ -31,9 +31,9 @@ def _get_reporter():
     return Reporter(os.getenv("REDIS_URL", "redis://localhost:6379/0"), agent_id=agent_id)
 
 
-def _get_logger(task_id: str):
+def _get_logger(task_id: str, agent_type: str = "ingest"):
     from .task_logger import TaskLogger
-    log_dir = Path.home() / ".paper_search" / "logs" / "tasks"
+    log_dir = Path.home() / ".paper_search" / "logs" / "sub_agents" / agent_type
     return TaskLogger(log_dir, task_id)
 
 

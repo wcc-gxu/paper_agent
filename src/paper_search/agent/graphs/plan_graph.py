@@ -88,7 +88,7 @@ class PlanGraph:
         await graph.aresume(thread_config, {"user_clarification": {...}})
     """
 
-    def __init__(self, llm, tools, memory, db, task_adapter=None):
+    def __init__(self, llm, tools, memory, db, task_adapter=None, report_listener=None):
         """
         Args:
             llm: LLMClientV2 实例
@@ -96,13 +96,19 @@ class PlanGraph:
             memory: MemoryManager 实例
             db: AgentDB 实例
             task_adapter: TaskEventAdapter 实例（可选，用于推送 task WS 消息）
+            report_listener: SubAgentReportListener 实例（可选，用于订阅子Agent实时报告）
         """
         self._llm = llm
         self._tools = tools
         self._memory = memory
         self._db = db
         self._task_adapter = task_adapter
+        self._report_listener = report_listener
         self._graph = None
+
+    def set_report_listener(self, listener):
+        """延迟绑定 SubAgentReportListener（在 AgentRunLoop 启动后调用）。"""
+        self._report_listener = listener
 
     def compile(self, checkpointer: Optional[SqliteSaver] = None) -> StateGraph:
         """编译 StateGraph。
@@ -513,6 +519,7 @@ class PlanGraph:
             executor = ExecuteGraph(
                 db=self._db, llm=self._llm, tools=self._tools,
                 task_adapter=adapter,
+                report_listener=self._report_listener,
             )
             dispatch_result = await executor.dispatch(task_id, plan)
 
