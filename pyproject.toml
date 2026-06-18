@@ -23,8 +23,6 @@ paper-search-legacy = "paper_search.cli.main:main"
 paper-agent-api = "paper_search.api.app:main"
 
 [project.optional-dependencies]
-# MCP Server
-mcp = ["fastmcp>=2,<3"]
 # Free API providers
 arxiv = ["arxiv>=2.3"]
 pubmed = ["biopython>=1.83", "metapub>=0.6"]
@@ -42,7 +40,6 @@ web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 ocr = ["pytesseract>=0.3"]
 # All deps
 all = [
-    "fastmcp>=2,<3",
     "httpx>=0.27",
     "pydantic>=2",
     "arxiv>=2.3",

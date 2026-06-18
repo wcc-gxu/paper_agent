@@ -2,186 +2,208 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **架构文档索引**: [agent-runloop.md](docs/development/agent-runloop.md) — AgentRunLoop · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议
+> **架构文档索引**: [agent-runloop.md](docs/development/agent-runloop.md) — AgentRunLoop · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [phase2-plan.md](docs/development/phase2-plan.md) — Phase 2 计划
 
-## Quick Start
+## 项目概述
 
-### 1. Install
+Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/下载/阅读/综述/知识库沉淀。
+
+- **产品形态**: Python 后端 (FastAPI + WebSocket) + iOS 客户端
+- **决策模型**: Plan-then-Execute (LangGraph StateGraph)
+- **事件驱动**: AgentRunLoop + EventBus (PriorityQueue) + Redis BRPOP + Pub/Sub
+- **存储**: SQLite (元数据) + ChromaDB (向量) + Redis (事件) + 文件系统 (PDF/MD)
+
+## 启动方式
 
 ```bash
-pip install -e ".[arxiv,rich]" pymupdf4llm chromadb
+# 依赖
+pip install -e ".[all]"
+
+# 终端 1: Redis
+redis-server
+
+# 终端 2: Celery Worker
+celery -A paper_search.agent.celery_app worker --loglevel=info --concurrency=4
+
+# 终端 3: API Server (包含 PlanGraph)
+uvicorn paper_search.api.app:app --host 0.0.0.0 --port 8000
+
+# 终端 4: Agent Daemon (可选)
+python -m paper_search.agent.daemon
 ```
-
-### 2. Tool Use (13 CLI + MCP 运行时)
-
-MCP Server 作为运行时工具暴露层，底层 13 个工具均为 CLI 可独立调用。
-
-```json
-{
-  "mcpServers": {
-    "paper-search": {
-      "command": "python",
-      "args": ["-m", "paper_search.mcp.server"],
-      "cwd": "${workspaceFolder}"
-    }
-  }
-}
-```
-
-Verify: say **"列出可用文献来源"** → calls `list_sources` tool.
 
 ---
 
-## CLI Tools (13)
+## 核心架构
 
-所有工具通过 `src/paper_search/cli/` 独立调用，同时也是 Agent Tool Use 的基础。
+### 事件流 (AgentRunLoop)
 
-| CLI Tool | Function |
-|----------|----------|
-| `search_papers` | Multi-source search → dedup → SQLite |
-| `download_paper` | Download single paper PDF |
-| `convert_paper` | PDF → Markdown (pymupdf4llm) |
-| `index_paper` | Markdown → ChromaDB 6-collection |
-| `evaluate_papers` | LLM batch relevance scoring (0-1) |
-| `rank_papers` | Journal ranking (CCF + SCI → A+/A/B/C) |
-| `generate_survey` | Generate AI survey report |
-| `paper_export` | Export BibTeX / JSON |
-| `paper_status` | View project/paper state |
-| `paper_clean` | Clean DB/index |
-| `batch_search` | Batch search from JSON/CSV |
-| `citation_chase` | 1-hop citation tracking |
-| `list_sources` | Source health check |
-| `web_search` | Volcengine web search (500次/月) |
+```
+WebSocket 消息  →  RunLoop(prio=0)  →  PlanGraph
+Celery 完成     →  Redis BRPOP     →  RunLoop(prio=1)  →  PlanGraph
+Celery 进度     →  Redis BRPOP     →  RunLoop(prio=2)  →  PlanGraph
+子Agent 报告    →  Redis Pub/Sub   →  RunLoop(prio=1~2) →  PlanGraph
+Timer 定时      →  RunLoop(prio=3)  →  PlanGraph
+```
 
----
+4 个事件源都通过 EventBus (asyncio.PriorityQueue) 汇入，RunLoop 逐个消费。同进程用 EventBus (纳秒级)，跨进程用 Redis (毫秒级)。
 
-## Data Flow
+### PlanGraph (主 Agent)
+
+```
+START → parse_intent → (clarify? → await_clarify →) generate_plan
+      → await_approval → await_permissions → execute_plan
+      → overall_evaluate → (satisfied? → END | adjust → generate_plan)
+```
+
+- `parse_intent`: LLM 解析用户意图 (PromptOptimizer Stage 1)
+- `clarify`: LLM 生成澄清问题 (Stage 2)
+- `await_clarify` / `await_approval` / `await_permissions`: LangGraph interrupt 节点
+- `generate_plan`: LLM 生成结构化方案 (Stage 3)
+- `execute_plan`: 委托 ExecuteGraph 调度子 Agent
+- `overall_evaluate`: LLM 评估执行结果
+
+### ExecuteGraph → 6 种子 Agent
+
+```
+execute_graph.py (调度层)
+    ├── IngestAgent        search→evaluate→download→convert→index→rank→[verify]→survey
+    ├── RADQueryAgent      parse→route→search→evaluate(refine loop)→format
+    ├── ClusteringAgent    load→cluster→label→visualize→detect
+    ├── CitationChaseAgent resolve→check→fetch→filter→ingest→decide(loop)→summarize
+    ├── HistoryAgent       analyze→generate_plan→archive→merge→skip→notify
+    └── TranslationAgent   route→translate|build|enrich
+```
 
 ### 论文入库流水线 (IngestAgent)
+
 ```
 search_papers  →  (papers in SQLite)
     → evaluate_papers → filter by relevance_score
         → download_paper  →  (updates pdf_path)
             → convert_paper  →  (updates markdown_path)
                 → index_paper  →  (ChromaDB: 6 collections)
-
-rank_papers      →  (unified_level: A+/A/B/C)
-generate_survey  →  (survey.md report)
-paper_export     →  (references.bib)
+                    → [verify] → rank_papers → generate_survey
 ```
 
-### 事件流 (AgentRunLoop)
+### WebSocket 协议 (v7.0)
+
+7 大类消息: `heartbeat` / `phase` / `thinking` / `message` / `tool` / `review` / `error`
+
+握手: 首条消息必须是 `message(chat, seq=1)` → Server 返回 `phase(connected)`
+
+---
+
+## 项目结构
+
 ```
-iOS → WebSocket → RunLoop(prio=0) → PlanGraph
-Tool调用 → Celery Worker → Redis BRPOP → RunLoop(prio=1~2) → PlanGraph → iOS
-Timer  → RunLoop(prio=3) → PlanGraph → 工具执行
-```
-
-### Output Structure
-
-```
-~/papers/outputs/{project_id}/
-├── survey.md               # AI survey report
-├── references.bib          # BibTeX export
-└── metadata.json           # Graded paper metadata
-
-~/papers/markdown/{project_id}/
-└── *.md                    # Full-text Markdown per paper
-
-~/.paper_search/
-├── agent_manifest.json     # Agent 身份证 — 启动/恢复/迁移
-├── agent.db                # SQLite: projects, papers, project_papers, journal_ranks
-├── chroma/                 # ChromaDB: 6 collections (papers_abstract, papers_fulltext, agent_conversations, agent_knowledge, agent_expressions, agent_learnings)
-└── logs/
-    ├── agent.log           # Agent global log (JSONL, one event per line)
-    └── tasks/              # Per-task pipeline logs
-        └── task-{YYYYMMDD}-{seq}.jsonl
+src/paper_search/
+├── agent/                          # Agent 核心
+│   ├── daemon.py                   # 守护进程 + AgentRunLoop
+│   ├── event_bus.py                # 统一事件总线 (PriorityQueue + Redis源 + Timer源)
+│   ├── db.py                       # SQLite 持久化 (AgentDB)
+│   ├── memory.py                   # 4 层记忆系统
+│   ├── llm_client_v2.py            # 多供应商 LLM (流式+重试+工具调用)
+│   ├── llm_client.py               # V1 客户端 (向后兼容)
+│   ├── prompt_optimizer.py         # 3 阶段提示词优化 (Parse/Clarify/Generate)
+│   ├── tool_registry.py            # 56 个工具注册
+│   ├── celery_app.py               # Celery 配置
+│   ├── celery_tasks.py             # download/convert/index/survey 异步 Task
+│   ├── reporter.py                 # Celery→Agent 双通道上报 (LPUSH + Pub/Sub)
+│   ├── task_event_adapter.py       # 任务事件→WS 协议信封
+│   ├── task_logger.py              # 任务 JSON 日志
+│   ├── sub_agent.py                # PipelineRunner 编排器
+│   ├── verifier.py                 # 引用三步校验 (格式/匹配/事实)
+│   ├── knowledge.py                # RAG 问答 + 知识提取 + 知识发现
+│   ├── chroma_store.py             # ChromaDB 6 集合
+│   ├── pdf_converter.py            # PDF→Markdown (pymupdf4llm)
+│   ├── chunker.py                  # Section-aware 分块
+│   ├── journal_ranker.py           # CCF+SCI 期刊分级
+│   │
+│   └── graphs/                     # LangGraph 图定义
+│       ├── plan_graph.py           # 主 Agent (7 节点)
+│       ├── execute_graph.py        # 子 Agent 调度层
+│       ├── ingest_graph.py         # 论文入库 (8 节点, 含可选 verify)
+│       ├── rad_query_graph.py      # RAG 问答 (5 节点)
+│       ├── clustering_graph.py     # 聚类 (5 节点)
+│       ├── citation_chase_graph.py # 引用追溯 (7 节点 + loop)
+│       ├── history_graph.py        # 历史处理 (Plan+Execute)
+│       └── translation_graph.py    # 术语翻译 (工具型)
+│
+├── api/                            # FastAPI 层
+│   ├── app.py                      # 应用入口 + /ws/chat/{agent_id}/{session_id}
+│   ├── routes.py                   # REST: /tasks, /papers, /projects, /knowledge, /ingest
+│   ├── ws.py                       # WebSocket 连接管理器
+│   ├── ws_handler.py               # WS 事件循环 (握手/重连回放)
+│   ├── message_store.py            # 消息持久化 + 智能回放
+│   ├── auth.py                     # Bearer Token 认证
+│   └── middleware.py               # 速率限制
+│
+├── providers/                      # 7 个搜索来源
+├── downloaders/                    # HTTP + Playwright 下载
+├── cli/                            # 13 个 CLI 命令
+├── engine.py                       # PaperSearchEngine 门面
+├── models.py                       # Pydantic 数据模型
+└── config.py                       # 配置管理
 ```
 
 ---
 
-## Project Structure
+## 事件通信技术选型
 
-```
-paper_agant/
-├── src/paper_search/
-│   ├── agent/              # Core components
-│   │   ├── db.py           # SQLite persistence (AgentDB)
-│   │   ├── chroma_store.py # ChromaDB dual-collection
-│   │   ├── pdf_converter.py # PDF→Markdown (pymupdf4llm)
-│   │   ├── chunker.py      # Section-aware chunking
-│   │   ├── journal_ranker.py # CCF+SCI journal ranking
-│   │   ├── llm_client.py   # Volcano Engine LLM (intent/eval/report)
-│   │   └── agent.py        # [DEPRECATED] Old 8-stage ResearchAgent
-│   ├── cli/                # 10 CLI entry points
-│   │   ├── common.py       # Rich console, DB/Engine factory, shared args
-│   │   ├── search_cmd.py   # paper-search
-│   │   ├── download_cmd.py # paper-download
-│   │   ├── convert_cmd.py  # paper-convert
-│   │   ├── index_cmd.py    # paper-index
-│   │   ├── evaluate_cmd.py # paper-evaluate
-│   │   ├── rank_cmd.py     # paper-rank
-│   │   ├── survey_cmd.py   # paper-survey
-│   │   ├── export_cmd.py   # paper-export
-│   │   ├── status_cmd.py   # paper-status
-│   │   └── clean_cmd.py    # paper-clean
-│   ├── providers/          # 6 search source providers
-│   ├── downloaders/        # HTTP + Playwright downloaders
-│   ├── mcp/server.py       # MCP Server (13 tools, thin wrappers)
-│   ├── engine.py           # PaperSearchEngine facade
-│   ├── models.py           # Pydantic data models
-│   └── config.py           # Configuration management
-├── .claude/skills/         # Project skills
-│   └── paper-agent/        # 完整论文研究工作流 skill
-├── scripts/
-├── .env                    # API keys
-└── pyproject.toml
-```
+| 场景 | 技术 | 理由 |
+|------|------|------|
+| **同进程** (Daemon 内部状态) | `asyncio.PriorityQueue` | 纳秒级，零序列化，无需外部依赖 |
+| **跨进程** (Celery → Daemon 完成/错误) | Redis **BRPOP** (List) | Celery Worker 独立进程；阻塞等待无空转 |
+| **跨进程** (子Agent 实时进度) | Redis **Pub/Sub** | 一对多广播，主Agent 按 task_id 订阅/取消 |
+| **定时器** | `asyncio.sleep` | 简单可靠，无需 Celery Beat |
+| **不选** Redis Streams | — | 场景是实时推送+消费即丢弃，Streams 过度设计 |
+| **不选** Kafka/RabbitMQ | — | 单机部署，不需要消息中间件复杂度 |
+
+4 个事件源全部向同一个 PriorityQueue 投递。RunLoop 逐个消费，不并发。低 prio 值先出队。
 
 ---
 
 ## Environment (.env)
 
-| Variable | Purpose | Status |
-|----------|---------|--------|
-| `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar 1 req/s | ✅ |
-| `ELSEVIER_API_KEY` | ScienceDirect search + PDF | ✅ |
-| `IEEE_API_KEY` | IEEE Xplore search | 🔑 pending activation |
-| `VOLCANO_API_KEY` | Volcano Engine LLM | ✅ |
-| `WEB_SEARCH_API_KEY` | Volcano Engine Web Search (500次/月) | ✅ |
+| Variable | Purpose |
+|----------|---------|
+| `VOLCANO_API_KEY` | LLM (火山方舟) |
+| `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar 1 req/s |
+| `ELSEVIER_API_KEY` | ScienceDirect |
+| `IEEE_API_KEY` | IEEE Xplore |
+| `WEB_SEARCH_API_KEY` | 火山引擎联网搜索 (500次/月) |
+| `REDIS_URL` | Redis 连接 (默认 `redis://localhost:6379/0`) |
 
 ---
 
-## Source Capability Matrix
+## 子 Agent 独立日志
 
-| Source | Priority | Search | PDF | Requires |
-|--------|----------|--------|-----|----------|
-| Semantic Scholar | P0 | ✅ 1 req/s | ✅ OA | API Key |
-| arXiv | P1 | ✅ | ✅ direct | None |
-| PubMed | P1 | ✅ | ✅ OA | None |
-| OpenAlex | P2 | ✅ 1 req/s | ❌ | None（无需 key，Semantic Scholar 降级方案） |
-| ScienceDirect | P2 | ✅ 5k/week | ✅ API | API Key + campus IP |
-| IEEE Xplore | P3 | 🔑 | 🌐 | API Key + campus IP |
-| CNKI | P3 | ⚠️ | 🌐 | Campus IP + Playwright CAPTCHA |
+```
+~/.paper_search/logs/
+├── agent.log                        # 全局日志
+└── sub_agents/
+    ├── ingest/
+    │   └── task-{YYYYMMDD}-{seq}.jsonl    # 按 task_id 分文件
+    ├── citation_chase/
+    │   └── task-{YYYYMMDD}-{seq}.jsonl
+    └── ...
+```
 
-> **搜索策略**：Semantic Scholar 作为元数据主来源（完整摘要 + AI 排序 + 引用关系 + OA PDF）→ arXiv/PubMed 并行补充 → OpenAlex 作为 Semantic Scholar 降级方案（免费无 Key）→ 合并去重。
-> PDF 下载顺序：Semantic Scholar OA → arXiv direct → ScienceDirect → IEEE → publisher page。
-> 全部失败 → 记录到 `unavailable_pdfs` 表 → API 可查询。
+每条日志带 `task_id` + `agent_type` + `timestamp`，可按任务过滤。
 
 ---
 
 ## Dependencies
 
 ```
-fastmcp>=2,<3       # MCP Server
-httpx>=0.27          # HTTP
-pydantic>=2          # Data models
-arxiv>=2.3           # arXiv
-biopython, metapub   # PubMed
-pymupdf4llm          # PDF→Markdown
-chromadb             # Vector DB
-python-dotenv        # Environment
-rich>=13             # CLI output
+langgraph>=0.2.0, langgraph-checkpoint-sqlite>=1.0.0
+fastapi>=0.110, uvicorn[standard]>=0.27
+celery[redis]>=5.4, redis>=5.0
+httpx>=0.27, pydantic>=2
+arxiv>=2.3, biopython, metapub
+pymupdf4llm, chromadb
+python-dotenv, rich>=13
 ```
 
 Python >= 3.11
