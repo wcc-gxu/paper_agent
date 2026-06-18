@@ -112,6 +112,11 @@ class PlanGraph:
 
         Returns:
             编译好的 StateGraph（支持 astream_events / ainvoke / aresume）
+
+        图结构 (v2 — Phase 2):
+          START → parse_intent → (clarify? → await_clarify →) generate_plan
+          → await_approval → await_permissions → execute_plan
+          → overall_evaluate → (satisfied? → END | adjust → generate_plan)
         """
         builder = StateGraph(MainAgentState)
 
@@ -121,6 +126,7 @@ class PlanGraph:
         builder.add_node("await_clarify", self._await_clarify)
         builder.add_node("generate_plan", self._generate_plan)
         builder.add_node("await_approval", self._await_approval)
+        builder.add_node("await_permissions", self._await_permissions)  # [NEW] Phase 2
         builder.add_node("execute_plan", self._execute_plan)
         builder.add_node("overall_evaluate", self._overall_evaluate)
 
@@ -133,10 +139,19 @@ class PlanGraph:
         builder.add_edge("clarify", "await_clarify")
         builder.add_edge("await_clarify", "generate_plan")
         builder.add_edge("generate_plan", "await_approval")
+
+        # await_approval → 检查权限需求 → await_permissions 或 execute_plan
         builder.add_conditional_edges(
-            "await_approval", self._user_approved,
+            "await_approval", self._needs_permissions,
+            {"yes": "await_permissions", "no": "execute_plan", "rejected": END},
+        )
+
+        # await_permissions → 检查权限确认
+        builder.add_conditional_edges(
+            "await_permissions", self._permissions_confirmed,
             {"yes": "execute_plan", "no": END},
         )
+
         builder.add_edge("execute_plan", "overall_evaluate")
         builder.add_conditional_edges(
             "overall_evaluate", self._decide_overall,
@@ -360,15 +375,119 @@ class PlanGraph:
         logger.info("await_approval: graph paused, waiting for user approval")
         return {}
 
-    async def _execute_plan(self, state: MainAgentState) -> dict:
-        """Stage 4: 执行方案 — 委托 IngestAgent 入库。"""
+    async def _await_permissions(self, state: MainAgentState) -> dict:
+        """[NEW] Interrupt 节点 — 等待用户确认权限清单。
+
+        在用户批准 plan 之后、执行之前，一次性列出所有子 Agent
+        需要的权限（搜索/下载/通知等），用户一次性确认。
+        """
         plan = state.get("plan", {}) or {}
         task_id = plan.get("task_id", "unknown")
-        user_query = plan.get("original_query", plan.get("refined_query", ""))
-        goal = plan.get("goal", user_query)
+        sub_tasks = plan.get("sub_tasks", [])
+
+        # 收集权限清单
+        permissions = self._collect_permissions(sub_tasks, plan)
+
+        if not permissions:
+            return {"pending_review": None}
+
+        review_envelope = {
+            "type": "review",
+            "subType": "permissions",
+            "payload": {
+                "taskId": task_id,
+                "message": "以下操作需要你的授权，请一次性确认：",
+                "permissions": permissions,
+            },
+        }
+
+        logger.info(f"await_permissions: {len(permissions)} permissions for {task_id}")
+        return {
+            "pending_review": review_envelope,
+            "plan_status": "awaiting_permissions",
+        }
+
+    def _collect_permissions(self, sub_tasks: list, plan: dict) -> list[dict]:
+        """从子任务列表收集所需权限。
+
+        权限类型:
+          - search: 搜索论文 (source, max_results, year_range)
+          - download: 下载 PDF (count, estimate_size)
+          - notification: 通知推送 (scope)
+          - ios_calendar: 日历访问
+          - ios_file: 文件读写
+        """
+        permissions = []
+        total_papers_estimate = 0
+
+        for st in sub_tasks:
+            action = st.get("action", "search")
+            agent = st.get("agent", "ingest")
+
+            if action == "search":
+                max_papers = st.get("max_papers", st.get("max_results_per_source", 20))
+                sources = st.get("sources", plan.get("suggested_sources", ["arxiv", "semantic_scholar"]))
+                keywords = st.get("keywords", [])
+                total_papers_estimate += max_papers * len(sources)
+
+                permissions.append({
+                    "id": f"search-{len(permissions)}",
+                    "tool": "search_papers",
+                    "scope": ", ".join(sources) if isinstance(sources, list) else str(sources),
+                    "description": f"在 {', '.join(sources) if isinstance(sources, list) else sources} 搜索: {', '.join(keywords[:5]) if keywords else '相关论文'}",
+                    "maxResults": max_papers,
+                    "agent": agent,
+                })
+
+            elif action == "download":
+                count = st.get("download_count", 10)
+                permissions.append({
+                    "id": f"download-{len(permissions)}",
+                    "tool": "download_paper",
+                    "scope": f"{count} papers",
+                    "estimateSize": f"{count * 5}MB",
+                    "description": f"下载约 {count} 篇论文 PDF",
+                    "agent": agent,
+                })
+
+            elif action == "notify":
+                permissions.append({
+                    "id": f"notify-{len(permissions)}",
+                    "tool": "ios_notification_local",
+                    "scope": st.get("notification_scope", "task_complete"),
+                    "description": st.get("description", "任务完成时推送通知"),
+                    "agent": agent,
+                })
+
+            elif action == "citation_chase":
+                permissions.append({
+                    "id": f"citation-{len(permissions)}",
+                    "tool": "citation_chase",
+                    "scope": f"depth={st.get('depth', 2)}",
+                    "description": f"引用追溯 (深度 {st.get('depth', 2)} 层)",
+                    "agent": agent,
+                })
+
+        # 总览
+        if total_papers_estimate > 0:
+            permissions.append({
+                "id": "summary",
+                "tool": "_summary",
+                "scope": "",
+                "description": f"预计共搜索约 {total_papers_estimate} 篇论文，下载并入库相关论文",
+                "estimate": f"搜索 {total_papers_estimate} 篇，下载 ~{total_papers_estimate // 4} 篇",
+                "agent": "ingest",
+            })
+
+        return permissions
+
+    async def _execute_plan(self, state: MainAgentState) -> dict:
+        """Stage 4: 执行方案 — 委托 ExecuteGraph 调度子 Agent。"""
+        plan = state.get("plan", {}) or {}
+        task_id = plan.get("task_id", "unknown")
         adapter = self._task_adapter
 
-        logger.info(f"execute_plan: delegating to IngestAgent for {task_id}")
+        logger.info(f"execute_plan: delegating to ExecuteGraph for {task_id}")
 
         # 更新 DB 任务状态为 running
         try:
@@ -376,66 +495,46 @@ class PlanGraph:
         except Exception:
             pass
 
-        # 构建 on_progress 回调 → task(running) WS 推送
-        async def _on_ingest_progress(stage: str, stage_index: int,
-                                       total_stages: int, current: int, total: int):
-            if adapter:
-                await adapter.on_task_running(
-                    task_id, stage, stage_index, total_stages, current, total,
+        # 通知 task(started)
+        if adapter:
+            try:
+                await adapter.on_task_started(
+                    task_id, plan.get("goal", plan.get("original_query", "Research")),
+                    mode="foreground",
+                    total_stages=len(plan.get("sub_tasks", [])),
                 )
+            except Exception:
+                pass
 
         try:
-            from ..sub_agent import PipelineRunner
-            from ..graphs.ingest_graph import IngestAgent
-            from ..pdf_converter import PDFConverter
-            from ..journal_ranker import JournalRanker
-            from ..chroma_store import ChromaStoreV2
+            # ── Phase 2: 由 ExecuteGraph 统一调度 ──
+            from .execute_graph import ExecuteGraph
 
-            converter = PDFConverter(max_concurrent=2)
-            ranker = JournalRanker()
-            chroma = ChromaStoreV2()
-
-            runner = PipelineRunner(
-                engine=None,  # 由 IngestAgent 的 _search_node 内部创建
-                db=self._db, llm=self._llm,
-                chroma=chroma, converter=converter, ranker=ranker,
+            executor = ExecuteGraph(
+                db=self._db, llm=self._llm, tools=self._tools,
+                task_adapter=adapter,
             )
-            ingest = IngestAgent(runner, on_progress=_on_ingest_progress)
-            ingest_graph = ingest.compile()
+            dispatch_result = await executor.dispatch(task_id, plan)
 
-            config = {"configurable": {"thread_id": f"ingest-{task_id}"}}
-            ingest_result = await ingest_graph.ainvoke(
-                {
-                    "project_id": task_id,
-                    "user_query": user_query,
-                    "sources": plan.get("suggested_sources", ["arxiv", "semantic_scholar"]),
-                    "year_from": 2022,
-                    "max_results": 20,
-                    "is_single_tool": False,
-                    "single_tool_name": "",
-                },
-                config=config,
-            )
-
-            result_summary = ingest_result.get("result", {})
-            logger.info(f"IngestAgent complete: {json.dumps(result_summary, default=str)[:300]}")
+            logger.info(f"ExecuteGraph complete: {json.dumps(dispatch_result, default=str)[:300]}")
 
             # task(done) + update DB
             if adapter:
-                await adapter.on_task_done(task_id, result_summary)
+                await adapter.on_task_done(task_id, dispatch_result)
             try:
                 self._db.update_agent_task(task_id, status="done",
-                                           total_steps=7, current_step=7)
+                                           total_steps=len(plan.get("sub_tasks", [])),
+                                           current_step=len(plan.get("sub_tasks", [])))
             except Exception:
                 pass
 
             return {
-                "plan": {**plan, "execution_results": [result_summary]},
+                "plan": {**plan, "execution_results": [dispatch_result]},
                 "plan_status": "done",
             }
 
         except Exception as e:
-            logger.error(f"IngestAgent execution failed: {e}", exc_info=True)
+            logger.error(f"Execution failed: {e}", exc_info=True)
 
             # task(failed) + update DB
             if adapter:
@@ -496,7 +595,43 @@ class PlanGraph:
 
     @staticmethod
     def _user_approved(state: MainAgentState) -> str:
-        """检查用户是否审批通过。"""
+        """[DEPRECATED] 被 _needs_permissions 替代。保留向后兼容。"""
+        approval = state.get("user_approval") or {}
+        if isinstance(approval, dict) and approval.get("confirmed"):
+            return "yes"
+        return "no"
+
+    @staticmethod
+    def _needs_permissions(state: MainAgentState) -> str:
+        """检查是否需要权限确认。
+
+        Returns:
+            "yes" → 进入 await_permissions
+            "no" → 直接进入 execute_plan
+            "rejected" → 用户拒绝了 plan，结束
+        """
+        # 先检查用户是否审批
+        approval = state.get("user_approval") or {}
+        if isinstance(approval, dict) and not approval.get("confirmed"):
+            return "rejected"
+
+        # 检查是否有子任务需要权限
+        plan = state.get("plan", {}) or {}
+        sub_tasks = plan.get("sub_tasks", [])
+        for st in sub_tasks:
+            action = st.get("action", "")
+            if action in ("search", "download", "citation_chase", "notify"):
+                return "yes"
+
+        return "no"
+
+    @staticmethod
+    def _permissions_confirmed(state: MainAgentState) -> str:
+        """检查用户是否确认权限。"""
+        perm_approval = state.get("user_approval") or {}
+        if isinstance(perm_approval, dict) and perm_approval.get("confirmed"):
+            return "yes"
+        # 检查旧字段名
         approval = state.get("user_approval") or {}
         if isinstance(approval, dict) and approval.get("confirmed"):
             return "yes"

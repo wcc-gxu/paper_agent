@@ -27,7 +27,8 @@ def _get_db():
 
 def _get_reporter():
     from .reporter import Reporter
-    return Reporter(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    agent_id = os.getenv("AGENT_ID", "agent-001")
+    return Reporter(os.getenv("REDIS_URL", "redis://localhost:6379/0"), agent_id=agent_id)
 
 
 def _get_logger(task_id: str):
@@ -43,7 +44,9 @@ def _get_logger(task_id: str):
 
 @app.task(bind=True, max_retries=1, default_retry_delay=30)
 def download_task(self, paper_id: str, project_id: str,
-                  title: str = "", source: str = "arxiv") -> dict:
+                  title: str = "", source: str = "arxiv",
+                  agent_task_id: str = "", paper_index: int = 0,
+                  paper_total: int = 0) -> dict:
     """下载单篇论文 PDF。
 
     失败自动重试 1 次（换来源），仍失败则记录 unavailable。
@@ -52,10 +55,16 @@ def download_task(self, paper_id: str, project_id: str,
         {"paper_id": str, "success": bool, "local_path": str, "error": str}
     """
     task_id = self.request.id
-    task_logger = _get_logger(task_id)
+    task_logger = _get_logger(agent_task_id or task_id)
     reporter = _get_reporter()
 
-    task_logger.paper_progress(task_id, "download", paper_id, title, "download_start")
+    # Pub/Sub 实时报告: 下载开始
+    if agent_task_id:
+        reporter.publish_report(agent_task_id, "ingest", "download",
+                               paper_index=paper_index, paper_total=paper_total,
+                               paper_id=paper_id, status="start")
+
+    task_logger.paper_progress(agent_task_id or task_id, "download", paper_id, title, "download_start")
 
     try:
         from ..engine import PaperSearchEngine

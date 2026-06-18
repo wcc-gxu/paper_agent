@@ -399,7 +399,7 @@ class CitationVerifier:
         return None
 
     async def _verify_claims(self, matches: list[CitationMatch]) -> list[CitationMatch]:
-        """使用 LLM 验证声明与原文的一致性."""
+        """使用 LLM 验证声明与原文的一致性（含 PDF 全文接入）。"""
         if not self._llm:
             return matches
 
@@ -407,13 +407,54 @@ class CitationVerifier:
             if not m.matched or not m.raw_context:
                 continue
 
+            # ── Bugfix: 全文接入 — 读取论文 Markdown 用于事实验证 ──
+            paper_content = ""
+            paper_id = m.matched_paper_id
+            if paper_id and self._db:
+                try:
+                    row = self._db.conn.execute(
+                        "SELECT title, abstract, markdown_path FROM papers WHERE id = ?",
+                        (paper_id,),
+                    ).fetchone()
+                    if row:
+                        rd = dict(row)
+                        # 优先使用全文
+                        md_path = rd.get("markdown_path", "")
+                        if md_path:
+                            from pathlib import Path
+                            p = Path(md_path)
+                            if p.exists():
+                                # 限制全文长度避免超出 token 限制
+                                full_text = p.read_text(encoding="utf-8")
+                                # 取引言+结论最关键的部分
+                                intro = full_text[:3000]
+                                conclusion = full_text[-2000:] if len(full_text) > 2000 else ""
+                                paper_content = f"全文引言: {intro}\n\n全文结论: {conclusion}"
+                            else:
+                                paper_content = f"摘要: {rd.get('abstract', '')[:1500]}"
+                        else:
+                            paper_content = f"摘要: {rd.get('abstract', '')[:1500]}"
+                except Exception as e:
+                    logger.debug(f"Failed to read full text for {paper_id}: {e}")
+
+            # 构建校验上下文
+            if paper_content:
+                user_content = (
+                    f"论文标题: {m.matched_title}\n"
+                    f"论文内容:\n{paper_content}\n\n"
+                    f"声明文本: {m.raw_context}\n\n"
+                    f"请判断：该声明内容是否准确反映了这篇论文的实际内容？"
+                )
+            else:
+                user_content = (
+                    f"论文标题: {m.matched_title}\n"
+                    f"声明文本: {m.raw_context}\n\n"
+                    f"请判断：该声明内容是否准确反映了这篇论文的实际内容？（注意：无全文，仅基于标题判断，confidence 应降低）"
+                )
+
             try:
                 result = await self._llm.chat_json(
-                    messages=[{"role": "user", "content": (
-                        f"论文标题: {m.matched_title}\n"
-                        f"声明文本: {m.raw_context}\n\n"
-                        f"请判断：专家声明内容是否准确反映了这篇论文的实际内容？"
-                    )}],
+                    messages=[{"role": "user", "content": user_content}],
                     system="""你是一个学术事实校验器。判断一个声明是否准确反映了论文的实际内容。
 
 输出纯 JSON:
@@ -430,7 +471,12 @@ class CitationVerifier:
   "confidence": 0.2,
   "assessment": "声明中说该论文使用了Transformer，但实际上该论文使用的是CNN",
   "issues": ["方法错误", "应改为CNN-based approach"]
-}""",
+}
+
+重要原则:
+- 若提供了全文，基于全文内容判断；若仅提供了摘要，confidence 不应超过 0.6
+- 不确定时宁保守，标记为 inconsistent
+- 只判断声明是否与论文内容一致，不评价论文质量""",
                 )
                 m.claim_verified = result.get("consistent", False)
                 m.claim_score = result.get("confidence", 0.5)

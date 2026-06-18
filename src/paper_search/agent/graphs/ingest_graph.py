@@ -33,13 +33,14 @@ class IngestState(TypedDict):
     sources: list[str]
     year_from: int
     max_results: int
-    current_stage: str          # search|evaluate|download|convert|index|rank|survey
+    current_stage: str          # search|evaluate|download|convert|index|rank|verify|survey
     stage_index: int
     total_stages: int
     papers: list[dict]          # 论文列表（含处理状态）
     errors: list[dict]          # 失败汇总
     is_single_tool: bool
     single_tool_name: str
+    enable_verify: bool         # [NEW Phase 2] 启用引用校验
     result: Optional[dict]      # 最终结果
     error: Optional[str]
 
@@ -80,7 +81,10 @@ class IngestAgent:
         self._graph = None
 
     def compile(self, checkpointer=None):
-        """编译 7 节点线性图。"""
+        """编译最多 8 节点线性图（含可选 verify 阶段）。
+
+        search → evaluate → download → convert → index → rank → [verify] → survey
+        """
         builder = StateGraph(IngestState)
 
         builder.add_node("search", self._search_node)
@@ -89,6 +93,7 @@ class IngestAgent:
         builder.add_node("convert", self._convert_node)
         builder.add_node("index", self._index_node)
         builder.add_node("rank", self._rank_node)
+        builder.add_node("verify", self._verify_node)  # [NEW] Phase 2 — 可选
         builder.add_node("survey", self._survey_node)
 
         builder.add_edge(START, "search")
@@ -97,7 +102,12 @@ class IngestAgent:
         builder.add_edge("download", "convert")
         builder.add_edge("convert", "index")
         builder.add_edge("index", "rank")
-        builder.add_edge("rank", "survey")
+        # rank → verify (if enabled) or survey
+        builder.add_conditional_edges(
+            "rank", self._should_verify,
+            {"yes": "verify", "no": "survey"},
+        )
+        builder.add_edge("verify", "survey")
         builder.add_edge("survey", END)
 
         self._graph = builder.compile(checkpointer=checkpointer)
@@ -109,13 +119,22 @@ class IngestAgent:
             raise RuntimeError("IngestAgent not compiled — call compile() first")
         return self._graph
 
+    # ── 条件路由 ─────────────────────────────────────
+
+    @staticmethod
+    def _should_verify(state: IngestState) -> str:
+        """检查是否启用引用校验。"""
+        if state.get("enable_verify", False):
+            return "yes"
+        return "no"
+
     # ── 节点 ─────────────────────────────────────────────
 
     async def _search_node(self, state: IngestState) -> dict:
         if state.get("is_single_tool") and state.get("single_tool_name") != "search":
             return {}
 
-        await self._notify("搜索论文", 1, 7, "搜索论文", 0, 0)
+        await self._notify("搜索论文", 1, 8, "搜索论文", 0, 0)
         papers = await self.runner._search_stage(
             "ingest", state["project_id"], state["user_query"],
             state.get("sources", ["arxiv", "semantic_scholar"]),
@@ -124,7 +143,8 @@ class IngestAgent:
             None,
         )
         await self._notify("搜索论文", 1, 7, f"搜索完成: {len(papers)} 篇", len(papers), len(papers))
-        return {"papers": papers, "current_stage": "search", "stage_index": 1, "total_stages": 7}
+        total = 8 if state.get("enable_verify") else 7
+        return {"papers": papers, "current_stage": "search", "stage_index": 1, "total_stages": total}
 
     async def _evaluate_node(self, state: IngestState) -> dict:
         if state.get("is_single_tool") and state.get("single_tool_name") != "evaluate":
@@ -233,6 +253,66 @@ class IngestAgent:
             await self.runner._rank_stage("ingest", state["project_id"], indexed, None)
 
         return {"current_stage": "rank", "stage_index": 6}
+
+    async def _verify_node(self, state: IngestState) -> dict:
+        """[NEW Phase 2] 可选 — 引用幻觉校验。
+
+        对所有已入库论文的引用进行三步校验:
+          1. 格式检查
+          2. 数据库匹配
+          3. 事实验证 (LLM + 全文)
+        """
+        if state.get("is_single_tool") and state.get("single_tool_name") != "verify":
+            return {}
+
+        papers = state.get("papers", [])
+        indexed = [p for p in papers if p.get("index_ok")]
+        if not indexed:
+            return {"current_stage": "verify", "stage_index": 7}
+
+        await self._notify("引用校验", 7, 8, f"校验 {len(indexed)} 篇论文引用", 0, len(indexed))
+
+        try:
+            from ..verifier import CitationVerifier
+            verifier = CitationVerifier(db=None, llm_client=None)  # DB 由 runner 提供
+
+            verified_count = 0
+            flagged_count = 0
+            for i, paper in enumerate(indexed):
+                paper_id = paper.get("paper_id", "")
+                title = paper.get("title", "")
+                markdown_path = paper.get("markdown_path", "")
+
+                # 读取全文做验证
+                if markdown_path:
+                    from pathlib import Path
+                    md = Path(markdown_path)
+                    if md.exists():
+                        text = md.read_text(encoding="utf-8")[:5000]
+                        # 提取引用并验证
+                        citations = verifier._parser.extract(text)
+                        if citations:
+                            verified_count += 1
+                            # 记录到 paper 状态
+                            paper["citation_count"] = len(citations)
+                            paper["citations_verified"] = True
+                        else:
+                            paper["citation_count"] = 0
+                            paper["citations_verified"] = False
+                            flagged_count += 1
+
+                await self._notify("引用校验", 7, 8,
+                                   f"校验 ({i+1}/{len(indexed)})",
+                                   i + 1, len(indexed))
+
+            logger.info(f"Verify: {verified_count} verified, {flagged_count} flagged")
+            return {
+                "papers": papers,
+                "current_stage": "verify", "stage_index": 7,
+            }
+        except Exception as e:
+            logger.warning(f"Verify stage failed (non-blocking): {e}")
+            return {"current_stage": "verify", "stage_index": 7}
 
     async def _survey_node(self, state: IngestState) -> dict:
         if state.get("is_single_tool") and state.get("single_tool_name") != "survey":

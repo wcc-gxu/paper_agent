@@ -1,24 +1,18 @@
-"""TaskEventAdapter — 任务事件 → WS 协议信封构建器。
+"""TaskEventAdapter — 任务事件 → WS 协议信封构建器 (EventBus 版)。
 
-作为 PipelineRunner/IngestAgent 与 WebSocket 层之间的桥梁。
-持有 send_fn 回调（由 app.py 注入），负责构建符合
-websocket-protocol.md v7.0 的 task/message(notification) 信封并发送。
+Phase 2 重写: 不再持有 send_fn 回调，改为向 EventBus 发布事件。
+ws_handler 通过订阅 EventBus 或 Daemon 的 send_fn 消费这些事件。
 
 用法:
-    adapter = TaskEventAdapter(
-        agent_id="agent-001", session_id="main",
-        send_fn=ws_manager.send_and_persist,
-    )
+    adapter = TaskEventAdapter(agent_id="agent-001", session_id="main", bus=event_bus)
     await adapter.on_task_started("task-001", "入库 Transformer", "foreground", 7)
-    await adapter.on_task_running("task-001", "搜索论文", 1, 7, 18, 50)
-    await adapter.on_task_done("task-001", {"total": 50, "downloaded": 48, "failed": 2})
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,22 +22,29 @@ def _now() -> str:
 
 
 class TaskEventAdapter:
-    """将任务生命周期事件转换为 WS 协议信封并发送。
+    """将任务生命周期事件转换为 WS 协议信封，发布到 EventBus。
 
     5 种 task 子类 + 2 种 notification 子类。
+
+    支持两种使用模式:
+      1. EventBus 模式 (Phase 2 推荐): 传入 bus，事件发布到 EventBus
+      2. 直接回调模式 (向后兼容): 传入 send_fn，事件直接回调发送
     """
 
     def __init__(self, agent_id: str, session_id: str,
-                 send_fn: Callable[..., Any] = None):
+                 send_fn: Any = None,
+                 bus: Any = None):
         """
         Args:
             agent_id: Agent 部署实例标识
             session_id: 会话标识
-            send_fn: 异步回调 async def(envelope: dict) — 发送 + 持久化
+            send_fn: [向后兼容] 异步回调 async def(envelope: dict)
+            bus: [Phase 2] EventBus 实例
         """
         self.agent_id = agent_id
         self.session_id = session_id
         self._send = send_fn
+        self._bus = bus
 
     # ── 信封构建器 ─────────────────────────────────────────
 
@@ -62,15 +63,26 @@ class TaskEventAdapter:
             "payload": payload,
         }
 
-    async def _emit(self, envelope: dict):
-        """发送信封（若 send_fn 已注入）。"""
-        if self._send is None:
-            logger.debug(f"TaskEvent: no send_fn, dropping {envelope.get('type')}/{envelope.get('subType')}")
-            return
-        try:
-            await self._send(envelope)
-        except Exception as e:
-            logger.error(f"TaskEvent emit failed: {e}")
+    async def _emit(self, envelope: dict, event_type: str = ""):
+        """发送信封（EventBus 优先，降级到 send_fn）。"""
+        if self._bus is not None:
+            try:
+                from .event_bus import CeleryProgressEvent, Priority
+                await self._bus.push(CeleryProgressEvent(
+                    agent_id=self.agent_id,
+                    session_id=self.session_id,
+                    agent_type="ingest",
+                    data=envelope.get("payload", {}),
+                ), priority=envelope.get("priority", Priority.CELERY_PROGRESS))
+                return
+            except Exception as e:
+                logger.debug(f"EventBus push failed, falling back to send_fn: {e}")
+
+        if self._send is not None:
+            try:
+                await self._send(envelope)
+            except Exception as e:
+                logger.error(f"TaskEvent emit failed: {e}")
 
     # ── task 类型 5 种子类 ─────────────────────────────────
 
@@ -103,12 +115,10 @@ class TaskEventAdapter:
     async def on_task_backgrounded(self, task_id: str,
                                     reason: str = "user_new_message"):
         """前台→后台（不可逆） → task(backgrounded) + message(notification)。"""
-        # 1) task(backgrounded)
         await self._emit(self._env("task", "backgrounded", {
             "taskId": task_id,
             "reason": reason,
         }))
-        # 2) notification
         await self._emit(self._env("message", "notification", {
             "title": "转入后台",
             "body": f"任务 {task_id} 已转入后台继续执行",

@@ -164,11 +164,18 @@ class KnowledgeBase:
     async def _rerank(
         self, question: str, candidates: list[dict], top_k: int
     ) -> list[dict]:
-        """LLM 重排序 — 从候选论文中选出最相关的 top-k."""
+        """LLM 重排序 — 从候选论文中选出最相关的 top-k。
+
+        注意: 当前用 LLM 重排序。Phase 4 将替换为 Cross-Encoder (bge-reranker-v2-m3)，
+        需要将输入截断到 512 tokens 以内。此处保留足够的上下文窗口。
+        """
+        # ── Bugfix: 增大截断窗口，给 LLM 足够信息判断相关性 ──
+        ABSTRACT_MAX = 500   # 从 200 提升，Cross-Encoder 时降回 300
+        SNIPPET_MAX = 300    # 从 150 提升
         candidates_text = "\n\n".join(
             f"[{i}] {c['title']} ({c.get('year', '?')})\n"
-            f"   摘要: {c['abstract'][:200]}\n"
-            f"   片段: {c.get('snippet', '')[:150]}"
+            f"   摘要: {c['abstract'][:ABSTRACT_MAX]}\n"
+            f"   片段: {c.get('snippet', '')[:SNIPPET_MAX]}"
             for i, c in enumerate(candidates)
         )
 

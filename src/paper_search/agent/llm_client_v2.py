@@ -661,81 +661,118 @@ class LLMClientV2:
         if tools:
             payload["tools"] = self._to_anthropic_tools(tools)
 
-        await self._get_rate_limiter().acquire()
+        last_error = None
 
-        try:
-            async with self._make_client() as client:
-                async with client.stream(
-                    "POST",
-                    f"{p.base_url}/v1/messages",
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
+        for attempt in range(p.max_retries + 1):
+            try:
+                await self._get_rate_limiter().acquire()
 
-                    parser = SSEParser()
-                    tool_use_buffers: dict[str, dict] = {}
-
-                    async for line in response.aiter_lines():
-                        if not line:
+                async with self._make_client() as client:
+                    async with client.stream(
+                        "POST",
+                        f"{p.base_url}/v1/messages",
+                        json=payload,
+                    ) as response:
+                        if response.status_code == 429:
+                            retry_after = response.headers.get("Retry-After", str(2 ** attempt))
+                            wait = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+                            logger.warning(f"Stream rate limited (429), waiting {wait}s...")
+                            await asyncio.sleep(wait)
                             continue
 
-                        events = parser.feed(line + "\n")
-                        for event in events:
-                            if event.get("type") == "done":
-                                yield {"type": "message_stop", "stop_reason": "end_turn"}
+                        if response.status_code >= 500:
+                            delay = p.retry_base_delay * (2 ** attempt)
+                            logger.warning(f"Stream server error {response.status_code}, retry {attempt+1}")
+                            await asyncio.sleep(delay)
+                            continue
+
+                        response.raise_for_status()
+
+                        parser = SSEParser()
+                        tool_use_buffers: dict[str, dict] = {}
+
+                        async for line in response.aiter_lines():
+                            if not line:
                                 continue
 
-                            delta_type = event.get("type")
+                            events = parser.feed(line + "\n")
+                            for event in events:
+                                if event.get("type") == "done":
+                                    yield {"type": "message_stop", "stop_reason": "end_turn"}
+                                    continue
 
-                            if delta_type == "content_block_delta":
-                                delta = event.get("delta", {})
-                                if delta.get("type") == "text_delta":
-                                    yield {"type": "text_delta", "text": delta.get("text", "")}
-                                elif delta.get("type") == "input_json_delta":
+                                delta_type = event.get("type")
+
+                                if delta_type == "content_block_delta":
+                                    delta = event.get("delta", {})
+                                    if delta.get("type") == "text_delta":
+                                        yield {"type": "text_delta", "text": delta.get("text", "")}
+                                    elif delta.get("type") == "input_json_delta":
+                                        idx = event.get("index", 0)
+                                        if idx not in tool_use_buffers:
+                                            tool_use_buffers[idx] = {"partial_json": ""}
+                                        tool_use_buffers[idx]["partial_json"] += delta.get("partial_json", "")
+
+                                elif delta_type == "content_block_start":
+                                    block = event.get("content_block", {})
+                                    if block.get("type") == "tool_use":
+                                        idx = event.get("index", 0)
+                                        tool_use_buffers[idx] = {
+                                            "id": block.get("id", ""),
+                                            "name": block.get("name", ""),
+                                            "partial_json": "",
+                                        }
+                                        yield {
+                                            "type": "tool_use_start",
+                                            "id": block.get("id", ""),
+                                            "name": block.get("name", ""),
+                                        }
+
+                                elif delta_type == "content_block_stop":
                                     idx = event.get("index", 0)
-                                    if idx not in tool_use_buffers:
-                                        tool_use_buffers[idx] = {"partial_json": ""}
-                                    tool_use_buffers[idx]["partial_json"] += delta.get("partial_json", "")
+                                    if idx in tool_use_buffers:
+                                        buf = tool_use_buffers[idx]
+                                        try:
+                                            input_data = json.loads(buf["partial_json"])
+                                        except json.JSONDecodeError:
+                                            input_data = {}
+                                        yield {
+                                            "type": "tool_use_delta",
+                                            "id": buf.get("id", ""),
+                                            "name": buf.get("name", ""),
+                                            "input": input_data,
+                                        }
 
-                            elif delta_type == "content_block_start":
-                                block = event.get("content_block", {})
-                                if block.get("type") == "tool_use":
-                                    idx = event.get("index", 0)
-                                    tool_use_buffers[idx] = {
-                                        "id": block.get("id", ""),
-                                        "name": block.get("name", ""),
-                                        "partial_json": "",
-                                    }
-                                    yield {
-                                        "type": "tool_use_start",
-                                        "id": block.get("id", ""),
-                                        "name": block.get("name", ""),
-                                    }
+                                elif delta_type == "message_stop":
+                                    yield {"type": "message_stop", "stop_reason": "end_turn"}
 
-                            elif delta_type == "content_block_stop":
-                                idx = event.get("index", 0)
-                                if idx in tool_use_buffers:
-                                    buf = tool_use_buffers[idx]
-                                    try:
-                                        input_data = json.loads(buf["partial_json"])
-                                    except json.JSONDecodeError:
-                                        input_data = {}
-                                    yield {
-                                        "type": "tool_use_delta",
-                                        "id": buf.get("id", ""),
-                                        "name": buf.get("name", ""),
-                                        "input": input_data,
-                                    }
+                                elif delta_type == "error":
+                                    yield {"type": "error", "message": str(event.get("error", event))}
 
-                            elif delta_type == "message_stop":
-                                yield {"type": "message_stop", "stop_reason": "end_turn"}
+                        return  # 成功完成流式响应
 
-                            elif delta_type == "error":
-                                yield {"type": "error", "message": str(event.get("error", event))}
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                last_error = e
+                if attempt < p.max_retries:
+                    delay = p.retry_base_delay * (2 ** attempt)
+                    logger.warning(f"Stream network error: {e}, retry {attempt+1}/{p.max_retries}")
+                    await asyncio.sleep(delay)
+                else:
+                    yield {"type": "error", "message": f"Stream failed after {p.max_retries} retries: {e}"}
 
-        except Exception as e:
-            logger.error(f"Stream error: {e}")
-            yield {"type": "error", "message": str(e)}
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code < 500:
+                    yield {"type": "error", "message": f"Stream HTTP {e.response.status_code}: {e}"}
+                    return
+                last_error = e
+                if attempt < p.max_retries:
+                    delay = p.retry_base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                else:
+                    yield {"type": "error", "message": f"Stream failed: {e}"}
+
+        if last_error:
+            yield {"type": "error", "message": str(last_error)}
 
     # ── 结构化 JSON 输出 ───────────────────────────────────
 
@@ -773,25 +810,52 @@ class LLMClientV2:
             if system:
                 payload["system"] = system
 
-            await self._get_rate_limiter().acquire()
-
+            last_error = None
             for attempt in range(p.max_retries + 1):
                 try:
+                    await self._get_rate_limiter().acquire()
                     async with self._make_client() as client:
                         resp = await client.post(
                             f"{p.base_url}/v1/messages",
                             json=payload,
                         )
+
+                        if resp.status_code == 429:
+                            retry_after = resp.headers.get("Retry-After", str(2 ** attempt))
+                            wait = float(retry_after) if retry_after.isdigit() else 2 ** attempt
+                            logger.warning(f"chat_json rate limited (429), waiting {wait}s...")
+                            await asyncio.sleep(wait)
+                            continue
+
+                        if resp.status_code >= 500:
+                            delay = p.retry_base_delay * (2 ** attempt)
+                            logger.warning(f"chat_json server error {resp.status_code}, retry {attempt+1}")
+                            await asyncio.sleep(delay)
+                            continue
+
                         resp.raise_for_status()
                         data = resp.json()
                         text = self._extract_text(data)
                         return self._parse_json(text)
-                except (httpx.TimeoutException, httpx.ConnectError) as e:
-                    if attempt >= p.max_retries:
-                        raise
-                    await asyncio.sleep(p.retry_base_delay * (2 ** attempt))
 
-            return {"error": "max_retries_exceeded"}
+                except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+                    last_error = e
+                    if attempt < p.max_retries:
+                        delay = p.retry_base_delay * (2 ** attempt)
+                        logger.warning(f"chat_json network error: {e}, retry {attempt+1}/{p.max_retries}")
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"chat_json failed after {p.max_retries} retries: {e}")
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code < 500:
+                        raise
+                    last_error = e
+                    if attempt < p.max_retries:
+                        delay = p.retry_base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+
+            return {"error": "max_retries_exceeded", "detail": str(last_error) if last_error else "unknown"}
 
         # 使用 tool_use 强制结构化输出
         tool = ToolDef(
@@ -990,16 +1054,36 @@ class LLMClientV2:
         )
 
     async def evaluate_batch(
-        self, papers: list, user_query: str, max_concurrent: int = 5
+        self, papers: list, user_query: str, max_concurrent: int = 5,
+        batch_timeout: float = 300.0,
     ) -> list[RelevanceJudgment]:
-        """并发评估多篇论文."""
+        """并发评估多篇论文（含整体超时保护）。
+
+        Args:
+            papers: 论文列表
+            user_query: 用户查询
+            max_concurrent: 最大并发数
+            batch_timeout: 整体超时秒数 (默认 5 分钟)
+        """
         semaphore = asyncio.Semaphore(max_concurrent)
 
         async def evaluate_one(paper):
             async with semaphore:
-                return await self.evaluate_relevance(paper, user_query)
+                try:
+                    return await self.evaluate_relevance(paper, user_query)
+                except Exception as e:
+                    logger.warning(f"Evaluate failed for {getattr(paper, 'title', '?')}: {e}")
+                    return RelevanceJudgment(score=0.5, reason=f"评估失败: {str(e)[:50]}", is_relevant=True)
 
-        return await asyncio.gather(*[evaluate_one(p) for p in papers])
+        try:
+            return await asyncio.wait_for(
+                asyncio.gather(*[evaluate_one(p) for p in papers]),
+                timeout=batch_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"evaluate_batch timeout after {batch_timeout}s for {len(papers)} papers")
+            # 返回部分结果 + 默认值
+            return [RelevanceJudgment(score=0.5, reason="批量评估超时", is_relevant=True) for _ in papers]
 
     async def should_continue_search(
         self,

@@ -1,17 +1,27 @@
-"""Agent 守护进程入口 — 启动/恢复/迁移。
+"""Agent 守护进程入口 — 启动/恢复/迁移 + AgentRunLoop 事件循环。
 
 协议参见 docs/development/agent-manifest.md §3。
 
+架构:
+  AgentBootstrap → 创建/恢复 Agent 组件
+  AgentRunLoop  → PriorityQueue 消费 4 事件源
+    1. WebSocket (prio=0)        → 待 ws_handler 注入
+    2. RedisEventSource (prio=1~2)→ Celery Worker 进度
+    3. SubAgentReportListener     → Redis Pub/Sub 子Agent 实时报告
+    4. TimerEventSource (prio=3)  → 定时任务
+
 使用方式:
-    python -m paper_search.agent.daemon                   # 首次启动
-    python -m paper_search.agent.daemon --data-dir /path   # 指定数据目录
+    python -m paper_search.agent.daemon
+    python -m paper_search.agent.daemon --data-dir /path
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,7 +101,8 @@ class AgentBootstrap:
         """主入口 — 创建或恢复 Agent。
 
         Returns:
-            {"manifest": dict, "graph": CompiledStateGraph, "state": dict|None}
+            {"manifest": dict, "graph": CompiledStateGraph, "state": dict|None,
+             "db": AgentDB, "memory": MemoryManager, "tools": ToolRegistry}
         """
         if self.manifest.exists():
             logger.info(f"Resuming agent from manifest: {self.manifest.path}")
@@ -135,7 +146,7 @@ class AgentBootstrap:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         pg = PlanGraph(llm=self._llm, tools=self._tools, memory=self._memory, db=self._db)
-        checkpointer = AsyncSqliteSaver(conn=str(db_path))
+        checkpointer = AsyncSqliteSaver.from_conn_string(str(db_path))
         self._graph = pg.compile(checkpointer=checkpointer)
 
         # 6. 从 checkpoint 恢复状态
@@ -149,7 +160,8 @@ class AgentBootstrap:
         manifest_data["agent"]["updated_at"] = _now()
         self.manifest.save(manifest_data)
 
-        return {"manifest": manifest_data, "graph": self._graph, "state": state, "db": self._db, "memory": self._memory, "tools": self._tools}
+        return {"manifest": manifest_data, "graph": self._graph, "state": state,
+                "db": self._db, "memory": self._memory, "tools": self._tools}
 
     # ── 首次创建 ────────────────────────────────────────
 
@@ -191,7 +203,7 @@ class AgentBootstrap:
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
         pg = PlanGraph(llm=self._llm, tools=self._tools, memory=self._memory, db=self._db)
-        checkpointer = AsyncSqliteSaver(conn=str(db_path))
+        checkpointer = AsyncSqliteSaver.from_conn_string(str(db_path))
         self._graph = pg.compile(checkpointer=checkpointer)
         logger.info("PlanGraph compiled")
 
@@ -257,7 +269,475 @@ class AgentBootstrap:
         self.manifest.save(manifest_data)
         logger.info(f"Manifest created: {self.manifest.path}")
 
-        return {"manifest": manifest_data, "graph": self._graph, "state": None, "db": self._db, "memory": self._memory, "tools": self._tools}
+        return {"manifest": manifest_data, "graph": self._graph, "state": None,
+                "db": self._db, "memory": self._memory, "tools": self._tools}
+
+
+# ═══════════════════════════════════════════════════════════════
+# AgentRunLoop — 事件驱动主循环
+# ═══════════════════════════════════════════════════════════════
+
+
+class AgentRunLoop:
+    """事件驱动主循环 — PriorityQueue + 4 事件源。
+
+        ┌──────────────────────────────────────────┐
+        │        AgentRunLoop (PriorityQueue)       │
+        │                                          │
+        │  4 个事件源 (后台协程，互不阻塞):          │
+        │  ┌──────────┐ ┌───────────┐ ┌─────────┐  │
+        │  │_ws_source│ │_redis_src │ │_timer   │  │
+        │  │(prio=0)  │ │(prio=1~2) │ │(prio=3) │  │
+        │  └────┬─────┘ └─────┬─────┘ └────┬────┘  │
+        │       │              │            │       │
+        │       └──────────────┴────────────┘       │
+        │                     │                     │
+        │                     ▼                     │
+        │         while running:                    │
+        │           priority, seq, event = queue    │
+        │           dispatch(event)                 │
+        └──────────────────────────────────────────┘
+    """
+
+    def __init__(self, graph, bus, db, manifest_data: dict,
+                 redis_url: str = "redis://localhost:6379/0",
+                 agent_id: str = "agent-001"):
+        self._graph = graph
+        self._bus = bus
+        self._db = db
+        self._manifest_data = manifest_data
+        self._redis_url = redis_url
+        self._agent_id = agent_id
+
+        # 事件源
+        self._redis_source = None
+        self._report_listener = None
+        self._timer_source = None
+        self._ws_source = None  # 由 ws_handler 通过 set_ws_source() 注入
+
+        # 状态
+        self._running = False
+        self._shutdown_event = asyncio.Event()
+
+        # WS 回调 (由 ws_handler 设置)
+        self._ws_send_fn: Optional[Any] = None
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def set_ws_source(self, ws_queue: asyncio.Queue):
+        """由 ws_handler 注入 WebSocket 消息队列。
+
+        ws_handler 将接收到的 WS 消息放入此队列，
+        AgentRunLoop 从中取出并投递到 EventBus (prio=0)。
+        """
+        self._ws_source = ws_queue
+        logger.info("WebSocket source injected")
+
+    def set_ws_send_fn(self, send_fn):
+        """注入 WebSocket 发送回调。"""
+        self._ws_send_fn = send_fn
+
+    async def start(self):
+        """启动 AgentRunLoop 和所有事件源。"""
+        logger.info("AgentRunLoop starting...")
+        self._running = True
+
+        # 1. 启动 EventBus
+        await self._bus.start()
+
+        # 2. 启动 Redis 事件源 (Celery Worker 进度)
+        from .event_bus import RedisEventSource, SubAgentReportListener, TimerEventSource, TimerDef
+        self._redis_source = RedisEventSource(
+            self._bus, self._redis_url, self._agent_id,
+        )
+        await self._redis_source.start()
+
+        # 3. 启动 SubAgent 实时报告监听 (Redis Pub/Sub)
+        self._report_listener = SubAgentReportListener(
+            self._bus, self._redis_url,
+        )
+        await self._report_listener.start()
+
+        # 4. 启动 Timer 事件源 (注册系统定时器)
+        self._timer_source = TimerEventSource(self._bus)
+        await self._timer_source.start()
+
+        # 注册系统定时器
+        self._timer_source.register(TimerDef(
+            name="health_check",
+            interval_seconds=1200,  # 20 min
+            timer_type="health_check",
+        ))
+        self._timer_source.register(TimerDef(
+            name="cleanup_logs",
+            interval_seconds=86400,  # 1 day
+            timer_type="cleanup",
+        ))
+
+        # 5. 启动 WebSocket 源 (如有注入)
+        if self._ws_source is not None:
+            logger.info("WebSocket source active")
+
+        logger.info("AgentRunLoop started — consuming events")
+
+        # 进入主循环
+        await self._run_loop()
+
+    async def stop(self):
+        """优雅关闭。"""
+        logger.info("AgentRunLoop stopping...")
+        self._running = False
+        self._shutdown_event.set()
+
+        # 停止事件源
+        if self._redis_source:
+            await self._redis_source.stop()
+        if self._report_listener:
+            await self._report_listener.stop()
+        if self._timer_source:
+            await self._timer_source.stop()
+
+        # 停止 EventBus
+        await self._bus.stop()
+
+        logger.info("AgentRunLoop stopped")
+
+    async def _run_loop(self):
+        """主循环 — 消费 PriorityQueue 中的事件。"""
+        from .event_bus import (
+            EventType, UserMessageEvent, UserClarificationEvent, UserApprovalEvent,
+            CeleryDoneEvent, CeleryErrorEvent, CeleryProgressEvent, TimerFiredEvent,
+        )
+
+        # 启动 WS 消息转发协程
+        if self._ws_source is not None:
+            asyncio.create_task(self._forward_ws_messages())
+
+        while self._running:
+            try:
+                # 从 EventBus 获取下一个事件（带超时，可响应 shutdown）
+                priority, seq, event = await asyncio.wait_for(
+                    self._bus.pop(), timeout=1.0
+                )
+
+                event_type = event.type
+                logger.debug(f"[RunLoop] prio={priority} seq={seq} type={event_type}")
+
+                # ── 分发事件 ──────────────────────────────
+
+                if event_type == EventType.SYSTEM_SHUTDOWN:
+                    logger.info("Shutdown event received")
+                    break
+
+                elif event_type == EventType.USER_MESSAGE:
+                    await self._handle_user_message(event)
+
+                elif event_type == EventType.USER_CLARIFICATION:
+                    await self._handle_clarification(event)
+
+                elif event_type == EventType.USER_APPROVAL:
+                    await self._handle_approval(event)
+
+                elif event_type == EventType.CELERY_DONE:
+                    await self._handle_celery_done(event)
+
+                elif event_type == EventType.CELERY_ERROR:
+                    await self._handle_celery_error(event)
+
+                elif event_type == EventType.CELERY_PROGRESS:
+                    await self._handle_celery_progress(event)
+
+                elif event_type == EventType.TIMER_FIRED:
+                    await self._handle_timer_fired(event)
+
+                else:
+                    logger.debug(f"Unknown event type: {event_type}")
+
+                # 推送给订阅者
+                await self._bus.publish_to_subscribers(event)
+
+            except asyncio.TimeoutError:
+                continue  # 无事件，继续循环
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"AgentRunLoop dispatch error: {e}", exc_info=True)
+
+    # ── WS 消息转发协程 ─────────────────────────────────
+
+    async def _forward_ws_messages(self):
+        """将 WebSocket 消息队列中的消息转发到 EventBus。"""
+        from .event_bus import UserMessageEvent, UserClarificationEvent, UserApprovalEvent
+
+        while self._running and self._ws_source is not None:
+            try:
+                ws_msg = await asyncio.wait_for(self._ws_source.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            sub_type = ws_msg.get("subType", "")
+            payload = ws_msg.get("payload", {})
+            agent_id = ws_msg.get("agentId", self._agent_id)
+            session_id = ws_msg.get("sessionId", "main")
+
+            if sub_type == "chat":
+                await self._bus.push(UserMessageEvent(
+                    content=payload.get("text", ""),
+                    raw_envelope=ws_msg,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                ))
+            elif sub_type == "clarify":
+                await self._bus.push(UserClarificationEvent(
+                    answers=payload.get("answers", []),
+                    agent_id=agent_id,
+                    session_id=session_id,
+                ))
+            elif sub_type == "approve":
+                await self._bus.push(UserApprovalEvent(
+                    confirmed=payload.get("confirmed", False),
+                    modifications=payload.get("modifications", {}),
+                    agent_id=agent_id,
+                    session_id=session_id,
+                ))
+
+    # ── 事件处理器 ──────────────────────────────────────
+
+    async def _handle_user_message(self, event):
+        """处理用户消息 → 启动/恢复 PlanGraph。"""
+        session_id = getattr(event, 'session_id', 'main')
+        config = {
+            "configurable": {
+                "thread_id": f"{self._agent_id}-plan-{session_id}",
+            },
+        }
+
+        try:
+            # 启动 PlanGraph 处理
+            result = await self._graph.ainvoke(
+                {"messages": [{"role": "user", "content": event.content}]},
+                config=config,
+            )
+            await self._dispatch_graph_output(result, session_id)
+        except Exception as e:
+            logger.error(f"PlanGraph invocation failed: {e}", exc_info=True)
+
+    async def _handle_clarification(self, event):
+        """处理用户澄清回答 → aresume PlanGraph。"""
+        session_id = getattr(event, 'session_id', 'main')
+        config = {
+            "configurable": {
+                "thread_id": f"{self._agent_id}-plan-{session_id}",
+            },
+        }
+
+        try:
+            result = await self._graph.aresume(
+                config,
+                {"user_clarification": {"answers": event.answers}},
+            )
+            await self._dispatch_graph_output(result, session_id)
+        except Exception as e:
+            logger.error(f"PlanGraph aresume (clarify) failed: {e}", exc_info=True)
+
+    async def _handle_approval(self, event):
+        """处理用户审批 → aresume PlanGraph。"""
+        session_id = getattr(event, 'session_id', 'main')
+        config = {
+            "configurable": {
+                "thread_id": f"{self._agent_id}-plan-{session_id}",
+            },
+        }
+
+        try:
+            result = await self._graph.aresume(
+                config,
+                {"user_approval": {
+                    "confirmed": event.confirmed,
+                    "modifications": event.modifications,
+                }},
+            )
+            await self._dispatch_graph_output(result, session_id)
+        except Exception as e:
+            logger.error(f"PlanGraph aresume (approval) failed: {e}", exc_info=True)
+
+    async def _handle_celery_done(self, event: CeleryDoneEvent):
+        """处理 Celery 任务完成。"""
+        logger.info(f"Celery done: task={event.agent_task_id} agent={event.agent_type}")
+        # 通过 WS 推送完成通知
+        if self._ws_send_fn:
+            await self._ws_send_fn({
+                "role": "assistant",
+                "type": "task",
+                "subType": "done",
+                "agentId": self._agent_id,
+                "sessionId": getattr(event, 'session_id', 'main'),
+                "seq": event.seq,
+                "priority": event.priority,
+                "timestamp": _now(),
+                "payload": {
+                    "taskId": event.agent_task_id,
+                    "result": event.result,
+                },
+            })
+
+    async def _handle_celery_error(self, event: CeleryErrorEvent):
+        """处理 Celery 任务失败。"""
+        logger.error(f"Celery error: task={event.agent_task_id} error={event.error[:200]}")
+        if self._ws_send_fn:
+            await self._ws_send_fn({
+                "role": "assistant",
+                "type": "task",
+                "subType": "failed",
+                "agentId": self._agent_id,
+                "sessionId": getattr(event, 'session_id', 'main'),
+                "seq": event.seq,
+                "priority": event.priority,
+                "timestamp": _now(),
+                "payload": {
+                    "taskId": event.agent_task_id,
+                    "error": event.error,
+                },
+            })
+
+    async def _handle_celery_progress(self, event: CeleryProgressEvent):
+        """处理 Celery 进度 → WS 推送。"""
+        if self._ws_send_fn:
+            await self._ws_send_fn({
+                "role": "assistant",
+                "type": "task",
+                "subType": "running",
+                "agentId": self._agent_id,
+                "sessionId": getattr(event, 'session_id', 'main'),
+                "seq": event.seq,
+                "priority": event.priority,
+                "timestamp": _now(),
+                "payload": {
+                    "taskId": event.agent_task_id,
+                    "stage": event.stage,
+                    "stageIndex": event.stage_index,
+                    "totalStages": event.total_stages,
+                    "current": event.current,
+                    "total": event.total,
+                },
+            })
+
+    async def _handle_timer_fired(self, event: TimerFiredEvent):
+        """处理定时触发事件。"""
+        logger.info(f"Timer fired: {event.timer_name} (type={event.timer_type})")
+
+        if event.timer_type == "health_check":
+            await self._run_health_check()
+        elif event.timer_type == "cleanup":
+            await self._run_cleanup()
+        elif event.timer_type == "subscription":
+            # TODO: 检查订阅方向的新论文
+            pass
+
+    async def _run_health_check(self):
+        """执行系统健康检查。"""
+        ok = True
+        status = {}
+
+        # 检查 DB
+        try:
+            self._db.conn.execute("SELECT 1")
+            status["db"] = "ok"
+        except Exception as e:
+            status["db"] = f"error: {e}"
+            ok = False
+
+        # 检查 Redis
+        if self._redis_source:
+            try:
+                self._redis_source.redis.ping()
+                status["redis"] = "ok"
+            except Exception as e:
+                status["redis"] = f"error: {e}"
+                ok = False
+
+        logger.info(f"Health check: {'OK' if ok else 'FAILED'} — {json.dumps(status)}")
+
+    async def _run_cleanup(self):
+        """清理过期日志。"""
+        log_dir = Path.home() / ".paper_search" / "logs" / "tasks"
+        if log_dir.exists():
+            cutoff = datetime.now(timezone.utc).timestamp() - 30 * 86400  # 30 days
+            count = 0
+            for f in log_dir.glob("*.jsonl"):
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    count += 1
+            if count:
+                logger.info(f"Cleanup: removed {count} old task logs")
+
+    # ── PlanGraph 输出分发 ──────────────────────────────
+
+    async def _dispatch_graph_output(self, result, session_id: str):
+        """将 PlanGraph 输出转为 WS 协议消息并发送。
+
+        PlanGraph 节点可能设置:
+          - pending_review → 转为 review(clarify/plan/permissions) WS 消息
+          - plan_status → 转为 phase 消息
+          - error → 转为 error 消息
+        """
+        if result is None:
+            return
+
+        # 检查 pending_review
+        pending_review = result.get("pending_review")
+        if pending_review and isinstance(pending_review, dict):
+            await self._send_ws({
+                "role": "assistant",
+                "type": pending_review.get("type", "review"),
+                "subType": pending_review.get("subType", "clarify"),
+                "agentId": self._agent_id,
+                "sessionId": session_id,
+                "seq": 0,
+                "priority": 0,
+                "timestamp": _now(),
+                "payload": pending_review.get("payload", {}),
+            })
+
+        # 检查错误
+        error = result.get("error")
+        if error:
+            await self._send_ws({
+                "role": "assistant",
+                "type": "error",
+                "subType": "error",
+                "agentId": self._agent_id,
+                "sessionId": session_id,
+                "seq": 0,
+                "priority": 0,
+                "timestamp": _now(),
+                "payload": {"message": str(error)},
+            })
+
+        # 检查 plan_status 变更
+        plan_status = result.get("plan_status", "")
+        if plan_status:
+            await self._send_ws({
+                "role": "assistant",
+                "type": "phase",
+                "subType": plan_status,
+                "agentId": self._agent_id,
+                "sessionId": session_id,
+                "seq": 0,
+                "priority": 0,
+                "timestamp": _now(),
+                "payload": {"planStatus": plan_status},
+            })
+
+    async def _send_ws(self, envelope: dict):
+        """发送 WS 消息。"""
+        if self._ws_send_fn:
+            try:
+                await self._ws_send_fn(envelope)
+            except Exception as e:
+                logger.error(f"WS send failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -265,18 +745,69 @@ class AgentBootstrap:
 # ═══════════════════════════════════════════════════════════════
 
 
-async def main(data_dir: Optional[str] = None):
-    """daemon 主入口。"""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
+    """daemon 主入口 — bootstrap + AgentRunLoop。
+
+    启动流程:
+      1. AgentBootstrap.bootstrap() → 创建/恢复 Agent 组件
+      2. 创建 EventBus + AgentRunLoop
+      3. 启动 RunLoop (阻塞直到 SIGTERM/SIGINT)
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
 
     path = Path(data_dir) if data_dir else None
+    redis = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    # Bootstrap
     bs = AgentBootstrap(data_dir=path)
     result = await bs.bootstrap()
 
-    logger.info(f"Agent {result['manifest']['agent']['agent_id']} ready")
-    logger.info(f"  Status: {result['manifest']['agent']['status']}")
+    manifest = result["manifest"]
+    agent_id = manifest["agent"]["agent_id"]
+
+    logger.info(f"Agent {agent_id} ready")
+    logger.info(f"  Status: {manifest['agent']['status']}")
     logger.info(f"  Graph: {type(result['graph']).__name__}")
     logger.info(f"  State: {'restored' if result['state'] else 'fresh'}")
+
+    # 创建 EventBus
+    from .event_bus import EventBus
+    bus = EventBus()
+
+    # 创建 AgentRunLoop
+    loop = AgentRunLoop(
+        graph=result["graph"],
+        bus=bus,
+        db=result["db"],
+        manifest_data=manifest,
+        redis_url=redis,
+        agent_id=agent_id,
+    )
+
+    # 注册信号处理
+    def _sig_handler():
+        logger.info("Received shutdown signal")
+        asyncio.create_task(loop.stop())
+
+    try:
+        loop_evt = asyncio.get_event_loop()
+    except RuntimeError:
+        loop_evt = asyncio.get_running_loop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop_evt.add_signal_handler(sig, _sig_handler)
+        except NotImplementedError:
+            pass  # Windows 不支持 add_signal_handler
+
+    # 启动 RunLoop（阻塞）
+    try:
+        await loop.start()
+    except asyncio.CancelledError:
+        pass
 
     return result
 
@@ -286,5 +817,4 @@ def _now() -> str:
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
