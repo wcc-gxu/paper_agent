@@ -158,13 +158,30 @@ class VideoBrowser:
             page = context.new_page()
 
             # 导航到分享链接
-            page.goto(url, wait_until="networkidle", timeout=REDIRECT_TIMEOUT_SECONDS * 1000)
+            # 抖音短链会 302 → snssdk1128:// 深链 → ERR_ABORTED
+            # 但在此之前浏览器已通过 JS 跳转到网页版
+            final_url = url  # fallback
+            page_title = ""
 
-            # 等待可能的额外重定向（JS 驱动的深链 → 网页 fallback）
-            time.sleep(2)
+            try:
+                page.goto(url, wait_until="domcontentloaded",
+                         timeout=REDIRECT_TIMEOUT_SECONDS * 1000)
+            except Exception as e:
+                err_msg = str(e)
+                if "ERR_ABORTED" in err_msg or "net::" in err_msg:
+                    logger.debug(f"Navigation interrupted (expected for deep links): {err_msg[:100]}")
+                else:
+                    raise
 
-            final_url = page.url
-            page_title = page.title()
+            # 等待可能的额外重定向完成
+            time.sleep(3)
+
+            # 获取当前 URL（重定向后的最终地址）
+            try:
+                final_url = page.url
+                page_title = page.title()
+            except Exception:
+                pass  # page may have closed after redirect
 
             logger.info(f"Resolved: {url[:60]} → {final_url[:80]}")
 
