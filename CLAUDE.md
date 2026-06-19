@@ -63,7 +63,7 @@ START → parse_intent → (clarify? → await_clarify →) generate_plan
 - `execute_plan`: 委托 ExecuteGraph 调度子 Agent
 - `overall_evaluate`: LLM 评估执行结果
 
-### ExecuteGraph → 6 种子 Agent
+### ExecuteGraph → 7 种子 Agent
 
 ```
 execute_graph.py (调度层)
@@ -72,7 +72,9 @@ execute_graph.py (调度层)
     ├── ClusteringAgent    load→cluster→label→visualize→detect
     ├── CitationChaseAgent resolve→check→fetch→filter→ingest→decide(loop)→summarize
     ├── HistoryAgent       analyze→generate_plan→archive→merge→skip→notify
-    └── TranslationAgent   route→translate|build|enrich
+    ├── TranslationAgent   route→translate|build|enrich
+    └── VideoAgent         parse_link→fetch_metadata→download→extract_audio
+                           →transcribe→summarize→analyze→notify
 ```
 
 ### 论文入库流水线 (IngestAgent)
@@ -85,6 +87,18 @@ search_papers  →  (papers in SQLite)
                 → index_paper  →  (ChromaDB: 6 collections)
                     → [verify] → rank_papers → generate_survey
 ```
+
+### 视频解析流水线 (VideoAgent)
+
+```
+parse_link  →  fetch_metadata (yt-dlp)  →  download_video  →  extract_audio (ffmpeg)
+    →  transcribe (faster-whisper)  →  summarize (LLM)  →  analyze (LLM)  →  notify (SQLite)
+```
+
+- 长视频 (>10分钟): 跳过转录，基于标题/简介生成摘要
+- 双策略下载: yt-dlp 直连 → 失败/缺 cookie → CloakBrowser 提取 cookie → yt-dlp 重试
+- 支持 6 平台 URL 识别: 抖音(短链/长链/口令)/TikTok/B站/YouTube/小红书/快手
+- Cookie 缓存: 30 分钟 TTL，同平台复用
 
 ### WebSocket 协议 (v7.0)
 
@@ -114,6 +128,8 @@ src/paper_search/
 │   ├── task_logger.py              # 任务 JSON 日志
 │   ├── sub_agent.py                # PipelineRunner 编排器
 │   ├── verifier.py                 # 引用三步校验 (格式/匹配/事实)
+│   ├── video_downloader.py         # yt-dlp 封装 + URL解析 + CloakBrowser 降级
+│   ├── video_browser.py            # CloakBrowser 封装 (链接解析 + cookie 导出)
 │   ├── knowledge.py                # RAG 问答 + 知识提取 + 知识发现
 │   ├── chroma_store.py             # ChromaDB 6 集合
 │   ├── pdf_converter.py            # PDF→Markdown (pymupdf4llm)
@@ -128,7 +144,8 @@ src/paper_search/
 │       ├── clustering_graph.py     # 聚类 (5 节点)
 │       ├── citation_chase_graph.py # 引用追溯 (7 节点 + loop)
 │       ├── history_graph.py        # 历史处理 (Plan+Execute)
-│       └── translation_graph.py    # 术语翻译 (工具型)
+│       ├── translation_graph.py    # 术语翻译 (工具型)
+│       └── video_graph.py          # 视频解析 (8 节点: 链接→下载→转写→总结→分析)
 │
 ├── api/                            # FastAPI 层
 │   ├── app.py                      # 应用入口 + /ws/chat/{agent_id}/{session_id}
@@ -174,6 +191,8 @@ src/paper_search/
 | `IEEE_API_KEY` | IEEE Xplore |
 | `WEB_SEARCH_API_KEY` | 火山引擎联网搜索 (500次/月) |
 | `REDIS_URL` | Redis 连接 (默认 `redis://localhost:6379/0`) |
+| `WHISPER_MODEL_SIZE` | Whisper 模型大小 (默认 `small`) |
+| `CLOAKBROWSER_HEADLESS` | 浏览器无头模式 (默认 `1`) |
 
 ---
 
@@ -187,6 +206,8 @@ src/paper_search/
     │   └── task-{YYYYMMDD}-{seq}.jsonl    # 按 task_id 分文件
     ├── citation_chase/
     │   └── task-{YYYYMMDD}-{seq}.jsonl
+    ├── video/
+    │   └── task-{YYYYMMDD}-{seq}.jsonl    # 视频解析日志
     └── ...
 ```
 
@@ -197,6 +218,7 @@ src/paper_search/
 ## Dependencies
 
 ```
+# Core
 langgraph>=0.2.0, langgraph-checkpoint-sqlite>=1.0.0
 fastapi>=0.110, uvicorn[standard]>=0.27
 celery[redis]>=5.4, redis>=5.0
@@ -204,6 +226,12 @@ httpx>=0.27, pydantic>=2
 arxiv>=2.3, biopython, metapub
 pymupdf4llm, chromadb
 python-dotenv, rich>=13
+
+# Video (optional — pip install -e ".[video]")
+yt-dlp>=2024.12           # 多平台视频下载 (1800+ 站点)
+faster-whisper>=1.1.0     # 本地语音识别 (CTranslate2 加速)
+cloakbrowser>=0.3         # 反检测浏览器 (cookie 提取 + 链接解析)
+ffmpeg                    # 系统级依赖 (apt install ffmpeg)
 ```
 
 Python >= 3.11

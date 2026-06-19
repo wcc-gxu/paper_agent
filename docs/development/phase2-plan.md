@@ -27,7 +27,7 @@
 | 17 | 子 Agent **统一改为 Celery 调度** |
 | 18 | 先不做多用户 |
 | 18+ | 主 Agent 通过 **Redis Pub/Sub** 监听子 Agent 实时 report；子 Agent 独立日志，可按 task_id 区分条目 |
-| 19 | **全部 6 个子 Agent** 实现 |
+| 19 | **全部 7 个子 Agent** 实现 |
 | 20 | 实现 `ws_handler.py` |
 | 21 | `task_event_adapter.py` 按新设计**重写** |
 | 22 | Phase 1 的 **6 个 Bug 全部修复** |
@@ -233,7 +233,7 @@ def sub_agent_task(self, agent_type: str, state: dict):
 
 ---
 
-### Step 4: 六个子 Agent 全部实现（第 2-3 周）
+### Step 4: 七个子 Agent 全部实现（第 2-3 周）
 
 #### 4.1 IngestAgent（已有，增强）
 

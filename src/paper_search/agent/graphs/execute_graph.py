@@ -14,6 +14,7 @@
   citation_chase  → CitationChaseAgent (引用追溯)
   history         → HistoryAgent    (历史消息处理)
   translation     → TranslationAgent (术语翻译)
+  video           → VideoAgent      (视频链接解析+下载+转写+总结)
 
 使用方式:
     executor = ExecuteGraph(db, llm, tools, task_adapter, celery_app, redis_url)

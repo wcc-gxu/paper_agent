@@ -1083,6 +1083,7 @@ P3: IEEE Xplore + CNKI → 按需补充
 | CitationChaseAgent | Execute Graph (动态迭代) | 用户以文搜文 |
 | HistoryAgent | Plan Graph + Execute Graph | 主Agent重启时 |
 | TranslationAgent | 无 Graph (工具型 Agent) | 查询翻译 / 入库后术语提取 |
+| VideoAgent | Execute Graph (线性8阶段) | 用户分享视频链接 |
 
 ### LLM 架构
 

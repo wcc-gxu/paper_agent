@@ -32,7 +32,7 @@
               │  │  Parse → Clarify → Plan → Execute    │   │
               │  └──────────────────────────────────────┘   │
               │  ┌──────────────────────────────────────┐   │
-              │  │  6 个子 Agent (IngestAgent 等)       │   │
+              │  │  7 个子 Agent (IngestAgent 等)       │   │
               │  └──────────────────────────────────────┘   │
               │  ┌──────────────────────────────────────┐   │
               │  │  ToolRegistry (50+ 工具)              │   │
@@ -190,6 +190,7 @@ plan_graph.add_conditional_edges("overall_evaluate", decide_overall, {
 | **CitationChaseAgent** | 动态 Execute Graph | 7 节点 | resolve→check→fetch(evaluate parallel)→filter→ingest(parallel)→decide(loop)→summarize |
 | **HistoryAgent** | Plan Graph + Execute Graph | 2+4 节点 | Plan: analyze→generate_plan；Execute: archive→merge→skip→notify |
 | **TranslationAgent** | 无 Graph | — | 工具型 Agent，直接调用：build_glossary / translate_query / enrich_terminology |
+| **VideoAgent** | 线性 Execute Graph | 8 节点 | parse_link→fetch_metadata→download→extract_audio→transcribe→summarize→analyze→notify；双策略下载 (yt-dlp + CloakBrowser 降级) |
 
 ### 3.3 State 定义 — 每个 Agent 独立 State
 

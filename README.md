@@ -28,6 +28,7 @@
 | **引用追溯** | 从一篇论文出发，沿引用网络发现相关工作 |
 | **学术术语翻译** | 中英术语库，中文查询自动翻译为准确学术英文 |
 | **24/7 常驻** | Agent 守护进程常驻后台，随时响应 |
+| **视频解析** | 分享链接 → 下载 → 本地转写 → LLM 总结 + 深度分析 |
 
 ---
 
@@ -58,7 +59,8 @@ ExecuteGraph (统一调度层)
     ├── ClusteringAgent   — 研究方向聚类
     ├── CitationChaseAgent — 引用追溯
     ├── HistoryAgent      — 历史消息处理
-    └── TranslationAgent  — 术语翻译
+    ├── TranslationAgent  — 术语翻译
+    └── VideoAgent        — 视频链接解析+下载+转写+总结
     │
     ▼
 存储: SQLite + ChromaDB + Redis + 文件系统
@@ -151,6 +153,8 @@ paper_agant/
 │   │   ├── task_event_adapter.py # 任务事件→WS 协议
 │   │   ├── task_logger.py        # JSON 日志
 │   │   ├── sub_agent.py          # PipelineRunner
+│   │   ├── video_downloader.py    # yt-dlp + URL 解析
+│   │   ├── video_browser.py       # CloakBrowser cookie 提取
 │   │   │
 │   │   ├── graphs/               # LangGraph 图
 │   │   │   ├── plan_graph.py         # 主 Agent
@@ -160,7 +164,8 @@ paper_agant/
 │   │   │   ├── clustering_graph.py   # 研究方向聚类
 │   │   │   ├── citation_chase_graph.py # 引用追溯
 │   │   │   ├── history_graph.py      # 历史消息处理
-│   │   │   └── translation_graph.py  # 术语翻译
+│   │   │   ├── translation_graph.py  # 术语翻译
+│   │   │   └── video_graph.py        # 视频解析 (8节点)
 │   │   │
 │   │   ├── chroma_store.py       # ChromaDB
 │   │   ├── pdf_converter.py      # PDF→Markdown
