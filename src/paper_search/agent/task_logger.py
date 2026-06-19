@@ -12,6 +12,11 @@ paper_progress event_type 枚举:
   download_start|done|failed|skip /
   convert_start|done|failed|skip /
   index_start|done|failed / rank_done / survey_done
+
+video_stage event_type 枚举 (VideoAgent):
+  parse_link_done|failed / metadata_fetched|failed /
+  video_download_done|failed / audio_extract_done|failed /
+  transcribe_done|failed|skipped / summarize_done / analyze_done
 """
 
 from __future__ import annotations

@@ -105,3 +105,60 @@ class BatchSummary(BaseModel):
     total_failed: int = 0
     results: list[SearchResult] = Field(default_factory=list)
     downloads: list[DownloadResult] = Field(default_factory=list)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Video Models — 视频解析子 Agent
+# ═══════════════════════════════════════════════════════════════
+
+
+class VideoMetadata(BaseModel):
+    """yt-dlp 提取的视频元数据。"""
+    url: str = Field(default="", description="规范化后的视频 URL")
+    platform: str = Field(default="", description="视频平台 (douyin/tiktok/youtube/...)")
+    video_id: str = Field(default="", description="平台视频 ID")
+    title: str = Field(default="", description="视频标题")
+    duration_seconds: float = Field(default=0.0, description="视频时长 (秒)")
+    uploader: str = Field(default="", description="上传者/频道名")
+    thumbnail_url: str = Field(default="", description="缩略图 URL")
+    description: str = Field(default="", description="视频简介")
+
+
+class VideoSummary(BaseModel):
+    """LLM 结构化视频摘要。"""
+    one_line_summary: str = Field(default="", description="一句话总结视频核心内容")
+    key_points: list[dict] = Field(
+        default_factory=list,
+        description="分段要点列表 [{title: str, content: str}]",
+    )
+    core_thesis: str = Field(default="", description="视频的核心论点或主张")
+    tags: list[str] = Field(default_factory=list, description="中英双语标签")
+    language: str = Field(default="zh", description="视频主要语言 (zh/en)")
+
+
+class VideoAnalysis(BaseModel):
+    """LLM 视频深度分析。"""
+    stance: str = Field(default="", description="视频立场 (中立/赞成/反对/批判/宣传)")
+    stance_confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="立场置信度")
+    logic_chain: list[dict] = Field(
+        default_factory=list,
+        description="逻辑链路 [{premise: str, conclusion: str}]",
+    )
+    factual_claims: list[dict] = Field(
+        default_factory=list,
+        description="可验证陈述 [{claim, verdict, evidence, confidence}]",
+    )
+    overall_assessment: str = Field(default="", description="总体评价")
+    target_audience: str = Field(default="", description="目标受众分析")
+    production_quality: str = Field(default="medium", description="制作质量 (high/medium/low)")
+
+
+class VideoResult(BaseModel):
+    """完整的视频处理结果。"""
+    metadata: VideoMetadata = Field(default_factory=VideoMetadata, description="视频元数据")
+    local_video_path: str = Field(default="", description="本地视频文件路径")
+    transcript_path: str = Field(default="", description="转录文本文件路径")
+    transcript_text: Optional[str] = Field(default=None, description="完整转录文本")
+    transcription_skipped: bool = Field(default=False, description="是否因长视频跳过转录")
+    summary: Optional[VideoSummary] = Field(default=None, description="结构化摘要")
+    analysis: Optional[VideoAnalysis] = Field(default=None, description="深度分析")

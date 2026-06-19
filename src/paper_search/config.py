@@ -127,6 +127,7 @@ class Config:
         """确保所有必要的目录存在。"""
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.cookie_cache_dir.mkdir(parents=True, exist_ok=True)
+        get_videos_dir().mkdir(parents=True, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -165,3 +166,15 @@ def get_outputs_dir(project_id: str = "") -> Path:
     if project_id:
         p = p / project_id
     return p
+
+
+def get_videos_dir() -> Path:
+    """获取视频存储目录 (~/.paper_search/videos/)。
+
+    Directory layout:
+      ~/.paper_search/videos/
+        ├── {video_id}.mp4              # 下载的视频文件
+        ├── {video_id}.wav              # 提取的音频文件
+        └── {video_id}_transcript.txt   # 转录文本
+    """
+    return get_data_dir() / "videos"

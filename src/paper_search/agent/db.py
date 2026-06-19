@@ -157,6 +157,25 @@ CREATE TABLE IF NOT EXISTS ws_messages (
     is_replay INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_ws_messages_lookup ON ws_messages(agent_id, session_id, seq);
+
+CREATE TABLE IF NOT EXISTS videos (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES agent_tasks(id),
+    url TEXT NOT NULL,
+    platform TEXT NOT NULL DEFAULT 'unknown',
+    title TEXT NOT NULL DEFAULT '',
+    duration_seconds REAL DEFAULT 0,
+    uploader TEXT DEFAULT '',
+    summary TEXT,
+    analysis TEXT,
+    transcript_text TEXT,
+    local_path TEXT,
+    thumbnail_url TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_videos_project ON videos(project_id);
+CREATE INDEX IF NOT EXISTS idx_videos_platform ON videos(platform);
 """
 
 # 运行时迁移：为旧表添加新列（多表支持）
@@ -674,6 +693,94 @@ class AgentDB:
             }
             for r in rows
         ]
+
+    # ── Video CRUD ────────────────────────────────────────
+
+    def save_video_result(self, project_id: str, video_id: str, url: str,
+                          platform: str = "", title: str = "",
+                          duration_seconds: float = 0,
+                          uploader: str = "",
+                          summary: dict = None,
+                          analysis: dict = None,
+                          local_path: str = "",
+                          transcript_text: str = None) -> str:
+        """保存或更新视频分析结果。
+
+        Args:
+            project_id: 主任务 ID
+            video_id: 平台视频 ID
+            url: 视频 URL
+            platform: 平台名 (douyin/tiktok/...)
+            title: 视频标题
+            duration_seconds: 时长 (秒)
+            uploader: 上传者
+            summary: LLM 结构化摘要 (dict → JSON)
+            analysis: LLM 深度分析 (dict → JSON)
+            local_path: 本地视频文件路径
+            transcript_text: 转录全文
+
+        Returns:
+            video_id (用于后续查询)
+        """
+        import uuid as _uuid
+        now = self._now()
+        vid = video_id or f"vid:{_uuid.uuid4().hex[:12]}"
+        summary_json = json.dumps(summary, ensure_ascii=False, default=str) if summary else None
+        analysis_json = json.dumps(analysis, ensure_ascii=False, default=str) if analysis else None
+
+        self.conn.execute(
+            """INSERT OR REPLACE INTO videos
+               (id, project_id, url, platform, title, duration_seconds,
+                uploader, summary, analysis, transcript_text, local_path, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (vid, project_id, url, platform, title, duration_seconds,
+             uploader, summary_json, analysis_json, transcript_text,
+             local_path, now, now),
+        )
+        self.conn.commit()
+        return vid
+
+    def get_video_result(self, video_id: str) -> Optional[dict]:
+        """获取视频分析结果。
+
+        Args:
+            video_id: 视频 ID
+
+        Returns:
+            dict 含 deserialized summary/analysis JSON 字段，或 None
+        """
+        row = self.conn.execute(
+            "SELECT * FROM videos WHERE id = ?", (video_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        for field in ("summary", "analysis"):
+            if d.get(field):
+                try:
+                    d[field] = json.loads(d[field])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return d
+
+    def list_video_results(self, project_id: str, limit: int = 20) -> list[dict]:
+        """列出项目的所有视频结果。
+
+        Args:
+            project_id: 项目 ID
+            limit: 最大返回数
+
+        Returns:
+            list[dict] 包含 id, url, platform, title, duration_seconds, uploader, created_at
+        """
+        rows = self.conn.execute(
+            """SELECT id, project_id, url, platform, title, duration_seconds,
+                      uploader, created_at
+               FROM videos WHERE project_id = ?
+               ORDER BY created_at DESC LIMIT ?""",
+            (project_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def close(self):
         if self._conn:

@@ -161,6 +161,8 @@ class ExecuteGraph:
             result = await self._run_translation(task_id, sub_task, plan)
         elif agent_type == "history":
             result = await self._run_history(task_id, sub_task, plan)
+        elif agent_type == "video":
+            result = await self._run_video(task_id, sub_task, plan)
         else:
             result = {"action": action, "agent": agent_type, "error": f"Unknown agent: {agent_type}"}
 
@@ -186,6 +188,8 @@ class ExecuteGraph:
             "cluster": "clustering",
             "translate": "translation",
             "history": "history",
+            "video": "video",
+            "analyze_video": "video",
         }
         return mapping.get(action, "ingest")
 
@@ -371,3 +375,123 @@ class ExecuteGraph:
         except Exception as e:
             logger.error(f"HistoryAgent failed: {e}", exc_info=True)
             return {"action": "history", "agent": "history", "error": str(e)}
+
+    async def _run_video(self, task_id: str, sub_task: dict, plan: dict) -> dict:
+        """执行 VideoAgent — 视频解析。
+
+        Pipeline:
+          parse_link → fetch_metadata → download_video → extract_audio
+          → transcribe → summarize → analyze → notify
+
+        取消: 通过 agent:cmd:{task_id} Pub/Sub channel + 进程 kill
+        """
+        from ..video_downloader import VideoDownloader
+        from ..config import get_videos_dir
+        from .video_graph import VideoAgent
+
+        videos_dir = get_videos_dir()
+        downloader = VideoDownloader(output_dir=videos_dir)
+
+        # Lazy-load faster-whisper model
+        whisper_model = self._get_whisper_model()
+
+        # Build on_progress callback → task_adapter
+        async def _on_progress(stage, stage_index, total_stages, current, total):
+            if self._task_adapter:
+                try:
+                    await self._task_adapter.on_task_running(
+                        task_id, stage, stage_index, total_stages, current, total,
+                    )
+                except Exception:
+                    pass
+
+        agent = VideoAgent(
+            downloader=downloader,
+            whisper_model=whisper_model,
+            llm=self._llm,
+            db=self._db,
+            videos_dir=videos_dir,
+            on_progress=_on_progress,
+        )
+        graph = agent.compile()
+
+        config = {"configurable": {"thread_id": f"video-{task_id}"}}
+        user_text = sub_task.get("description", plan.get("original_query", ""))
+
+        # ── Publish agent_started ──
+        if self._report_listener:
+            self._report_listener.publish_lifecycle(
+                task_id, "agent_started", agent_type="video")
+
+        try:
+            result = await graph.ainvoke({
+                "project_id": task_id,
+                "user_query": user_text,
+            }, config=config)
+
+            # ── Publish agent_done ──
+            if self._report_listener:
+                self._report_listener.publish_lifecycle(
+                    task_id, "agent_done", agent_type="video",
+                    extra={"result": result.get("result", {})})
+
+            video_result = result.get("result", {})
+            return {
+                "action": "video",
+                "agent": "video",
+                "title": video_result.get("title", ""),
+                "duration_seconds": video_result.get("duration_seconds", 0),
+                "summary": video_result.get("summary"),
+                "analysis": video_result.get("analysis"),
+                "result": video_result,
+            }
+        except Exception as e:
+            logger.error(f"VideoAgent failed: {e}", exc_info=True)
+            if self._report_listener:
+                self._report_listener.publish_lifecycle(
+                    task_id, "agent_failed", agent_type="video",
+                    extra={"error": str(e)})
+            return {"action": "video", "agent": "video", "error": str(e)}
+        finally:
+            # Ensure yt-dlp subprocess is cleaned up
+            downloader.cancel()
+
+    def _get_whisper_model(self):
+        """Lazy singleton for faster-whisper model.
+
+        Model is loaded once per ExecuteGraph instance.
+        Uses "small" model as default (good accuracy/speed trade-off for Chinese).
+
+        Returns:
+            faster_whisper.WhisperModel instance, or None if import fails.
+        """
+        if not hasattr(self, "_whisper_model") or self._whisper_model is None:
+            try:
+                from faster_whisper import WhisperModel
+                import os
+                model_size = os.environ.get("WHISPER_MODEL_SIZE", "small")
+                compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
+                cpu_threads = int(os.environ.get("WHISPER_CPU_THREADS", "4"))
+                num_workers = int(os.environ.get("WHISPER_NUM_WORKERS", "2"))
+
+                self._whisper_model = WhisperModel(
+                    model_size,
+                    device="cpu",
+                    compute_type=compute_type,
+                    cpu_threads=cpu_threads,
+                    num_workers=num_workers,
+                )
+                logger.info(
+                    f"Loaded faster-whisper model: {model_size} "
+                    f"(compute={compute_type}, threads={cpu_threads})"
+                )
+            except ImportError as e:
+                logger.error(
+                    f"faster-whisper not installed. Install with: "
+                    f"pip install faster-whisper: {e}"
+                )
+                self._whisper_model = None
+            except Exception as e:
+                logger.error(f"Failed to load whisper model: {e}")
+                self._whisper_model = None
+        return self._whisper_model

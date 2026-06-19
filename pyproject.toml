@@ -38,6 +38,8 @@ celery = ["celery[redis]>=5.4", "redis>=5.0"]
 web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
 # CAPTCHA handling (CNKI)
 ocr = ["pytesseract>=0.3"]
+# Video processing (yt-dlp + Whisper)
+video = ["yt-dlp>=2024.12", "faster-whisper>=1.1.0"]
 # All deps
 all = [
     "httpx>=0.27",
@@ -53,6 +55,8 @@ all = [
     "langgraph>=0.2.0",
     "langgraph-checkpoint-sqlite>=1.0.0",
     "langchain-core>=0.3.0",
+    "yt-dlp>=2024.12",
+    "faster-whisper>=1.1.0",
 ]
 
 [build-system]
