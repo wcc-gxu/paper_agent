@@ -128,6 +128,7 @@ class Config:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.cookie_cache_dir.mkdir(parents=True, exist_ok=True)
         get_videos_dir().mkdir(parents=True, exist_ok=True)
+        get_cookie_dir().mkdir(parents=True, exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -178,3 +179,12 @@ def get_videos_dir() -> Path:
         └── {video_id}_transcript.txt   # 转录文本
     """
     return get_data_dir() / "videos"
+
+
+def get_cookie_dir() -> Path:
+    """获取浏览器 cookie 缓存目录 (~/.paper_search/cookies/)。
+
+    CloakBrowser 导出的 Netscape 格式 cookie 文件存放于此。
+    各平台独立文件: douyin_cookies.txt, bilibili_cookies.txt 等。
+    """
+    return get_data_dir() / "cookies"

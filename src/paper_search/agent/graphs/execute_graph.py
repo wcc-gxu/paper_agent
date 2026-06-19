@@ -386,11 +386,12 @@ class ExecuteGraph:
         取消: 通过 agent:cmd:{task_id} Pub/Sub channel + 进程 kill
         """
         from ..video_downloader import VideoDownloader
-        from ..config import get_videos_dir
+        from ..config import get_videos_dir, get_cookie_dir
         from .video_graph import VideoAgent
 
         videos_dir = get_videos_dir()
-        downloader = VideoDownloader(output_dir=videos_dir)
+        downloader = VideoDownloader(output_dir=videos_dir,
+                                     browser=self._get_browser())
 
         # Lazy-load faster-whisper model
         whisper_model = self._get_whisper_model()
@@ -495,3 +496,39 @@ class ExecuteGraph:
                 logger.error(f"Failed to load whisper model: {e}")
                 self._whisper_model = None
         return self._whisper_model
+
+    def _get_browser(self):
+        """Lazy singleton for VideoBrowser (CloakBrowser).
+
+        Browser is only created when needed by VideoDownloader's fallback strategy.
+        Returns None if cloakbrowser is not installed (graceful degradation).
+
+        Returns:
+            VideoBrowser instance, or None if not available.
+        """
+        if not hasattr(self, "_browser"):
+            self._browser = None  # default: no browser
+            try:
+                from ..video_browser import VideoBrowser
+                from ..config import get_cookie_dir
+                import os
+
+                cookie_dir = get_cookie_dir()
+                headless = os.environ.get("CLOAKBROWSER_HEADLESS", "1") == "1"
+
+                self._browser = VideoBrowser(
+                    cookie_dir=cookie_dir,
+                    headless=headless,
+                )
+                logger.info(
+                    f"VideoBrowser ready (headless={headless}, "
+                    f"cookie_dir={cookie_dir})"
+                )
+            except ImportError:
+                logger.info(
+                    "cloakbrowser not installed — browser fallback disabled. "
+                    "Install with: pip install cloakbrowser"
+                )
+            except Exception as e:
+                logger.warning(f"VideoBrowser init failed: {e}")
+        return self._browser
