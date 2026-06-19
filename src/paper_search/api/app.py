@@ -187,40 +187,18 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         send_fn=_task_send_fn,
     )
 
-    async def _handle_chat_message(msg: dict):
-        """处理用户 chat 消息 → Plan Graph astream_events()。"""
+    async def _process_graph_stream(graph_input):
+        """处理 Plan Graph astream_events() 的事件流。
+
+        对初始输入和 resume(Command) 统一使用此函数。
+        """
         nonlocal _pending_graph
 
         graph = await _get_plan_graph(task_adapter=task_adapter)
-        content = (msg.get("payload") or {}).get("content", "")
-        seq = msg.get("seq", 0)
 
-        # ── 前台→后台 切换（v7.0: task 类型）────
-        # 用户发新消息 → 当前前台任务转入后台（不可逆）
-        foreground_task = get_db().get_foreground_task(session_id)
-        if foreground_task:
-            ft_id = foreground_task.get("id", "")
-            try:
-                get_db().set_task_mode(ft_id, "background")
-                get_db().update_agent_task(ft_id, status="running")
-            except Exception:
-                pass
-            await task_adapter.on_task_backgrounded(ft_id, reason="user_new_message")
-
-        # 保存用户消息
-        await store.save_user_message(agent_id, session_id, seq, msg.get("payload", {}))
-
-        # 构建输入
-        user_input = {
-            "messages": [{"role": "user", "content": content}],
-            "session_id": session_id,
-            "agent_id": agent_id,
-        }
-
-        # 流式执行 Plan Graph
         try:
             async for event in graph.astream_events(
-                user_input, config=_graph_config, version="v1",
+                graph_input, config=_graph_config, version="v2",
             ):
                 kind = event.get("event", "")
                 name = event.get("name", "")
@@ -261,6 +239,19 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                             payload=plan_payload,
                         ))
                         _pending_graph = graph
+
+                    elif name == "await_permissions" and pending_review:
+                        # 发送 review(permissions) — 权限确认（当前自动授予）
+                        perm_payload = pending_review.get("payload", {})
+                        await _send_and_store(_envelope(
+                            type="review", subType="permissions", priority=2, seq=0,
+                            payload=perm_payload,
+                        ))
+                        # 自动批准所有权限
+                        from langgraph.types import Command
+                        await _process_graph_stream(
+                            Command(resume={"permissions_granted": True})
+                        )
 
                     elif name == "execute_plan":
                         await _send_and_store(_envelope(
@@ -314,19 +305,46 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 payload={"message": f"Execution error: {e}", "recoverable": True},
             ))
 
-    async def _handle_review_response(msg: dict):
-        """处理用户 review 回复 → graph.aresume()。"""
-        nonlocal _pending_graph
+    async def _handle_chat_message(msg: dict):
+        """处理用户 chat 消息 → Plan Graph astream_events()。"""
+        content = (msg.get("payload") or {}).get("content", "")
+        seq = msg.get("seq", 0)
 
-        graph = await _get_plan_graph(task_adapter=task_adapter)
+        # ── 前台→后台 切换（v7.0: task 类型）────
+        # 用户发新消息 → 当前前台任务转入后台（不可逆）
+        foreground_task = get_db().get_foreground_task(session_id)
+        if foreground_task:
+            ft_id = foreground_task.get("id", "")
+            try:
+                get_db().set_task_mode(ft_id, "background")
+                get_db().update_agent_task(ft_id, status="running")
+            except Exception:
+                pass
+            await task_adapter.on_task_backgrounded(ft_id, reason="user_new_message")
+
+        # 保存用户消息
+        await store.save_user_message(agent_id, session_id, seq, msg.get("payload", {}))
+
+        # 构建输入
+        user_input = {
+            "messages": [{"role": "user", "content": content}],
+            "session_id": session_id,
+            "agent_id": agent_id,
+        }
+
+        await _process_graph_stream(user_input)
+
+    async def _handle_review_response(msg: dict):
+        """处理用户 review 回复 → graph ainvoke(Command(resume=...))."""
+        from langgraph.types import Command
+
         msg_sub = msg.get("subType", "")
         payload = msg.get("payload", {})
 
         if msg_sub == "clarify":
             answers = payload.get("answers", [])
-            await graph.aresume(
-                _graph_config,
-                {"user_clarification": {"answers": answers}},
+            await _process_graph_stream(
+                Command(resume={"user_clarification": {"answers": answers}})
             )
         elif msg_sub == "plan":
             confirmed = payload.get("confirmed", False)
@@ -339,9 +357,8 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                     mode="foreground",
                     total_stages=len(payload.get("steps", [])) or 7,
                 )
-                await graph.aresume(
-                    _graph_config,
-                    {"user_approval": {"confirmed": True, "modifications": payload.get("modifications", {})}},
+                await _process_graph_stream(
+                    Command(resume={"user_approval": {"confirmed": True, "modifications": payload.get("modifications", {})}})
                 )
             else:
                 await _send_and_store(_envelope(
@@ -350,15 +367,15 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 ))
 
     async def _handle_tool_result(msg: dict):
-        """处理 iOS tool(result) → graph.aresume()。"""
-        graph = await _get_plan_graph(task_adapter=task_adapter)
+        """处理 iOS tool(result) → graph ainvoke(Command(resume=...))."""
+        from langgraph.types import Command
+
         payload = msg.get("payload", {})
         tool_call_id = payload.get("tool_call_id", "")
         content = payload.get("content", "")
         error = payload.get("error", "")
-        await graph.aresume(
-            _graph_config,
-            {"tool_result": {"tool_call_id": tool_call_id, "content": content, "error": error}},
+        await _process_graph_stream(
+            Command(resume={"tool_result": {"tool_call_id": tool_call_id, "content": content, "error": error}})
         )
 
     async def _handle_task_control(msg: dict):

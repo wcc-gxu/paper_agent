@@ -75,7 +75,7 @@ def _paper_to_dict(paper) -> dict:
     }
 
 
-async def main():
+async def _main():
     parser = build_parser()
     args = parser.parse_args()
 
@@ -195,5 +195,9 @@ async def main():
     output_json(output)
 
 
+def main():
+    return run_async(_main())
+
+
 if __name__ == "__main__":
-    sys.exit(run_async(main()))
+    sys.exit(main())

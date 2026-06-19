@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def main():
+async def _main():
     parser = build_parser()
     args = parser.parse_args()
 
@@ -112,5 +112,9 @@ async def main():
     })
 
 
+def main():
+    return run_async(_main())
+
+
 if __name__ == "__main__":
-    sys.exit(run_async(main()))
+    sys.exit(main())

@@ -108,7 +108,7 @@ async def _index_single(store, db, paper_id: str, index_type: str) -> dict:
     return result
 
 
-async def main():
+async def _main():
     parser = build_parser()
     args = parser.parse_args()
 
@@ -192,5 +192,9 @@ async def main():
     })
 
 
+def main():
+    return run_async(_main())
+
+
 if __name__ == "__main__":
-    sys.exit(run_async(main()))
+    sys.exit(main())

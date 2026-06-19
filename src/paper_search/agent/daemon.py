@@ -144,9 +144,14 @@ class AgentBootstrap:
         # 5. 编译 PlanGraph
         from ..agent.graphs.plan_graph import PlanGraph
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        import aiosqlite
 
         pg = PlanGraph(llm=self._llm, tools=self._tools, memory=self._memory, db=self._db)
-        checkpointer = AsyncSqliteSaver.from_conn_string(str(db_path))
+        self._aiosqlite_conn = await aiosqlite.connect(str(db_path))
+        await self._aiosqlite_conn.execute("PRAGMA journal_mode=WAL")
+        await self._aiosqlite_conn.execute("PRAGMA busy_timeout=30000")
+        checkpointer = AsyncSqliteSaver(conn=self._aiosqlite_conn)
+        await checkpointer.setup()
         self._graph = pg.compile(checkpointer=checkpointer)
 
         # 6. 从 checkpoint 恢复状态
@@ -201,9 +206,14 @@ class AgentBootstrap:
         # 5. 编译 PlanGraph
         from ..agent.graphs.plan_graph import PlanGraph
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        import aiosqlite
 
         pg = PlanGraph(llm=self._llm, tools=self._tools, memory=self._memory, db=self._db)
-        checkpointer = AsyncSqliteSaver.from_conn_string(str(db_path))
+        self._aiosqlite_conn = await aiosqlite.connect(str(db_path))
+        await self._aiosqlite_conn.execute("PRAGMA journal_mode=WAL")
+        await self._aiosqlite_conn.execute("PRAGMA busy_timeout=30000")
+        checkpointer = AsyncSqliteSaver(conn=self._aiosqlite_conn)
+        await checkpointer.setup()
         self._graph = pg.compile(checkpointer=checkpointer)
         logger.info("PlanGraph compiled")
 
