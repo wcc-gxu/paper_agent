@@ -819,16 +819,12 @@ def subscription_check_task(self) -> dict:
 
                     if new_papers:
                         total_new += len(new_papers)
-                        # Publish notification via Redis Pub/Sub for API process
-                        reporter.publish_report(
-                            task_id, "subscription", "check",
-                            paper_total=len(new_papers),
-                            extra={
-                                "subscription_id": sub_id,
-                                "subscription_name": sub_name,
-                                "new_papers": new_papers,
-                            },
-                        )
+                        # Publish notification via Redis Pub/Sub → API process
+                        reporter.publish_notification({
+                            "subscription_id": sub_id,
+                            "subscription_name": sub_name,
+                            "new_papers": new_papers,
+                        })
                         logger.info(
                             f"Subscription '{sub_name}': {len(new_papers)} new papers"
                         )

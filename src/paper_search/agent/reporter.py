@@ -150,3 +150,25 @@ class Reporter:
         except Exception as e:
             logger.warning(f"Failed to publish report to {channel}: {e}")
 
+    def publish_notification(self, notification: dict):
+        """发布跨进程通知到 agent:notifications channel。
+
+        Celery Worker → API 进程的桥接通道。
+        API 进程的 start_notification_listener() 订阅此 channel。
+
+        Args:
+            notification: 通知数据 dict，含 subscription_id/new_papers 等
+        """
+        channel = "agent:notifications"
+        try:
+            self.redis.publish(
+                channel,
+                json.dumps(notification, ensure_ascii=False, default=str),
+            )
+            logger.debug(
+                f"Published notification to {channel}: "
+                f"sub={notification.get('subscription_id', '?')}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish notification to {channel}: {e}")
+

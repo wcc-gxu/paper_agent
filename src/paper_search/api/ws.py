@@ -188,6 +188,8 @@ async def start_notification_listener(
             subscription_name = data.get("subscription_name", "")
             new_papers = data.get("new_papers", [])
 
+            from datetime import datetime, timezone
+
             envelope = {
                 "role": "system",
                 "type": "subscription",
@@ -196,6 +198,7 @@ async def start_notification_listener(
                 "sessionId": "main",
                 "seq": 0,
                 "priority": 2,
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "payload": {
                     "subscription_id": subscription_id,
                     "subscription_name": subscription_name,
