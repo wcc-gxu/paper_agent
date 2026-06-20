@@ -258,41 +258,6 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
     await ws_manager.disconnect(agent_id, session_id, websocket)
 
 
-# ── Plan Graph 惰性初始化 ──────────────────────────────
-
-_graph = None
-_saver = None
-_aiosqlite_conn = None
-
-async def _get_plan_graph(task_adapter=None):
-    """惰性初始化 LangGraph Plan Graph（异步，需要 aiosqlite 连接）。
-
-    Args:
-        task_adapter: TaskEventAdapter 实例（用于 task WS 消息推送）
-    """
-    global _graph, _saver, _aiosqlite_conn
-    if _graph is None:
-        import aiosqlite
-        from ..agent.graphs.plan_graph import PlanGraph
-        from ..agent.tool_registry import ToolRegistry
-        from ..agent.memory import MemoryManager
-        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-        llm = get_llm()
-        db = get_db()
-        chroma = get_chroma()
-        tools = ToolRegistry.get_instance()
-        memory = MemoryManager(db, chroma)
-        pg = PlanGraph(llm=llm, tools=tools, memory=memory, db=db,
-                       task_adapter=task_adapter)
-        _aiosqlite_conn = await aiosqlite.connect(str(db.db_path))
-        await _aiosqlite_conn.execute("PRAGMA journal_mode=WAL")
-        await _aiosqlite_conn.execute("PRAGMA busy_timeout=30000")
-        _saver = AsyncSqliteSaver(conn=_aiosqlite_conn)
-        await _saver.setup()
-        _graph = pg.compile(checkpointer=_saver)
-        logger.info("Plan Graph lazily initialized")
-    return _graph
-
 
 # ═══════════════════════════════════════════════════════════════
 # Main
