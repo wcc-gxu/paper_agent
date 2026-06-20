@@ -140,172 +140,117 @@ app.include_router(router)
 
 @app.websocket("/ws/chat/{agent_id}/{session_id}")
 async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
-    """WebSocket 对话通道 — 完整协议 v7.0 实现.
+    """WebSocket 中继 — v9.0 无握手协议。
 
-    协议见 docs/development/websocket-protocol.md
+    - 连接即用，不需要握手
+    - 收消息 → LPUSH Redis → Daemon 消费
+    - Daemon 回复 → Pub/Sub → WS send → iOS
+    - 永不主动断开连接
     """
     import json as _json
     import asyncio as _asyncio
-    from datetime import datetime, timezone
 
     await websocket.accept()
     await ws_manager.connect(agent_id, session_id, websocket)
     logger.info(f"WS connected: agent={agent_id}, session={session_id}")
 
-    # ── Redis 连接 ──────────────────────────────────────
-    try:
-        import redis.asyncio as aioredis
-        _redis = aioredis.from_url(
-            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-            decode_responses=True,
-        )
-    except Exception as e:
-        logger.warning(f"Redis unavailable for WS relay: {e}")
-        _redis = None
+    # ── Redis 连接 (带重试) ────────────────────────────
+    _redis = None
+    for attempt in range(3):
+        try:
+            import redis.asyncio as aioredis
+            _redis = aioredis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                decode_responses=True,
+            )
+            await _redis.ping()
+            break
+        except Exception as e:
+            logger.warning(f"Redis connect attempt {attempt+1}/3: {e}")
+            await _asyncio.sleep(1)
+    if not _redis:
+        await websocket.close(code=1011, reason="Redis unavailable")
+        return
 
     ws_queue = f"agent:ws:{agent_id}"
     output_channel = f"agent:output:{agent_id}:{session_id}"
-    handshake_done = False
 
     # ── 后台 Task: Redis Pub/Sub → WebSocket ───────────
     async def _output_relay():
-        if not _redis:
-            return
-        try:
-            pubsub = _redis.pubsub()
-            await pubsub.subscribe(output_channel)
-            logger.debug(f"Output relay started: {output_channel}")
-            async for msg in pubsub.listen():
-                if msg["type"] != "message":
-                    continue
-                try:
-                    data = _json.loads(msg["data"])
-                    text = _json.dumps(data, ensure_ascii=False, default=str)
-                    await websocket.send_text(text)
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f"Output relay ended: {e}")
-
-    relay_task = _asyncio.create_task(_output_relay()) if _redis else None
-
-    def _now() -> str:
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def _envelope(**overrides) -> dict:
-        """构建符合协议的信封。默认 role=assistant。"""
-        defaults = {
-            "role": "assistant", "type": "error", "subType": "INTERNAL_ERROR",
-            "agentId": agent_id, "sessionId": session_id,
-            "seq": 0, "priority": 2, "timestamp": _now(), "payload": {},
-        }
-        return defaults | overrides
-
-    async def _send_json(data: dict):
-        """发送 JSON 到 WebSocket（不含持久化，daemon 负责记录）。"""
-        text = _json.dumps(data, ensure_ascii=False, default=str)
-        await websocket.send_text(text)
-
-    # ── 主消息循环 ────────────────────────────────────────
-
-    try:
+        """订阅 Daemon output channel，转发到 WebSocket。不断线重连。"""
         while True:
+            try:
+                pubsub = _redis.pubsub()
+                await pubsub.subscribe(output_channel)
+                logger.debug(f"Output relay subscribed: {output_channel}")
+                async for msg in pubsub.listen():
+                    if msg["type"] != "message":
+                        continue
+                    try:
+                        await websocket.send_text(msg["data"])
+                    except Exception:
+                        pass  # 客户端可能已断开，不 crash
+            except Exception as e:
+                logger.warning(f"Output relay error, reconnecting: {e}")
+                await _asyncio.sleep(1)
+
+    relay_task = _asyncio.create_task(_output_relay())
+
+    # ── Redis LPUSH helper ──────────────────────────────
+    async def _push_to_redis(msg: dict):
+        """推送消息到 Redis 队列，失败重试 3 次。"""
+        msg["_session_id"] = session_id
+        msg["_agent_id"] = agent_id
+        data = _json.dumps(msg, ensure_ascii=False, default=str)
+        for attempt in range(3):
+            try:
+                await _redis.lpush(ws_queue, data)
+                return True
+            except Exception as e:
+                logger.warning(f"Redis LPUSH attempt {attempt+1}/3: {e}")
+                await _asyncio.sleep(0.5)
+        return False
+
+    # ── 主消息循环 (永不主动断开) ──────────────────────
+    while True:
+        try:
             raw = await websocket.receive_text()
+        except WebSocketDisconnect:
+            logger.info(f"WS client disconnected: agent={agent_id}, session={session_id}")
+            break
+        except Exception as e:
+            logger.warning(f"WS recv error: {e}, continuing...")
+            await _asyncio.sleep(0.5)
+            continue
+
+        # 解析 JSON
+        try:
+            msg = _json.loads(raw)
+        except _json.JSONDecodeError:
+            continue  # 忽略无效 JSON，不断线
+
+        msg_type = msg.get("type", "")
+
+        # 心跳: ping → pong
+        if msg_type == "ping":
             try:
-                msg = _json.loads(raw)
-            except _json.JSONDecodeError:
-                await _send_and_store(_envelope(
-                    type="error", subType="INTERNAL_ERROR",
-                    payload={"message": "Invalid JSON", "recoverable": True},
-                ))
-                continue
-
-            msg_type = msg.get("type", "")
-            msg_sub = msg.get("subType", "")
-            msg_seq = msg.get("seq", 0)
-
-            # ── 握手（v8.0: 本地处理，不跑 PlanGraph）────
-            if not handshake_done and msg_type == "message" and msg_sub == "chat":
-                handshake_done = True
-                db = get_db()
-                existing = db.get_session(agent_id, session_id)
-                if not existing:
-                    db.create_session(agent_id, session_id, title="新对话")
-                history_count = db.get_history_count(agent_id, session_id)
-                active_tasks = db.get_active_tasks(agent_id, session_id)
-
-                await _send_json(_envelope(
-                    type="phase", subType="connected", priority=0, seq=0,
-                    payload={
-                        "sessionTitle": (existing or {}).get("title", "新对话") if existing else "新对话",
-                        "historyCount": history_count,
-                        "activeTasks": [
-                            {
-                                "taskId": t.get("taskId", t.get("id", "")),
-                                "name": t.get("name", "未命名任务"),
-                                "mode": t.get("mode", "foreground"),
-                                "stage": t.get("stage", t.get("status", "")),
-                                "current": t.get("current", 0),
-                                "total": t.get("total", 0),
-                                "status": t.get("status", "pending"),
-                            }
-                            for t in active_tasks
-                        ],
-                    },
-                ))
-                logger.info(f"Handshake: agent={agent_id}, session={session_id}, history={history_count}")
-
-            if not handshake_done:
-                await _send_and_store(_envelope(
-                    type="error", subType="INTERNAL_ERROR",
-                    payload={
-                        "message": "Handshake required — first message must be message(chat) with seq=1",
-                        "recoverable": False,
-                    },
-                ))
-                continue
-
-            # ── 消息分发 (v8.0: LPUSH → Redis → Daemon) ──
-            try:
-                if msg_type == "heartbeat" and msg_sub == "ping":
-                    await _send_and_store(_envelope(
-                        type="heartbeat", subType="pong", priority=0, seq=0, payload={},
-                    ))
-
-                else:
-                    # 所有业务消息 → LPUSH Redis → Daemon 处理
-                    msg["_session_id"] = session_id
-                    msg["_agent_id"] = agent_id
-                    if _redis:
-                        await _redis.lpush(ws_queue, _json.dumps(msg, ensure_ascii=False, default=str))
-                        logger.debug(f"WS → Redis: type={msg_type}, subType={msg_sub}")
-                    else:
-                        await _send_json(_envelope(
-                            type="error", subType="INTERNAL_ERROR",
-                            payload={"message": "Redis unavailable", "recoverable": True},
-                        ))
-
-            except Exception as handler_err:
-                logger.error(f"Message handler error: {handler_err}", exc_info=True)
-                await _send_json(_envelope(
-                    type="error", subType="INTERNAL_ERROR", priority=2, seq=0,
-                    payload={"message": f"Handler error: {handler_err}", "recoverable": True},
-                ))
-
-    except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected: agent={agent_id}, session={session_id}")
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}", exc_info=True)
-    finally:
-        if relay_task:
-            relay_task.cancel()
-            try:
-                await relay_task
-            except _asyncio.CancelledError:
+                await websocket.send_text('{"type":"pong"}')
+            except Exception:
                 pass
-        if _redis:
-            await _redis.close()
-        await ws_manager.disconnect(agent_id, session_id, websocket)
+            continue
+
+        # 所有其他消息 → LPUSH Redis
+        await _push_to_redis(msg)
+
+    # ── 清理 ────────────────────────────────────────────
+    relay_task.cancel()
+    try:
+        await relay_task
+    except _asyncio.CancelledError:
+        pass
+    if _redis:
+        await _redis.close()
+    await ws_manager.disconnect(agent_id, session_id, websocket)
 
 
 # ── Plan Graph 惰性初始化 ──────────────────────────────

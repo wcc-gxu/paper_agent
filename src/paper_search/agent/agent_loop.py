@@ -367,15 +367,11 @@ class AgentLoop:
 
     def _envelope(self, session_id: str, msg_type: str, sub_type: str,
                   **kwargs) -> dict:
-        """构建 WebSocket 协议信封。"""
+        """构建 WebSocket 协议信封 (v9.0: 无 seq, 无 handshake)。"""
         return {
-            "role": "assistant",
             "type": msg_type,
             "subType": sub_type,
-            "agentId": self._agent_id,
             "sessionId": session_id,
-            "seq": 0,
-            "priority": 2 if sub_type in ("reply", "clarify", "plan") else 0,
             "timestamp": _now(),
         } | kwargs
 
