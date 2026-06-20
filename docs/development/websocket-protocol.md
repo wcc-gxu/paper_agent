@@ -14,198 +14,265 @@ ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
 
 | 参数 | 说明 |
 |------|------|
-| `agent_id` | Agent 部署实例标识。默认 `"agent-001"` |
-| `session_id` | 会话标识。默认 `"main"` |
+| `agent_id` | Agent 实例 ID。默认 `"agent-001"` |
+| `session_id` | 会话 ID。默认 `"main"` |
 
 ### 1.2 连接建立
 
-**无握手协议。** iOS 连接成功后立即发送 ping，服务端回复 pong，即开始通信。
+无握手。iOS 连接后立即发 ping，服务端回 pong，开始通信。
 
 ```
-iOS → Server:  WebSocket 连接
-iOS → Server:  {"type": "ping"}
-Server → iOS:  {"type": "pong"}
-              (开始收发业务消息)
+→ {"type":"ping","role":"user","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{}}
+← {"type":"pong","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{}}
 ```
 
-服务端 **永不主动断开连接**。异常时自动重连。
+服务端永不主动断开连接。
 
 ### 1.3 通用信封
 
 ```json
 {
-  "type": "<大类>",
+  "type": "message | tool | ping | pong | error",
   "subType": "<子类>",
+  "role": "user | assistant | tool | system",
+  "agentId": "agent-001",
   "sessionId": "main",
-  "timestamp": "2026-06-20T10:30:00Z",
-  "payload": { ... }
+  "timestamp": "2026-06-20T12:00:00Z",
+  "payload": {}
 }
 ```
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `type` | string | 消息大类: `ping` / `pong` / `phase` / `message` / `tool` / `review` / `error` |
+| `type` | string | 消息大类: `message` / `tool` / `ping` / `pong` / `error` |
 | `subType` | string | 消息子类 |
-| `sessionId` | string | 会话标识 |
-| `timestamp` | string | ISO 8601 UTC 时间戳 |
+| `role` | string | `user`=iOS发出, `assistant`=LLM/服务端发出, `tool`=工具结果, `system`=子Agent状态 |
+| `agentId` | string | Agent 实例 ID |
+| `sessionId` | string | 会话 ID |
+| `timestamp` | string | ISO 8601 UTC |
 | `payload` | object | 消息体 |
 
-**v9.0 移除的字段**: `role`, `agentId`, `seq`, `priority`。
+### 1.4 消息速查全表
 
-### 1.4 消息速查表
-
-| type | subType | 方向 | 说明 |
-|------|---------|:---:|------|
-| `ping` | — | → | 心跳 |
-| `pong` | — | ← | 心跳回复 |
-| `message` | `chat` | → | 用户聊天消息 |
-| `message` | `text` | ← | LLM 流式文本 token |
-| `message` | `reply` | ← | LLM 最终回复 |
-| `phase` | `clarify` | ← | 正在分析需求 |
-| `phase` | `execute` | ← | 正在执行任务 |
-| `phase` | `done` | ← | 本轮完成 |
-| `review` | `clarify` | ← | 需要用户澄清问题 |
-| `review` | `plan` | ← | 方案待确认 |
-| `tool` | `ios_request` | ← | 请求 iOS 执行工具 |
-| `tool` | `result` | → | iOS 工具执行结果 |
-| `error` | `TASK_FAILED` | ← | 任务执行失败 |
-| `error` | `INTERNAL_ERROR` | ← | 内部错误 |
+| type | subType | role | →/← | payload | 说明 |
+|------|---------|------|:---:|------|------|
+| `ping` | — | `user` | → | `{}` | 心跳 |
+| `pong` | — | `assistant` | ← | `{}` | 心跳回复 |
+| `message` | `chat` | `user` | → | `{"content":"..."}` | 用户消息 |
+| `message` | `text` | `assistant` | ← | `{"content":"## 完整回复\n..."}` | LLM 完整回复 |
+| `message` | `thinking` | `assistant` | ← | `{"content":"让我想想...","done":false}` | LLM 思考过程流式 |
+| `tool` | `ask_user_question` | `assistant` | ← | `{"id":"call_1","questions":[...]}` | LLM 请求向用户提问 |
+| `tool` | `ask_user_question` | `user` | → | `{"tool_call_id":"call_1","answers":[...]}` | 用户回答问题 |
+| `tool` | `ios_request` | `assistant` | ← | `{"id":"call_2","name":"share","input":{}}` | 请求 iOS 执行工具 |
+| `tool` | `result` | `tool` | → | `{"tool_call_id":"call_2","content":{}}` | iOS 工具执行结果 |
+| `tool` | `launch_sub_agent` | `assistant` | ← | `{"taskId":"...","agentType":"ingest","query":"..."}` | 启动子Agent |
+| `tool` | `sub_agent_progress` | `system` | ← | `{"taskId":"...","agentType":"ingest","stage":"download","current":5,"total":20}` | 子Agent 进度 |
+| `tool` | `sub_agent_result` | `system` | ← | `{"taskId":"...","agentType":"ingest","status":"done","result":{}}` | 子Agent 结果 |
+| `error` | `TASK_FAILED` | `system` | ← | `{"taskId":"...","message":"..."}` | 任务失败 |
+| `error` | `INTERNAL_ERROR` | `system` | ← | `{"message":"..."}` | 内部错误 |
 
 ---
 
-## 二、消息详细定义
+## 二、消息详述
 
-### 2.1 心跳
-
-```
-→ {"type": "ping"}
-← {"type": "pong"}
-```
-
-iOS 连接后立即发 ping。之后每 30 秒发一次。
-
-### 2.2 用户聊天消息
+### 2.1 `message/chat` — 用户消息 (→)
 
 ```json
-→ {
-  "type": "message",
-  "subType": "chat",
+{
+  "type": "message", "subType": "chat", "role": "user",
+  "agentId": "agent-001", "sessionId": "main",
+  "timestamp": "2026-06-20T12:00:00Z",
   "payload": {
-    "content": "帮我搜索transformer相关论文"
+    "content": "帮我搜索 transformer attention 相关论文"
   }
 }
 ```
 
-### 2.3 LLM 流式文本
+### 2.2 `message/text` — LLM 完整回复 (←)
+
+LLM 完成全部推理后，一次性发送完整文本。不做流式拆分。
 
 ```json
-← {
-  "type": "message",
-  "subType": "text",
+{
+  "type": "message", "subType": "text", "role": "assistant",
+  "agentId": "agent-001", "sessionId": "main",
+  "timestamp": "2026-06-20T12:01:00Z",
   "payload": {
-    "index": 0,
-    "delta": "好的，我来",
+    "content": "## 搜索结果\n\n找到以下相关论文：\n\n1. **Attention Is All You Need** (2017)..."
+  }
+}
+```
+
+### 2.3 `message/thinking` — LLM 思考过程 (←)
+
+流式推送 LLM 推理过程。`done: true` 表示思考结束，`text` 即将到达。
+
+```json
+{
+  "type": "message", "subType": "thinking", "role": "assistant",
+  "agentId": "agent-001", "sessionId": "main",
+  "payload": {
+    "content": "用户想搜索 transformer 论文，我需要先澄清...",
     "done": false
   }
 }
 ```
 
-### 2.4 LLM 最终回复
+---
+
+## 三、Tool 消息详述
+
+### 3.1 `tool/ask_user_question` — LLM 提问用户 (←)
+
+替代旧协议的 `review/clarify` 和 `review/plan`。LLM 通过这个 tool 向用户问任何问题（澄清意图、确认方案、审批权限）。
 
 ```json
-← {
-  "type": "message",
-  "subType": "reply",
+{
+  "type": "tool", "subType": "ask_user_question", "role": "assistant",
+  "agentId": "agent-001", "sessionId": "main",
+  "timestamp": "2026-06-20T12:00:30Z",
   "payload": {
-    "content": "## 研究结果\n\n..."
+    "id": "call_q1",
+    "questions": [
+      {"id": "q1", "question": "你关注 transformer 的哪个子方向？", "type": "text"},
+      {"id": "q2", "question": "论文年份范围？", "type": "choice", "options": ["近1年","近3年","近5年"]}
+    ],
+    "context": "LLM 正在规划搜索方案，需要更多信息"
   }
 }
 ```
 
-### 2.5 用户澄清
+### 3.2 `tool/ask_user_question` — 用户回答 (→)
 
 ```json
-← {
-  "type": "review",
-  "subType": "clarify",
+{
+  "type": "tool", "subType": "ask_user_question", "role": "user",
+  "agentId": "agent-001", "sessionId": "main",
+  "timestamp": "2026-06-20T12:01:00Z",
   "payload": {
-    "message": "请确认以下问题",
-    "questions": [
-      {"id": "q1", "question": "你关注哪个子领域？"}
+    "tool_call_id": "call_q1",
+    "answers": [
+      {"id": "q1", "answer": "attention mechanism"},
+      {"id": "q2", "answer": "近3年"}
     ]
   }
 }
-
-→ {
-  "type": "review",
-  "subType": "clarify",
-  "payload": {
-    "answers": [{"id": "q1", "answer": "attention mechanism"}]
-  }
-}
 ```
 
-### 2.6 方案确认
+### 3.3 `tool/ios_request` — 请求 iOS 执行 (←)
 
 ```json
-← {
-  "type": "review",
-  "subType": "plan",
+{
+  "type": "tool", "subType": "ios_request", "role": "assistant",
+  "agentId": "agent-001", "sessionId": "main",
   "payload": {
-    "goal": "搜索Transformer论文",
-    "steps": [...]
-  }
-}
-
-→ {
-  "type": "review",
-  "subType": "plan",
-  "payload": {
-    "confirmed": true,
-    "taskId": "task-001"
-  }
-}
-```
-
-### 2.7 iOS 工具调用
-
-```json
-← {
-  "type": "tool",
-  "subType": "ios_request",
-  "payload": {
+    "id": "call_ios1",
     "name": "share",
-    "input": {...}
+    "input": {"url": "https://arxiv.org/abs/1706.03762"}
   }
 }
+```
 
-→ {
-  "type": "tool",
-  "subType": "result",
+### 3.4 `tool/result` — iOS 工具返回 (→)
+
+```json
+{
+  "type": "tool", "subType": "result", "role": "tool",
+  "agentId": "agent-001", "sessionId": "main",
   "payload": {
-    "tool_call_id": "call_123",
-    "content": {...}
+    "tool_call_id": "call_ios1",
+    "content": {"success": true}
+  }
+}
+```
+
+### 3.5 `tool/launch_sub_agent` — 启动子 Agent (←)
+
+```json
+{
+  "type": "tool", "subType": "launch_sub_agent", "role": "assistant",
+  "agentId": "agent-001", "sessionId": "main",
+  "payload": {
+    "taskId": "task-20260620-001",
+    "agentType": "ingest",
+    "query": "transformer attention mechanism",
+    "estimatedStages": 7
+  }
+}
+```
+
+### 3.6 `tool/sub_agent_progress` — 子 Agent 进度 (←)
+
+```json
+{
+  "type": "tool", "subType": "sub_agent_progress", "role": "system",
+  "agentId": "agent-001", "sessionId": "main",
+  "payload": {
+    "taskId": "task-20260620-001",
+    "agentType": "ingest",
+    "stage": "download",
+    "current": 5,
+    "total": 20,
+    "message": "正在下载第 5/20 篇论文"
+  }
+}
+```
+
+### 3.7 `tool/sub_agent_result` — 子 Agent 结果 (←)
+
+```json
+{
+  "type": "tool", "subType": "sub_agent_result", "role": "system",
+  "agentId": "agent-001", "sessionId": "main",
+  "payload": {
+    "taskId": "task-20260620-001",
+    "agentType": "ingest",
+    "status": "done",
+    "summary": "找到 20 篇论文，下载 15 篇，索引完成",
+    "result": {
+      "totalPapers": 20,
+      "downloaded": 15,
+      "indexed": 15,
+      "surveyPath": "/path/to/survey.md"
+    }
   }
 }
 ```
 
 ---
 
-## 三、架构说明
-
-### 3.1 消息流
+## 四、典型对话流程
 
 ```
-iOS ←→ API Server ←→ Redis ←→ Agent Daemon ←→ Celery Worker
-      (WS relay)    (queue)    (AgentLoop)     (async tasks)
+→ ping
+← pong
+
+→ message/chat                          {"content":"搜索transformer论文"}
+← message/thinking                      {"content":"用户想搜索论文，需要确认方向...","done":false}
+← message/thinking                      {"content":"应该询问子方向和年份范围","done":true}
+← tool/ask_user_question                {"id":"q1","questions":[...]}
+
+→ tool/ask_user_question                {"tool_call_id":"q1","answers":[...]}
+
+← message/thinking                      {"content":"用户确认了方向，现在生成搜索方案","done":true}
+← tool/launch_sub_agent                 {"taskId":"t1","agentType":"ingest","query":"..."}
+← tool/sub_agent_progress               {"taskId":"t1","stage":"search","current":15,"total":20}
+← tool/sub_agent_progress               {"taskId":"t1","stage":"download","current":3,"total":15}
+← tool/sub_agent_result                 {"taskId":"t1","status":"done","summary":"完成","result":{...}}
+← message/thinking                      {"content":"搜索完成，整理结果中","done":true}
+← message/text                          {"content":"## 搜索结果\n\n找到15篇..."}
 ```
 
-1. **API Server** — 纯 WebSocket 中继。收消息 LPUSH Redis，Daemon 回复通过 Pub/Sub 转发 WS
-2. **Agent Daemon** — BRPOP Redis 队列 → LLM tool-calling loop → Pub/Sub 输出
-3. **Celery Worker** — 执行子 Agent 异步任务
+---
 
-### 3.2 连接管理
+## 五、和 v7.0/v8.0 的差异
 
-- **服务端永不主动断开** — 异常时自动恢复
-- **ping/pong 心跳** — iOS 每 30 秒发 ping，服务端立即回 pong
-- **断线重连** — iOS 检测断开后立即重连，无需重新握手
+| | v7.0 | v9.0 |
+|------|------|------|
+| 握手 | `message(chat) seq=1` → `phase(connected)` | 无，直接 ping/pong |
+| `seq` 字段 | 有 | 移除 |
+| `review` 类型 | clarify / plan / task_control | 移除，统一用 `tool/ask_user_question` |
+| `phase` 类型 | connected / clarify / planning / execute / done | 移除，状态由消息序列隐式表达 |
+| LLM 输出 | `message/text` 流式 token | `message/thinking` 流式思考 + `message/text` 完整回复 |
+| 子Agent | `phase/progress` | `tool/sub_agent_progress` + `tool/sub_agent_result` |
+| `role` 字段 | 有 | 保留，增加 `tool` / `system` |

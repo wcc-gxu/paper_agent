@@ -234,7 +234,12 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         # 心跳: ping → pong
         if msg_type == "ping":
             try:
-                await websocket.send_text('{"type":"pong"}')
+                await websocket.send_text(_json.dumps({
+                    "type": "pong",
+                    "role": "assistant",
+                    "agentId": agent_id,
+                    "sessionId": session_id,
+                }, ensure_ascii=False))
             except Exception:
                 pass
             continue
