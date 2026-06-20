@@ -41,11 +41,23 @@ err()  { echo -e "  ${RED}[ERROR]${RESET} $1"; }
 info() { echo -e "  ${CYAN}[INFO]${RESET}  $1"; }
 
 mkdir -p "$PID_DIR"
-_clean_stale_pids
 
 # ══════════════════════════════════════════════════════════
 # Service Check Helpers
 # ══════════════════════════════════════════════════════════
+
+# Clean stale PID files for processes that aren't actually running
+_clean_stale_pids() {
+    for name in api celery_worker celery_beat daemon; do
+        local pid_file="$PID_DIR/${name}.pid"
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -f "$pid_file"
+            fi
+        fi
+    done
+}
 
 redis_running() {
     redis-cli -p "${REDIS_PORT}" ping &>/dev/null
@@ -71,19 +83,6 @@ _wait_for() {
     return 1
 }
 
-# Clean stale PID files for processes that aren't actually running
-_clean_stale_pids() {
-    for name in api celery_worker celery_beat daemon; do
-        local pid_file="$PID_DIR/${name}.pid"
-        if [ -f "$pid_file" ]; then
-            local pid=$(cat "$pid_file")
-            if ! kill -0 "$pid" 2>/dev/null; then
-                rm -f "$pid_file"
-            fi
-        fi
-    done
-}
-
 api_running() {
     curl -s "http://localhost:${API_PORT}/api/health" &>/dev/null
 }
@@ -95,6 +94,8 @@ daemon_running() {
 # ══════════════════════════════════════════════════════════
 # Status
 # ══════════════════════════════════════════════════════════
+
+_clean_stale_pids
 
 show_status() {
     echo ""
