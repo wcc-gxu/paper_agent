@@ -145,17 +145,49 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
     协议见 docs/development/websocket-protocol.md
     """
     import json as _json
+    import asyncio as _asyncio
     from datetime import datetime, timezone
-    from .message_store import MessageStore
 
     await websocket.accept()
     await ws_manager.connect(agent_id, session_id, websocket)
     logger.info(f"WS connected: agent={agent_id}, session={session_id}")
 
+    # ── Redis 连接 ──────────────────────────────────────
+    try:
+        import redis.asyncio as aioredis
+        _redis = aioredis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+        )
+    except Exception as e:
+        logger.warning(f"Redis unavailable for WS relay: {e}")
+        _redis = None
+
+    ws_queue = f"agent:ws:{agent_id}"
+    output_channel = f"agent:output:{agent_id}:{session_id}"
     handshake_done = False
-    store = MessageStore(get_db())
-    _pending_graph = None
-    _graph_config = {"configurable": {"thread_id": f"{agent_id}-{session_id}"}}
+
+    # ── 后台 Task: Redis Pub/Sub → WebSocket ───────────
+    async def _output_relay():
+        if not _redis:
+            return
+        try:
+            pubsub = _redis.pubsub()
+            await pubsub.subscribe(output_channel)
+            logger.debug(f"Output relay started: {output_channel}")
+            async for msg in pubsub.listen():
+                if msg["type"] != "message":
+                    continue
+                try:
+                    data = _json.loads(msg["data"])
+                    text = _json.dumps(data, ensure_ascii=False, default=str)
+                    await websocket.send_text(text)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"Output relay ended: {e}")
+
+    relay_task = _asyncio.create_task(_output_relay()) if _redis else None
 
     def _now() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -169,244 +201,10 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         }
         return defaults | overrides
 
-    def _maybe_create_session() -> tuple[bool, dict | None]:
-        """检查或创建 session。返回 (是否已存在, session_dict)。"""
-        db = get_db()
-        existing = db.get_session(agent_id, session_id)
-        if existing:
-            return True, existing
-        db.create_session(agent_id, session_id, title="新对话")
-        logger.info(f"Auto-created session: agent={agent_id}, session={session_id}")
-        new_session = db.get_session(agent_id, session_id)
-        return False, new_session
-
-    async def _send_and_store(envelope: dict):
-        """发送 WS 消息 + 持久化到 DB。"""
-        text = _json.dumps(envelope, ensure_ascii=False, default=str)
+    async def _send_json(data: dict):
+        """发送 JSON 到 WebSocket（不含持久化，daemon 负责记录）。"""
+        text = _json.dumps(data, ensure_ascii=False, default=str)
         await websocket.send_text(text)
-        await store.save_envelope(envelope)
-
-    # ── TaskEventAdapter ────────────────────────────────────
-    from ..agent.task_event_adapter import TaskEventAdapter
-
-    async def _task_send_fn(envelope: dict):
-        """TaskEventAdapter 的回调：发送 + 持久化 task/message(notification)。"""
-        await _send_and_store(envelope)
-
-    task_adapter = TaskEventAdapter(
-        agent_id=agent_id, session_id=session_id,
-        send_fn=_task_send_fn,
-    )
-
-    async def _process_graph_stream(graph_input):
-        """处理 Plan Graph astream_events() 的事件流。
-
-        对初始输入和 resume(Command) 统一使用此函数。
-        """
-        nonlocal _pending_graph
-
-        graph = await _get_plan_graph(task_adapter=task_adapter)
-
-        try:
-            async for event in graph.astream_events(
-                graph_input, config=_graph_config, version="v2",
-            ):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data", {})
-
-                if kind == "on_chat_model_stream":
-                    chunk = data.get("chunk", {})
-                    if hasattr(chunk, "content") and chunk.content:
-                        await _send_and_store(_envelope(
-                            type="message", subType="text", priority=0,
-                            seq=0,
-                            payload={"index": 0, "delta": str(chunk.content), "done": False},
-                        ))
-
-                elif kind == "on_chain_start" and name == "clarify":
-                    await _send_and_store(_envelope(
-                        type="phase", subType="clarify", priority=0, seq=0,
-                        payload={"stage": "分析需求", "message": "正在分析你的研究需求..."},
-                    ))
-
-                elif kind == "on_chain_end":
-                    output = data.get("output", {}) or {}
-                    pending_review = output.get("pending_review") if isinstance(output, dict) else None
-
-                    if name == "clarify" and pending_review:
-                        # 发送 review(clarify) 给客户端
-                        review_env = _envelope(
-                            type="review", subType="clarify", priority=2, seq=0,
-                            payload=pending_review.get("payload", {}),
-                        )
-                        await _send_and_store(review_env)
-                        _pending_graph = graph  # 等待 resume
-
-                    elif name == "generate_plan" and pending_review:
-                        plan_payload = pending_review.get("payload", {})
-                        await _send_and_store(_envelope(
-                            type="review", subType="plan", priority=2, seq=0,
-                            payload=plan_payload,
-                        ))
-                        _pending_graph = graph
-
-                    elif name == "await_permissions" and pending_review:
-                        # 发送 review(permissions) — 权限确认（当前自动授予）
-                        perm_payload = pending_review.get("payload", {})
-                        await _send_and_store(_envelope(
-                            type="review", subType="permissions", priority=2, seq=0,
-                            payload=perm_payload,
-                        ))
-                        # 自动批准所有权限
-                        from langgraph.types import Command
-                        await _process_graph_stream(
-                            Command(resume={"permissions_granted": True})
-                        )
-
-                    elif name == "execute_plan":
-                        await _send_and_store(_envelope(
-                            type="phase", subType="execute", priority=0, seq=0,
-                            payload={"stage": "执行方案", "message": "正在执行研究方案..."},
-                        ))
-
-                    elif name == "overall_evaluate":
-                        output = output if isinstance(output, dict) else {}
-                        assessment = output.get("evaluate_assessment", "satisfied")
-                        if assessment == "adjust":
-                            await _send_and_store(_envelope(
-                                type="phase", subType="verify", priority=0, seq=0,
-                                payload={"stage": "验证", "message": "结果不足，需要调整策略"},
-                            ))
-                        else:
-                            plan = output.get("plan", {}) or {}
-                            results = plan.get("execution_results", [])
-                            reply_content = f"## 研究完成\n\n已完成 {len(results)} 个子任务。"
-                            await _send_and_store(_envelope(
-                                type="message", subType="reply", priority=1, seq=0,
-                                payload={"content": reply_content},
-                            ))
-                            await _send_and_store(_envelope(
-                                type="phase", subType="done", priority=0, seq=0,
-                                payload={"stage": "完成", "message": "全部任务完成"},
-                            ))
-
-                elif kind == "on_tool_start":
-                    tool_name = data.get("name", event.get("name", ""))
-                    if tool_name:
-                        await _send_and_store(_envelope(
-                            type="tool", subType="server", priority=0, seq=0,
-                            payload={"id": event.get("run_id", ""), "name": str(tool_name),
-                                     "input": {}, "status": "running"},
-                        ))
-
-                elif kind == "on_tool_end":
-                    tool_name = data.get("name", event.get("name", ""))
-                    if tool_name:
-                        await _send_and_store(_envelope(
-                            type="tool", subType="server", priority=0, seq=0,
-                            payload={"id": event.get("run_id", ""), "name": str(tool_name),
-                                     "input": {}, "status": "done"},
-                        ))
-
-        except Exception as e:
-            logger.error(f"Plan Graph execution error: {e}", exc_info=True)
-            await _send_and_store(_envelope(
-                type="error", subType="TASK_FAILED", priority=2, seq=0,
-                payload={"message": f"Execution error: {e}", "recoverable": True},
-            ))
-
-    async def _handle_chat_message(msg: dict):
-        """处理用户 chat 消息 → Plan Graph astream_events()。"""
-        content = (msg.get("payload") or {}).get("content", "")
-        seq = msg.get("seq", 0)
-
-        # ── 前台→后台 切换（v7.0: task 类型）────
-        # 用户发新消息 → 当前前台任务转入后台（不可逆）
-        foreground_task = get_db().get_foreground_task(session_id)
-        if foreground_task:
-            ft_id = foreground_task.get("id", "")
-            try:
-                get_db().set_task_mode(ft_id, "background")
-                get_db().update_agent_task(ft_id, status="running")
-            except Exception:
-                pass
-            await task_adapter.on_task_backgrounded(ft_id, reason="user_new_message")
-
-        # 保存用户消息
-        await store.save_user_message(agent_id, session_id, seq, msg.get("payload", {}))
-
-        # 构建输入
-        user_input = {
-            "messages": [{"role": "user", "content": content}],
-            "session_id": session_id,
-            "agent_id": agent_id,
-        }
-
-        await _process_graph_stream(user_input)
-
-    async def _handle_review_response(msg: dict):
-        """处理用户 review 回复 → graph ainvoke(Command(resume=...))."""
-        from langgraph.types import Command
-
-        msg_sub = msg.get("subType", "")
-        payload = msg.get("payload", {})
-
-        if msg_sub == "clarify":
-            answers = payload.get("answers", [])
-            await _process_graph_stream(
-                Command(resume={"user_clarification": {"answers": answers}})
-            )
-        elif msg_sub == "plan":
-            confirmed = payload.get("confirmed", False)
-            if confirmed:
-                task_id = payload.get("taskId", "")
-                # v7.0: 方案批准 → 立即发送 task(started, mode=foreground)
-                await task_adapter.on_task_started(
-                    task_id=task_id,
-                    name=payload.get("goal", "论文调研"),
-                    mode="foreground",
-                    total_stages=len(payload.get("steps", [])) or 7,
-                )
-                await _process_graph_stream(
-                    Command(resume={"user_approval": {"confirmed": True, "modifications": payload.get("modifications", {})}})
-                )
-            else:
-                await _send_and_store(_envelope(
-                    type="message", subType="plan_rejected", priority=2, seq=0,
-                    payload={"taskId": payload.get("taskId", ""), "reason": payload.get("reason", "User rejected")},
-                ))
-
-    async def _handle_tool_result(msg: dict):
-        """处理 iOS tool(result) → graph ainvoke(Command(resume=...))."""
-        from langgraph.types import Command
-
-        payload = msg.get("payload", {})
-        tool_call_id = payload.get("tool_call_id", "")
-        content = payload.get("content", "")
-        error = payload.get("error", "")
-        await _process_graph_stream(
-            Command(resume={"tool_result": {"tool_call_id": tool_call_id, "content": content, "error": error}})
-        )
-
-    async def _handle_task_control(msg: dict):
-        """处理 task_control → 暂停/恢复/取消。"""
-        payload = msg.get("payload", {})
-        action = payload.get("action", "pause")
-        task_id = payload.get("taskId", "")
-        db = get_db()
-        status_map = {"pause": "paused", "resume": "running", "cancel": "cancelled"}
-        new_status = status_map.get(action, "paused")
-        if task_id:
-            try:
-                db.update_agent_task(task_id, status=new_status)
-            except Exception:
-                pass
-        await _send_and_store(_envelope(
-            type="phase", subType="paused" if action == "pause" else "execute",
-            priority=0, seq=0,
-            payload={"taskId": task_id, "action": action},
-        ))
 
     # ── 主消息循环 ────────────────────────────────────────
 
@@ -426,22 +224,20 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
             msg_sub = msg.get("subType", "")
             msg_seq = msg.get("seq", 0)
 
-            # ── 握手 ──────────────────────────────────────
+            # ── 握手（v8.0: 本地处理，不跑 PlanGraph）────
             if not handshake_done and msg_type == "message" and msg_sub == "chat":
                 handshake_done = True
-                existed, session_data = _maybe_create_session()
+                db = get_db()
+                existing = db.get_session(agent_id, session_id)
+                if not existing:
+                    db.create_session(agent_id, session_id, title="新对话")
+                history_count = db.get_history_count(agent_id, session_id)
+                active_tasks = db.get_active_tasks(agent_id, session_id)
 
-                # 加载重连回放消息
-                replay_msgs = await store.get_replay_messages(agent_id, session_id) if existed else []
-                history_count = get_db().get_history_count(agent_id, session_id) if existed else 0
-                active_tasks = get_db().get_active_tasks(agent_id, session_id) if existed else []
-                session_title = (session_data or {}).get("title", None)
-
-                # 发送 phase(connected) — v7.0 格式含完整任务卡片信息
-                await _send_and_store(_envelope(
+                await _send_json(_envelope(
                     type="phase", subType="connected", priority=0, seq=0,
                     payload={
-                        "sessionTitle": session_title,
+                        "sessionTitle": (existing or {}).get("title", "新对话") if existing else "新对话",
                         "historyCount": history_count,
                         "activeTasks": [
                             {
@@ -457,15 +253,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                         ],
                     },
                 ))
-                logger.info(f"Handshake: agent={agent_id}, session={session_id}, existed={existed}, history={history_count}")
-
-                # 回放过期 review 和 error
-                for rmsg in replay_msgs:
-                    await ws_manager.broadcast(agent_id, session_id, rmsg)
-
-                # 处理首条 chat 消息
-                await _handle_chat_message(msg)
-                continue
+                logger.info(f"Handshake: agent={agent_id}, session={session_id}, history={history_count}")
 
             if not handshake_done:
                 await _send_and_store(_envelope(
@@ -477,35 +265,20 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 ))
                 continue
 
-            # ── 消息分发 ───────────────────────────────────
+            # ── 消息分发 (v8.0: LPUSH → Redis → Daemon) ──
             try:
-                key = (msg_type, msg_sub)
-
                 if msg_type == "heartbeat" and msg_sub == "ping":
                     await _send_and_store(_envelope(
                         type="heartbeat", subType="pong", priority=0, seq=0, payload={},
                     ))
 
-                elif key == ("message", "chat"):
-                    await _handle_chat_message(msg)
-
-                elif key == ("review", "clarify"):
-                    await store.save_envelope(msg)
-                    await _handle_review_response(msg)
-
-                elif key == ("review", "plan"):
-                    await store.save_envelope(msg)
-                    await _handle_review_response(msg)
-
-                elif key == ("review", "task_control"):
-                    await _handle_task_control(msg)
-
-                elif key == ("tool", "result"):
-                    await store.save_envelope(msg)
-                    await _handle_tool_result(msg)
-
                 else:
-                    logger.debug(f"Unhandled WS message: type={msg_type}, subType={msg_sub}")
+                    # 所有业务消息 → LPUSH Redis → Daemon 处理
+                    msg["_session_id"] = session_id
+                    msg["_agent_id"] = agent_id
+                    _redis.lpush(ws_queue, _json.dumps(msg, ensure_ascii=False, default=str))
+                    logger.debug(f"WS → Redis: type={msg_type}, subType={msg_sub}")
+
             except Exception as handler_err:
                 logger.error(f"Message handler error: {handler_err}", exc_info=True)
                 await _send_and_store(_envelope(
@@ -518,6 +291,14 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
     except Exception as e:
         logger.error(f"WebSocket error: {e}", exc_info=True)
     finally:
+        if relay_task:
+            relay_task.cancel()
+            try:
+                await relay_task
+            except _asyncio.CancelledError:
+                pass
+        if _redis:
+            await _redis.close()
         await ws_manager.disconnect(agent_id, session_id, websocket)
 
 
