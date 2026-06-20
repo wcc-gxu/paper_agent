@@ -255,7 +255,7 @@ class AgentLoop:
     async def _tool_launch_sub_agent(
         self, args: dict, session_id: str, output_channel: str,
     ):
-        """tool/launch_sub_agent → tool/sub_agent_progress → tool/sub_agent_result。"""
+        """tool/sub_request → tool/sub_progress → tool/sub_result。"""
         agent_type = args.get("agent_type", "ingest")
         user_query = args.get("query", args.get("description", ""))
         task_id = f"sub-{agent_type}-{_now().replace(':', '').replace('-', '')[:12]}"
@@ -270,10 +270,11 @@ class AgentLoop:
 
         # 通知 iOS: 子Agent 已启动
         await self._push_output(output_channel, self._envelope(
-            session_id, "tool", "launch_sub_agent", role="assistant",
+            session_id, "tool", "sub_request", role="assistant",
             payload={
                 "taskId": task_id,
-                "agentType": agent_type,
+                "name": agent_type,
+                "label": args.get("label", agent_type),
                 "query": user_query,
                 "estimatedStages": 7,
             },
@@ -300,10 +301,10 @@ class AgentLoop:
                 if status in ("done", "failed"):
                     result = data
                     await self._push_output(output_channel, self._envelope(
-                        session_id, "tool", "sub_agent_result", role="system",
+                        session_id, "tool", "sub_result", role="system",
                         payload={
                             "taskId": task_id,
-                            "agentType": agent_type,
+                            "name": agent_type,
                             "status": status,
                             "summary": data.get("summary", data.get("error", "")),
                             "result": data.get("result", data.get("extra", {})),
@@ -313,10 +314,10 @@ class AgentLoop:
 
                 # progress
                 await self._push_output(output_channel, self._envelope(
-                    session_id, "tool", "sub_agent_progress", role="system",
+                    session_id, "tool", "sub_progress", role="system",
                     payload={
                         "taskId": task_id,
-                        "agentType": agent_type,
+                        "name": agent_type,
                         "stage": stage,
                         "current": data.get("paper_index", 0),
                         "total": data.get("paper_total", 0),
@@ -371,7 +372,7 @@ class AgentLoop:
     async def _tool_ios(
         self, tc_id: str, args: dict, session_id: str, output_channel: str,
     ):
-        """tool/ios_request → 等 tool/result(role=tool)。"""
+        """tool/ios_request → 等 tool/ios_result(role=tool)。"""
         tool_name = args.get("tool", args.get("name", "unknown"))
 
         await self._push_output(output_channel, self._envelope(
@@ -379,7 +380,7 @@ class AgentLoop:
             payload={"id": tc_id, "name": tool_name, "input": args},
         ))
 
-        reply = await self._wait_ws_reply(session_id, "tool", "result")
+        reply = await self._wait_ws_reply(session_id, "tool", "ios_result")
         return reply
 
     # ── Helpers ───────────────────────────────────────

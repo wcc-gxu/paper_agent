@@ -46,7 +46,7 @@ ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
 |------|------|------|
 | `type` | string | 消息大类: `message` / `tool` / `ping` / `pong` / `error` |
 | `subType` | string | 消息子类 |
-| `role` | string | `user`=iOS发出, `assistant`=LLM/服务端发出, `tool`=工具结果, `system`=子Agent状态 |
+| `role` | string | `user`=iOS发出, `assistant`=LLM/主Agent发出, `tool`=工具返回, `system`=后台任务状态 |
 | `agentId` | string | Agent 实例 ID |
 | `sessionId` | string | 会话 ID |
 | `timestamp` | string | ISO 8601 UTC |
@@ -54,225 +54,121 @@ ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
 
 ### 1.4 消息速查全表
 
-| type | subType | role | →/← | payload | 说明 |
-|------|---------|------|:---:|------|------|
-| `ping` | — | `user` | → | `{}` | 心跳 |
-| `pong` | — | `assistant` | ← | `{}` | 心跳回复 |
-| `message` | `chat` | `user` | → | `{"content":"..."}` | 用户消息 |
-| `message` | `text` | `assistant` | ← | `{"content":"## 完整回复\n..."}` | LLM 完整回复 |
-| `message` | `thinking` | `assistant` | ← | `{"content":"让我想想...","done":false}` | LLM 思考过程流式 |
-| `tool` | `ask_user_question` | `assistant` | ← | `{"id":"call_1","questions":[...]}` | LLM 请求向用户提问 |
-| `tool` | `ask_user_question` | `user` | → | `{"tool_call_id":"call_1","answers":[...]}` | 用户回答问题 |
-| `tool` | `ios_request` | `assistant` | ← | `{"id":"call_2","name":"share","input":{}}` | 请求 iOS 执行工具 |
-| `tool` | `result` | `tool` | → | `{"tool_call_id":"call_2","content":{}}` | iOS 工具执行结果 |
-| `tool` | `launch_sub_agent` | `assistant` | ← | `{"taskId":"...","agentType":"ingest","query":"..."}` | 启动子Agent |
-| `tool` | `sub_agent_progress` | `system` | ← | `{"taskId":"...","agentType":"ingest","stage":"download","current":5,"total":20}` | 子Agent 进度 |
-| `tool` | `sub_agent_result` | `system` | ← | `{"taskId":"...","agentType":"ingest","status":"done","result":{}}` | 子Agent 结果 |
-| `error` | `TASK_FAILED` | `system` | ← | `{"taskId":"...","message":"..."}` | 任务失败 |
-| `error` | `INTERNAL_ERROR` | `system` | ← | `{"message":"..."}` | 内部错误 |
+| type | subType | role | →/← | 说明 |
+|------|---------|------|:---:|------|
+| `ping` | — | `user` | → | 心跳 |
+| `pong` | — | `assistant` | ← | 心跳回复 |
+| `message` | `chat` | `user` | → | 用户聊天消息 |
+| `message` | `text` | `assistant` | ← | LLM 完整回复 |
+| `message` | `thinking` | `assistant` | ← | LLM 思考过程 (流式) |
+| `tool` | `ios_request` | `assistant` | ← | 请求 iOS 执行工具 |
+| `tool` | `ios_result` | `tool` | → | iOS 工具返回结果 |
+| `tool` | `ask_user_question` | `assistant` | ← | 请求 iOS 向用户提问 |
+| `tool` | `ask_user_question` | `user` | → | 用户回答 |
+| `tool` | `sub_request` | `assistant` | ← | 启动后台任务 (子Agent / CLI tool) |
+| `tool` | `sub_progress` | `system` | ← | 后台任务进度 |
+| `tool` | `sub_result` | `system` | ← | 后台任务结果 |
+| `error` | `TASK_FAILED` | `system` | ← | 任务失败 |
+| `error` | `INTERNAL_ERROR` | `system` | ← | 内部错误 |
 
 ---
 
 ## 二、消息详述
 
-### 2.1 `message/chat` — 用户消息 (→)
+### 2.1 `message` — 用户消息 + LLM 回复
 
 ```json
-{
-  "type": "message", "subType": "chat", "role": "user",
-  "agentId": "agent-001", "sessionId": "main",
-  "timestamp": "2026-06-20T12:00:00Z",
-  "payload": {
-    "content": "帮我搜索 transformer attention 相关论文"
-  }
-}
+// → 用户消息
+{"type":"message","subType":"chat","role":"user","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"content":"搜索transformer论文"}}
+
+// ← LLM 思考过程 (流式，done=false 表示继续，done=true 表示思考结束)
+{"type":"message","subType":"thinking","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"content":"用户想搜索...","done":false}}
+{"type":"message","subType":"thinking","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"content":"","done":true}}
+
+// ← LLM 最终回复 (完整文本)
+{"type":"message","subType":"text","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"content":"## 搜索结果\n\n..."}}
 ```
 
-### 2.2 `message/text` — LLM 完整回复 (←)
+### 2.2 `tool/ios_request` + `tool/ios_result` — iOS 工具
 
-LLM 完成全部推理后，一次性发送完整文本。不做流式拆分。
+LLM 请求 iOS 执行工具（分享、拍照、定位等）。带 `id` 用于关联结果。
 
 ```json
-{
-  "type": "message", "subType": "text", "role": "assistant",
-  "agentId": "agent-001", "sessionId": "main",
-  "timestamp": "2026-06-20T12:01:00Z",
-  "payload": {
-    "content": "## 搜索结果\n\n找到以下相关论文：\n\n1. **Attention Is All You Need** (2017)..."
-  }
-}
+// ← 请求 iOS 执行
+{"type":"tool","subType":"ios_request","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"id":"call_1","name":"share","input":{"url":"https://..."}}}
+
+// → iOS 返回结果
+{"type":"tool","subType":"ios_result","role":"tool","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"tool_call_id":"call_1","content":{"success":true}}}
 ```
 
-### 2.3 `message/thinking` — LLM 思考过程 (←)
+### 2.3 `tool/ask_user_question` — 向用户提问
 
-流式推送 LLM 推理过程。`done: true` 表示思考结束，`text` 即将到达。
+LLM 通过 iOS 向用户提问（澄清意图、确认方案等）。`ask_user_question` 是内置的 iOS tool，LLM 调用它来获取用户输入。带 `id` 用于关联回答。
 
 ```json
-{
-  "type": "message", "subType": "thinking", "role": "assistant",
-  "agentId": "agent-001", "sessionId": "main",
-  "payload": {
-    "content": "用户想搜索 transformer 论文，我需要先澄清...",
-    "done": false
-  }
-}
+// ← LLM 请求向用户提问
+{"type":"tool","subType":"ask_user_question","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"id":"call_q1","questions":[{"id":"q1","question":"你关注哪个子方向？"},{"id":"q2","question":"年份范围？","type":"choice","options":["近1年","近3年","近5年"]}],"context":"正在规划搜索方案"}}
+
+// → 用户回答
+{"type":"tool","subType":"ask_user_question","role":"user","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"tool_call_id":"call_q1","answers":[{"id":"q1","answer":"attention mechanism"},{"id":"q2","answer":"近3年"}]}}
 ```
 
----
+### 2.4 `tool/sub_*` — 后台任务 (子Agent / CLI tool)
 
-## 三、Tool 消息详述
-
-### 3.1 `tool/ask_user_question` — LLM 提问用户 (←)
-
-替代旧协议的 `review/clarify` 和 `review/plan`。LLM 通过这个 tool 向用户问任何问题（澄清意图、确认方案、审批权限）。
+`sub_request` 启动后台任务。`sub_progress` 推送进度。`sub_result` 推送最终结果。三种消息共享同一个 `taskId` 做关联。
 
 ```json
-{
-  "type": "tool", "subType": "ask_user_question", "role": "assistant",
-  "agentId": "agent-001", "sessionId": "main",
-  "timestamp": "2026-06-20T12:00:30Z",
-  "payload": {
-    "id": "call_q1",
-    "questions": [
-      {"id": "q1", "question": "你关注 transformer 的哪个子方向？", "type": "text"},
-      {"id": "q2", "question": "论文年份范围？", "type": "choice", "options": ["近1年","近3年","近5年"]}
-    ],
-    "context": "LLM 正在规划搜索方案，需要更多信息"
-  }
-}
+// ← 启动后台任务
+{"type":"tool","subType":"sub_request","role":"assistant","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"taskId":"task-001","name":"ingest","label":"论文搜索入库","query":"transformer attention","estimatedStages":7}}
+
+// ← 进度推送
+{"type":"tool","subType":"sub_progress","role":"system","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"taskId":"task-001","name":"ingest","stage":"download","current":5,"total":20,"message":"正在下载 5/20"}}
+
+// ← 最终结果
+{"type":"tool","subType":"sub_result","role":"system","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"taskId":"task-001","name":"ingest","status":"done","summary":"找到20篇，下载15篇，索引完成","result":{"totalPapers":20,"downloaded":15}}}
 ```
 
-### 3.2 `tool/ask_user_question` — 用户回答 (→)
+### 2.5 `error` — 错误
 
 ```json
-{
-  "type": "tool", "subType": "ask_user_question", "role": "user",
-  "agentId": "agent-001", "sessionId": "main",
-  "timestamp": "2026-06-20T12:01:00Z",
-  "payload": {
-    "tool_call_id": "call_q1",
-    "answers": [
-      {"id": "q1", "answer": "attention mechanism"},
-      {"id": "q2", "answer": "近3年"}
-    ]
-  }
-}
-```
-
-### 3.3 `tool/ios_request` — 请求 iOS 执行 (←)
-
-```json
-{
-  "type": "tool", "subType": "ios_request", "role": "assistant",
-  "agentId": "agent-001", "sessionId": "main",
-  "payload": {
-    "id": "call_ios1",
-    "name": "share",
-    "input": {"url": "https://arxiv.org/abs/1706.03762"}
-  }
-}
-```
-
-### 3.4 `tool/result` — iOS 工具返回 (→)
-
-```json
-{
-  "type": "tool", "subType": "result", "role": "tool",
-  "agentId": "agent-001", "sessionId": "main",
-  "payload": {
-    "tool_call_id": "call_ios1",
-    "content": {"success": true}
-  }
-}
-```
-
-### 3.5 `tool/launch_sub_agent` — 启动子 Agent (←)
-
-```json
-{
-  "type": "tool", "subType": "launch_sub_agent", "role": "assistant",
-  "agentId": "agent-001", "sessionId": "main",
-  "payload": {
-    "taskId": "task-20260620-001",
-    "agentType": "ingest",
-    "query": "transformer attention mechanism",
-    "estimatedStages": 7
-  }
-}
-```
-
-### 3.6 `tool/sub_agent_progress` — 子 Agent 进度 (←)
-
-```json
-{
-  "type": "tool", "subType": "sub_agent_progress", "role": "system",
-  "agentId": "agent-001", "sessionId": "main",
-  "payload": {
-    "taskId": "task-20260620-001",
-    "agentType": "ingest",
-    "stage": "download",
-    "current": 5,
-    "total": 20,
-    "message": "正在下载第 5/20 篇论文"
-  }
-}
-```
-
-### 3.7 `tool/sub_agent_result` — 子 Agent 结果 (←)
-
-```json
-{
-  "type": "tool", "subType": "sub_agent_result", "role": "system",
-  "agentId": "agent-001", "sessionId": "main",
-  "payload": {
-    "taskId": "task-20260620-001",
-    "agentType": "ingest",
-    "status": "done",
-    "summary": "找到 20 篇论文，下载 15 篇，索引完成",
-    "result": {
-      "totalPapers": 20,
-      "downloaded": 15,
-      "indexed": 15,
-      "surveyPath": "/path/to/survey.md"
-    }
-  }
-}
+{"type":"error","subType":"TASK_FAILED","role":"system","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"taskId":"task-001","message":"搜索超时","recoverable":true}}
+{"type":"error","subType":"INTERNAL_ERROR","role":"system","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{"message":"LLM 调用失败","recoverable":true}}
 ```
 
 ---
 
-## 四、典型对话流程
+## 三、典型对话流程
 
 ```
 → ping
 ← pong
 
-→ message/chat                          {"content":"搜索transformer论文"}
-← message/thinking                      {"content":"用户想搜索论文，需要确认方向...","done":false}
-← message/thinking                      {"content":"应该询问子方向和年份范围","done":true}
-← tool/ask_user_question                {"id":"q1","questions":[...]}
+→ message/chat                         {"content":"搜索transformer论文"}
+← message/thinking                     {"content":"需要确认方向...","done":false}
+← message/thinking                     {"content":"","done":true}
+← tool/ask_user_question               {"id":"q1","questions":[...]}
 
-→ tool/ask_user_question                {"tool_call_id":"q1","answers":[...]}
+→ tool/ask_user_question               {"tool_call_id":"q1","answers":[...]}
 
-← message/thinking                      {"content":"用户确认了方向，现在生成搜索方案","done":true}
-← tool/launch_sub_agent                 {"taskId":"t1","agentType":"ingest","query":"..."}
-← tool/sub_agent_progress               {"taskId":"t1","stage":"search","current":15,"total":20}
-← tool/sub_agent_progress               {"taskId":"t1","stage":"download","current":3,"total":15}
-← tool/sub_agent_result                 {"taskId":"t1","status":"done","summary":"完成","result":{...}}
-← message/thinking                      {"content":"搜索完成，整理结果中","done":true}
-← message/text                          {"content":"## 搜索结果\n\n找到15篇..."}
+← message/thinking                     {"content":"方案生成完毕","done":true}
+← tool/sub_request                     {"taskId":"t1","name":"ingest","query":"..."}
+← tool/sub_progress                    {"taskId":"t1","stage":"search","current":15,"total":20}
+← tool/sub_progress                    {"taskId":"t1","stage":"download","current":3,"total":15}
+← tool/sub_result                      {"taskId":"t1","status":"done","summary":"完成"}
+← message/thinking                     {"content":"整理结果中","done":true}
+← message/text                         {"content":"## 搜索结果\n\n找到15篇..."}
 ```
 
 ---
 
-## 五、和 v7.0/v8.0 的差异
+## 四、和旧版差异
 
 | | v7.0 | v9.0 |
 |------|------|------|
-| 握手 | `message(chat) seq=1` → `phase(connected)` | 无，直接 ping/pong |
-| `seq` 字段 | 有 | 移除 |
-| `review` 类型 | clarify / plan / task_control | 移除，统一用 `tool/ask_user_question` |
-| `phase` 类型 | connected / clarify / planning / execute / done | 移除，状态由消息序列隐式表达 |
-| LLM 输出 | `message/text` 流式 token | `message/thinking` 流式思考 + `message/text` 完整回复 |
-| 子Agent | `phase/progress` | `tool/sub_agent_progress` + `tool/sub_agent_result` |
-| `role` 字段 | 有 | 保留，增加 `tool` / `system` |
+| 握手 | `message(chat) seq=1` → `phase(connected)` | 无，ping/pong |
+| `seq` / `priority` | 有 | 移除 |
+| `review` | clarify/plan/task_control | 移除 → `tool/ask_user_question` |
+| `phase` | connected/clarify/planning/execute/done | 移除 |
+| iOS 工具 | `tool/ios_request` + `tool/result` | `tool/ios_request` + `tool/ios_result` |
+| 子Agent | `phase/progress` | `tool/sub_request` + `tool/sub_progress` + `tool/sub_result` |
+| 用户提问 | `review/clarify` | `tool/ask_user_question` |
