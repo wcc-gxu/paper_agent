@@ -664,13 +664,19 @@ class AgentRunLoop:
 # ═══════════════════════════════════════════════════════════════
 
 
-async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
+async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
+               new_loop: bool = False):
     """daemon 主入口 — bootstrap + AgentRunLoop。
 
     启动流程:
       1. AgentBootstrap.bootstrap() → 创建/恢复 Agent 组件
-      2. 创建 EventBus + AgentRunLoop
+      2. 创建 AgentRunLoop (v1) 或 AgentLoop (v2)
       3. 启动 RunLoop (阻塞直到 SIGTERM/SIGINT)
+
+    Args:
+        data_dir: 数据目录
+        redis_url: Redis URL
+        new_loop: True = 启动新 AgentLoop (v2), False = 原 AgentRunLoop (v1)
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -692,6 +698,27 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
     logger.info(f"  Graph: {type(result['graph']).__name__}")
     logger.info(f"  State: {'restored' if result['state'] else 'fresh'}")
 
+    if new_loop:
+        # ── v2: AgentLoop (WebSocket 驱动) ──
+        from .agent_loop import AgentLoop
+        from .llm_client_v2 import LLMClientV2
+        from .tool_registry import ToolRegistry
+
+        llm = LLMClientV2()
+        tools = ToolRegistry.get_instance()
+
+        agent_loop = AgentLoop(
+            agent_id=agent_id,
+            redis_url=redis,
+            llm=llm,
+            db=result["db"],
+            tools=tools.get_chat_tools() if hasattr(tools, "get_chat_tools") else [],
+        )
+        logger.info("AgentLoop v2 starting (WebSocket-driven)...")
+        await agent_loop.run()
+        return result
+
+    # ── v1: AgentRunLoop (tick-polling) ──
     # 创建 AgentRunLoop (tick-polling 模式)
     loop = AgentRunLoop(
         graph=result["graph"],
