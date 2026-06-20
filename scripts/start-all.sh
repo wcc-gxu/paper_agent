@@ -41,6 +41,7 @@ err()  { echo -e "  ${RED}[ERROR]${RESET} $1"; }
 info() { echo -e "  ${CYAN}[INFO]${RESET}  $1"; }
 
 mkdir -p "$PID_DIR"
+_clean_stale_pids
 
 # ══════════════════════════════════════════════════════════
 # Service Check Helpers
@@ -60,7 +61,7 @@ celery_beat_running() {
 
 # Wait for a process to be confirmed running
 _wait_for() {
-    local name="$1" check_fn="$2" max_wait="${3:-10}"
+    local name="$1" check_fn="$2" max_wait="${3:-15}"
     local waited=0
     while [ $waited -lt $max_wait ]; do
         if $check_fn; then return 0; fi
@@ -68,6 +69,19 @@ _wait_for() {
         waited=$((waited + 1))
     done
     return 1
+}
+
+# Clean stale PID files for processes that aren't actually running
+_clean_stale_pids() {
+    for name in api celery_worker celery_beat daemon; do
+        local pid_file="$PID_DIR/${name}.pid"
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file")
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -f "$pid_file"
+            fi
+        fi
+    done
 }
 
 api_running() {

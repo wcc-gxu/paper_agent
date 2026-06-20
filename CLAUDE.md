@@ -294,8 +294,10 @@ Python >= 3.11
 
 | 模块 | 状态 | 说明 |
 |------|:---:|------|
-| AgentRunLoop + EventBus | ✅ | 4 事件源 + PriorityQueue + Redis BRPOP/PubSub |
-| PlanGraph (主 Agent) | ✅ | 7 节点，含 clarify/approval/permissions |
+| **AgentLoop v2 (新)** | ✅ | WebSocket 驱动, LLM tool-calling loop, BRPOP 非阻塞 |
+| WebSocket 协议 v9.0 | ✅ | 无握手, ping/pong 直连, tool 消息统一, 永不主动断开 |
+| API Server (中继化) | ✅ | 纯收发中继, recv→LPUSH Redis, Pub/Sub→WS send |
+| PlanGraph (原主Agent) | 🔶 | 保留但不再使用, 被 AgentLoop v2 替代 |
 | ExecuteGraph (调度层) | ✅ | 8 种 Agent 完整调度 |
 | 7 种子 Agent | ✅ | Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video |
 | Celery 任务 | ✅ | 9 个 task (含 search/evaluate/rank/sub_agent/subscription_check) |
@@ -304,7 +306,7 @@ Python >= 3.11
 | ToolRegistry | ✅ | 56 个工具注册 |
 | Memory (4 层) | ✅ | 短期/中期/长期/元记忆 |
 | Verifier (引用校验) | ✅ | 3 步校验 (格式/匹配/事实) |
-| FastAPI + WebSocket | ✅ | REST + WS v7.0 + auth + 速率限制 |
+| AgentRunLoop v1 (原) | 🔶 | 保留, daemon.py --new-loop=False 可用 |
 | 启动脚本 | ✅ | `scripts/start-all.sh` (5 服务统一管理) |
 | 文档 | ✅ | 架构/协议/产品规格/CLAUDE.md 完整 |
 | 测试 | 🔶 | 62 passed, 覆盖率 ~11% (6 文件 / 55 模块) |
@@ -313,8 +315,9 @@ Python >= 3.11
 
 | # | 功能 | 工作量 |
 |---|------|:---:|
-| 1 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5天 |
-| 2 | 论文精读 (单篇深度提取) | 2-3天 |
-| 3 | APNs 离线推送 | 3-5天 |
-| 4 | Docker 部署 | 2-3天 |
-| 5 | 测试覆盖率提升 | 持续 |
+| 1 | AgentLoop v2 完整上线 (替掉 v1) | 2-3天 |
+| 2 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5天 |
+| 3 | 论文精读 (单篇深度提取) | 2-3天 |
+| 4 | APNs 离线推送 | 3-5天 |
+| 5 | Docker 部署 | 2-3天 |
+| 6 | 测试覆盖率提升 | 持续 |
