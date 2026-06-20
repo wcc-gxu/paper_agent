@@ -237,4 +237,5 @@ def test_reporter_create():
     reporter = Reporter(redis_url="redis://localhost:6379/0")
     assert reporter is not None
     # reporter 在无 Redis 时不应抛异常（惰性连接）
-    assert reporter._queue == "agent:events"
+    # reporter 内部使用 _events_queue 存储 LPUSH 目标 key
+    assert reporter._events_queue == "agent:events:agent-001"
