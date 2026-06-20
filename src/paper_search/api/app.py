@@ -276,12 +276,18 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                     # 所有业务消息 → LPUSH Redis → Daemon 处理
                     msg["_session_id"] = session_id
                     msg["_agent_id"] = agent_id
-                    _redis.lpush(ws_queue, _json.dumps(msg, ensure_ascii=False, default=str))
-                    logger.debug(f"WS → Redis: type={msg_type}, subType={msg_sub}")
+                    if _redis:
+                        await _redis.lpush(ws_queue, _json.dumps(msg, ensure_ascii=False, default=str))
+                        logger.debug(f"WS → Redis: type={msg_type}, subType={msg_sub}")
+                    else:
+                        await _send_json(_envelope(
+                            type="error", subType="INTERNAL_ERROR",
+                            payload={"message": "Redis unavailable", "recoverable": True},
+                        ))
 
             except Exception as handler_err:
                 logger.error(f"Message handler error: {handler_err}", exc_info=True)
-                await _send_and_store(_envelope(
+                await _send_json(_envelope(
                     type="error", subType="INTERNAL_ERROR", priority=2, seq=0,
                     payload={"message": f"Handler error: {handler_err}", "recoverable": True},
                 ))
