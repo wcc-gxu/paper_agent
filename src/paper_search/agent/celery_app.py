@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 from celery import Celery
+from celery.schedules import crontab
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/1")
@@ -36,6 +37,19 @@ app.conf.update(
     task_max_retries=1,
     broker_connection_retry_on_startup=True,
 )
+
+SUBSCRIPTION_CHECK_INTERVAL_MINUTES = int(
+    os.getenv("SUBSCRIPTION_CHECK_INTERVAL_MINUTES", "60")
+)
+
+# ── Celery Beat: 订阅定时检查 ──
+app.conf.beat_schedule = {
+    "check-subscriptions": {
+        "task": "paper_search.agent.celery_tasks.subscription_check_task",
+        "schedule": crontab(minute=f"*/{max(SUBSCRIPTION_CHECK_INTERVAL_MINUTES, 1)}"),
+        "options": {"queue": "default"},
+    },
+}
 
 # 自动发现 tasks
 app.autodiscover_tasks(["paper_search.agent.celery_tasks"])

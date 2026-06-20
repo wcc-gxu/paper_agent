@@ -90,7 +90,18 @@ def _load_providers():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期 — 启动时初始化，关闭时清理."""
+    import asyncio
+
     logger.info("Paper Agent API starting...")
+
+    # 启动订阅通知监听器 (Redis Pub/Sub → WebSocket 桥接)
+    try:
+        from .ws import start_notification_listener
+        asyncio.create_task(start_notification_listener())
+        logger.info("Subscription notification listener started")
+    except Exception as e:
+        logger.warning(f"Notification listener not started: {e}")
+
     yield
     logger.info("Paper Agent API shutting down...")
     if _db:

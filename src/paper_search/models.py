@@ -162,3 +162,42 @@ class VideoResult(BaseModel):
     transcription_skipped: bool = Field(default=False, description="是否因长视频跳过转录")
     summary: Optional[VideoSummary] = Field(default=None, description="结构化摘要")
     analysis: Optional[VideoAnalysis] = Field(default=None, description="深度分析")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Subscription Models — 每日前沿追踪
+# ═══════════════════════════════════════════════════════════════
+
+
+class Subscription(BaseModel):
+    """研究方向订阅配置。"""
+    id: str = Field(default="", description="订阅 ID")
+    name: str = Field(description="订阅名称，如 'LLM Safety'")
+    keywords: str = Field(description="搜索关键词")
+    sources: list[str] = Field(
+        default_factory=lambda: ["arxiv", "semantic_scholar"],
+        description="搜索来源",
+    )
+    interval_hours: int = Field(default=24, ge=1, description="检查间隔（小时）")
+    last_checked_at: Optional[str] = Field(default=None, description="上次检查时间")
+    last_paper_ids: list[str] = Field(
+        default_factory=list, description="上次发现的论文 ID 列表"
+    )
+    enabled: bool = Field(default=True, description="是否启用")
+    created_at: str = Field(default="", description="创建时间")
+    updated_at: str = Field(default="", description="更新时间")
+
+
+class SubscriptionResult(BaseModel):
+    """订阅推送的单篇论文结果。"""
+    id: int = Field(default=0)
+    subscription_id: str = Field(description="订阅 ID")
+    paper_id: str = Field(description="论文 ID")
+    title: str = Field(default="")
+    authors: list[str] = Field(default_factory=list)
+    year: Optional[int] = None
+    abstract: str = Field(default="")
+    venue: str = Field(default="")
+    source: str = Field(default="")
+    doi: str = Field(default="")
+    pushed_at: str = Field(default="", description="推送时间")

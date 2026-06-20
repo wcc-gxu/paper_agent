@@ -176,6 +176,37 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 CREATE INDEX IF NOT EXISTS idx_videos_project ON videos(project_id);
 CREATE INDEX IF NOT EXISTS idx_videos_platform ON videos(platform);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    keywords TEXT NOT NULL,
+    sources TEXT NOT NULL DEFAULT '["arxiv","semantic_scholar"]',
+    interval_hours INTEGER NOT NULL DEFAULT 24,
+    last_checked_at TEXT,
+    last_paper_ids TEXT DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subscription_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id TEXT NOT NULL REFERENCES subscriptions(id),
+    paper_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    authors TEXT DEFAULT '[]',
+    year INTEGER,
+    abstract TEXT DEFAULT '',
+    venue TEXT DEFAULT '',
+    source TEXT DEFAULT '',
+    doi TEXT DEFAULT '',
+    pushed_at TEXT NOT NULL,
+    delivered_ws INTEGER DEFAULT 0,
+    UNIQUE(subscription_id, paper_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sub_results_sub ON subscription_results(subscription_id);
+CREATE INDEX IF NOT EXISTS idx_sub_results_pushed ON subscription_results(pushed_at);
 """
 
 # 运行时迁移：为旧表添加新列（多表支持）
@@ -781,6 +812,129 @@ class AgentDB:
             (project_id, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ── Subscription CRUD ───────────────────────────────
+
+    def create_subscription(self, name: str, keywords: str,
+                            sources: list[str] = None,
+                            interval_hours: int = 24) -> str:
+        """创建订阅，返回 subscription_id。"""
+        import uuid as _uuid
+        sub_id = str(_uuid.uuid4())[:8]
+        now = self._now()
+        sources_json = json.dumps(sources or ["arxiv", "semantic_scholar"])
+        self.conn.execute(
+            """INSERT INTO subscriptions
+               (id, name, keywords, sources, interval_hours,
+                enabled, created_at, updated_at)
+               VALUES (?,?,?,?,?,1,?,?)""",
+            (sub_id, name, keywords, sources_json, interval_hours, now, now),
+        )
+        self.conn.commit()
+        return sub_id
+
+    def get_subscription(self, subscription_id: str) -> Optional[dict]:
+        """获取订阅详情。"""
+        row = self.conn.execute(
+            "SELECT * FROM subscriptions WHERE id = ?", (subscription_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        for field in ("sources", "last_paper_ids"):
+            if d.get(field):
+                try:
+                    d[field] = json.loads(d[field])
+                except (json.JSONDecodeError, TypeError):
+                    d[field] = []
+        return d
+
+    def list_subscriptions(self, enabled_only: bool = False) -> list[dict]:
+        """列出所有订阅。"""
+        query = "SELECT * FROM subscriptions"
+        params: list = []
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY created_at DESC"
+        rows = self.conn.execute(query, params).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            for field in ("sources", "last_paper_ids"):
+                if d.get(field):
+                    try:
+                        d[field] = json.loads(d[field])
+                    except (json.JSONDecodeError, TypeError):
+                        d[field] = []
+            results.append(d)
+        return results
+
+    def update_subscription(self, subscription_id: str, **kwargs) -> bool:
+        """更新订阅字段。"""
+        kwargs["updated_at"] = self._now()
+        for field in ("sources", "last_paper_ids"):
+            if field in kwargs and isinstance(kwargs[field], list):
+                kwargs[field] = json.dumps(kwargs[field])
+        sets = ", ".join(f"{k}=?" for k in kwargs)
+        vals = list(kwargs.values()) + [subscription_id]
+        self.conn.execute(
+            f"UPDATE subscriptions SET {sets} WHERE id=?", vals
+        )
+        self.conn.commit()
+        return True
+
+    def delete_subscription(self, subscription_id: str) -> bool:
+        """删除订阅及其结果。"""
+        self.conn.execute(
+            "DELETE FROM subscriptions WHERE id = ?", (subscription_id,)
+        )
+        self.conn.execute(
+            "DELETE FROM subscription_results WHERE subscription_id = ?",
+            (subscription_id,),
+        )
+        self.conn.commit()
+        return True
+
+    def save_subscription_result(self, subscription_id: str,
+                                  paper: dict) -> int:
+        """保存单篇论文推送结果（INSERT OR IGNORE 去重）。"""
+        now = self._now()
+        authors_json = json.dumps(paper.get("authors", []), ensure_ascii=False)
+        cursor = self.conn.execute(
+            """INSERT OR IGNORE INTO subscription_results
+               (subscription_id, paper_id, title, authors, year, abstract,
+                venue, source, doi, pushed_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (subscription_id, paper.get("paper_id", ""),
+             paper.get("title", ""), authors_json,
+             paper.get("year"), paper.get("abstract", ""),
+             paper.get("venue", ""), paper.get("source", ""),
+             paper.get("doi", ""), now),
+        )
+        self.conn.commit()
+        return cursor.lastrowid or 0
+
+    def get_subscription_results(self, subscription_id: str,
+                                  since: str = None,
+                                  limit: int = 50) -> list[dict]:
+        """获取订阅的推送历史。"""
+        query = "SELECT * FROM subscription_results WHERE subscription_id = ?"
+        params: list = [subscription_id]
+        if since:
+            query += " AND pushed_at > ?"
+            params.append(since)
+        query += " ORDER BY pushed_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(query, params).fetchall()
+        results = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["authors"] = json.loads(d.get("authors", "[]"))
+            except Exception:
+                d["authors"] = []
+            results.append(d)
+        return results
 
     def close(self):
         if self._conn:

@@ -332,3 +332,531 @@ def survey_task(self, project_id: str, user_query: str) -> dict:
         task_logger.task_error(task_id, error_str, "")
         reporter.report_error(task_id, error_str)
         return {"project_id": project_id, "survey_path": "", "error": error_str}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Feature: Pipeline Stage Tasks (search / evaluate / rank)
+# ═══════════════════════════════════════════════════════════════
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=30)
+def search_task(
+    self,
+    user_query: str,
+    sources: list[str] = None,
+    year_from: int = 2022,
+    max_results: int = 20,
+    project_id: str = "",
+    agent_task_id: str = "",
+) -> dict:
+    """Celery task: 多源搜索论文。
+
+    由 sub_agent_task 编排器或 PipelineRunner.run_via_celery() 分发。
+    """
+    task_id = self.request.id
+    task_logger = _get_logger(agent_task_id or task_id, "ingest")
+    reporter = _get_reporter()
+    db = _get_db()
+
+    try:
+        import asyncio
+        from ..engine import PaperSearchEngine
+        from ..config import Config
+        from ..models import SearchQuery, SourceType
+
+        source_list = sources or ["arxiv", "semantic_scholar"]
+        stypes = [
+            SourceType(s) for s in source_list
+            if s in [x.value for x in SourceType]
+        ]
+        if not stypes:
+            stypes = [SourceType.ARXIV, SourceType.SEMANTIC_SCHOLAR]
+
+        query = SearchQuery(
+            keywords=user_query,
+            sources=stypes,
+            year_from=year_from,
+            max_results=max_results,
+        )
+
+        engine = PaperSearchEngine(Config())
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(engine.search(query))
+        finally:
+            loop.close()
+
+        papers = []
+        for p in result.papers:
+            pid = db.upsert_paper(p)
+            if project_id:
+                db.link_paper_to_project(project_id, pid, relevance_score=0.5)
+            papers.append({
+                "paper_id": pid,
+                "title": p.title,
+                "year": p.year,
+                "abstract": (p.abstract or "")[:500],
+                "authors": p.authors[:10] if p.authors else [],
+                "venue": p.venue or "",
+                "source": p.source.value if hasattr(p.source, "value") else str(p.source),
+                "doi": p.doi or "",
+                "source_url": p.source_url or "",
+            })
+
+        task_logger.stage_done(task_id, "search", {"total": len(papers)})
+        reporter.report_done(task_id, {"papers_found": len(papers)})
+        return {"papers": papers, "total": len(papers), "error": ""}
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"search_task failed: {error_str}")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        task_logger.task_error(task_id, error_str, "")
+        reporter.report_error(task_id, error_str)
+        return {"papers": [], "total": 0, "error": error_str}
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=30)
+def evaluate_task(
+    self,
+    user_query: str,
+    papers: list[dict],
+    project_id: str = "",
+    agent_task_id: str = "",
+) -> dict:
+    """Celery task: LLM 相关性评估。
+
+    对搜索结果进行批量 LLM 评估，返回每篇论文的相关性评分。
+    """
+    task_id = self.request.id
+    task_logger = _get_logger(agent_task_id or task_id, "ingest")
+    reporter = _get_reporter()
+    db = _get_db()
+
+    try:
+        import asyncio
+        from .llm_client_v2 import LLMClientV2
+
+        if not papers:
+            return {"evaluations": [], "relevant_count": 0, "error": ""}
+
+        llm = LLMClientV2()
+
+        # Convert paper dicts for LLM evaluation
+        eval_papers = [
+            {"title": p.get("title", ""), "abstract": p.get("abstract", "")}
+            for p in papers
+        ]
+
+        loop = asyncio.new_event_loop()
+        try:
+            results = loop.run_until_complete(
+                llm.evaluate_batch(eval_papers, user_query)
+            )
+        finally:
+            loop.close()
+
+        evaluations = []
+        relevant_count = 0
+        for i, (paper, eval_result) in enumerate(zip(papers, results)):
+            score = float(getattr(eval_result, "score", eval_result.get("score", 0.5)) if hasattr(eval_result, "get") else getattr(eval_result, "score", 0.5))
+            reason = str(getattr(eval_result, "reason", eval_result.get("reason", "")) if hasattr(eval_result, "get") else getattr(eval_result, "reason", ""))
+
+            is_relevant = score >= 0.5
+            if is_relevant:
+                relevant_count += 1
+
+            if project_id and paper.get("paper_id"):
+                db.link_paper_to_project(
+                    project_id, paper["paper_id"],
+                    relevance_score=score,
+                    relevance_reason=reason,
+                )
+
+            evaluations.append({
+                "paper_id": paper.get("paper_id", ""),
+                "score": score,
+                "reason": reason,
+                "is_relevant": is_relevant,
+            })
+
+        task_logger.stage_done(task_id, "evaluate",
+                               {"total": len(papers), "relevant": relevant_count})
+        reporter.report_done(task_id, {
+            "evaluated": len(papers),
+            "relevant": relevant_count,
+        })
+        return {
+            "evaluations": evaluations,
+            "relevant_count": relevant_count,
+            "error": "",
+        }
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"evaluate_task failed: {error_str}")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        task_logger.task_error(task_id, error_str, "")
+        reporter.report_error(task_id, error_str)
+        return {"evaluations": [], "relevant_count": 0, "error": error_str}
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=30)
+def rank_task(
+    self,
+    papers: list[dict],
+    project_id: str = "",
+    agent_task_id: str = "",
+) -> dict:
+    """Celery task: 期刊等级评定。
+
+    同步执行（JournalRanker 无异步依赖），为有 venue 的论文评定等级。
+    """
+    task_id = self.request.id
+    task_logger = _get_logger(agent_task_id or task_id, "ingest")
+    reporter = _get_reporter()
+    db = _get_db()
+
+    try:
+        from .journal_ranker import JournalRanker
+
+        ranker = JournalRanker()
+        ranks = []
+
+        for paper in papers:
+            venue = paper.get("venue", "")
+            paper_id = paper.get("paper_id", "")
+            if not venue or not paper_id:
+                continue
+
+            rank_result = ranker.rank(venue)
+            level = getattr(rank_result, "unified_level", str(rank_result)) if rank_result else ""
+
+            db.upsert_journal_rank(
+                venue,
+                ccf=getattr(rank_result, "ccf_level", None) if hasattr(rank_result, "ccf_level") else None,
+                sci=getattr(rank_result, "sci_zone", None) if hasattr(rank_result, "sci_zone") else None,
+                unified=level,
+            )
+            if level:
+                db.update_paper_meta(paper_id, unified_level=level)
+
+            ranks.append({"paper_id": paper_id, "venue": venue, "level": level})
+
+        task_logger.stage_done(task_id, "rank", {"total": len(ranks)})
+        reporter.report_done(task_id, {"ranked": len(ranks)})
+        return {"ranks": ranks, "error": ""}
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"rank_task failed: {error_str}")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        task_logger.task_error(task_id, error_str, "")
+        reporter.report_error(task_id, error_str)
+        return {"ranks": [], "error": error_str}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Feature: Sub-Agent Orchestrator (Celery pipeline)
+# ═══════════════════════════════════════════════════════════════
+
+
+@app.task(bind=True, max_retries=0)
+def sub_agent_task(
+    self,
+    user_query: str,
+    sources: list[str] = None,
+    year_from: int = 2022,
+    max_results: int = 20,
+    project_id: str = "",
+    agent_task_id: str = "",
+) -> dict:
+    """Celery 编排器: 完整 7 阶段论文入库流水线。
+
+    顺序: search → evaluate → group(download) → group(convert)
+           → group(index) → rank → survey
+
+    通过 Celery group() 并行处理每篇论文的下载/转换/索引。
+    """
+    from celery import group
+
+    task_id = self.request.id
+    log_id = agent_task_id or task_id
+    task_logger = _get_logger(log_id, "ingest")
+    reporter = _get_reporter()
+
+    stages = {}
+
+    try:
+        # ── Stage 1: Search ──
+        task_logger.stage_start(log_id, "search", 1, 7)
+        search_result = search_task(
+            user_query=user_query,
+            sources=sources or ["arxiv", "semantic_scholar"],
+            year_from=year_from,
+            max_results=max_results,
+            project_id=project_id,
+            agent_task_id=log_id,
+        )
+        stages["search"] = {"total": search_result.get("total", 0)}
+        papers = search_result.get("papers", [])
+
+        if not papers:
+            task_logger.task_done(log_id, {"stages": stages})
+            reporter.report_done(log_id, {"stages": stages})
+            return {"stages": stages, "total_papers": 0, "error": ""}
+
+        # ── Stage 2: Evaluate ──
+        task_logger.stage_start(log_id, "evaluate", 2, 7)
+        eval_result = evaluate_task(
+            user_query=user_query,
+            papers=papers,
+            project_id=project_id,
+            agent_task_id=log_id,
+        )
+        stages["evaluate"] = {"total": len(papers),
+                              "relevant": eval_result.get("relevant_count", 0)}
+
+        # Filter to relevant papers only
+        evals = eval_result.get("evaluations", [])
+        relevant_papers = [
+            papers[i] for i, e in enumerate(evals)
+            if e.get("is_relevant", True) and i < len(papers)
+        ]
+        if not relevant_papers:
+            relevant_papers = papers[:10]  # fallback: top 10
+
+        # ── Stage 3: Download (parallel group) ──
+        task_logger.stage_start(log_id, "download", 3, 7)
+        dl_group = group(
+            download_task.s(
+                paper_id=p["paper_id"],
+                project_id=project_id,
+                title=p.get("title", ""),
+                source=p.get("source", "arxiv"),
+                agent_task_id=log_id,
+                paper_index=i + 1,
+                paper_total=len(relevant_papers),
+            )
+            for i, p in enumerate(relevant_papers)
+        )
+        dl_results = dl_group.apply_async().get(timeout=600)
+        dl_success = [r for r in dl_results if r and r.get("success")]
+        stages["download"] = {
+            "attempted": len(relevant_papers),
+            "succeeded": len(dl_success),
+        }
+
+        # ── Stage 4: Convert (parallel group) ──
+        task_logger.stage_start(log_id, "convert", 4, 7)
+        cv_group = group(
+            convert_task.s(
+                paper_id=r["paper_id"],
+                pdf_path=r.get("local_path", ""),
+                title=next((p.get("title", "") for p in relevant_papers
+                           if p["paper_id"] == r["paper_id"]), ""),
+                project_id=project_id,
+            )
+            for r in dl_success
+        )
+        cv_results = cv_group.apply_async().get(timeout=600)
+        cv_success = [r for r in cv_results if r and r.get("success")]
+        stages["convert"] = {
+            "attempted": len(dl_success),
+            "succeeded": len(cv_success),
+        }
+
+        # ── Stage 5: Index (parallel group) ──
+        task_logger.stage_start(log_id, "index", 5, 7)
+        idx_group = group(
+            index_task.s(
+                paper_id=r["paper_id"],
+                markdown_path=r.get("markdown_path", ""),
+                title=next((p.get("title", "") for p in relevant_papers
+                           if p["paper_id"] == r["paper_id"]), ""),
+                abstract=next((p.get("abstract", "") for p in relevant_papers
+                              if p["paper_id"] == r["paper_id"]), ""),
+                year=next((p.get("year") for p in relevant_papers
+                          if p["paper_id"] == r["paper_id"]), None),
+                source=next((p.get("source", "") for p in relevant_papers
+                            if p["paper_id"] == r["paper_id"]), ""),
+                venue=next((p.get("venue", "") for p in relevant_papers
+                           if p["paper_id"] == r["paper_id"]), ""),
+            )
+            for r in cv_success
+        )
+        idx_results = idx_group.apply_async().get(timeout=600)
+        idx_success = [r for r in idx_results if r and r.get("success")]
+        stages["index"] = {
+            "attempted": len(cv_success),
+            "succeeded": len(idx_success),
+        }
+
+        # ── Stage 6: Rank ──
+        task_logger.stage_start(log_id, "rank", 6, 7)
+        rank_result = rank_task(
+            papers=relevant_papers,
+            project_id=project_id,
+            agent_task_id=log_id,
+        )
+        stages["rank"] = {"ranked": len(rank_result.get("ranks", []))}
+
+        # ── Stage 7: Survey ──
+        task_logger.stage_start(log_id, "survey", 7, 7)
+        survey_result = survey_task(
+            project_id=project_id,
+            user_query=user_query,
+        )
+        stages["survey"] = {"path": survey_result.get("survey_path", "")}
+
+        total_papers = len(papers)
+        task_logger.task_done(log_id, {"stages": stages, "total_papers": total_papers})
+        reporter.report_done(log_id, {
+            "stages": stages,
+            "total_papers": total_papers,
+        })
+        return {"stages": stages, "total_papers": total_papers, "error": ""}
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"sub_agent_task failed: {error_str}")
+        task_logger.task_error(log_id, error_str, "")
+        reporter.report_error(log_id, error_str)
+        return {"stages": stages, "total_papers": 0, "error": error_str}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Feature: Daily Frontier Tracking (subscription check)
+# ═══════════════════════════════════════════════════════════════
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=60)
+def subscription_check_task(self) -> dict:
+    """Celery Beat 定时任务: 检查所有启用订阅，发现新论文。
+
+    由 Celery Beat 定时触发（默认每 60 分钟）。
+    对每个订阅: 搜索 → 对比上次论文 ID → 新论文存入 subscription_results → Pub/Sub 推送。
+    """
+    import asyncio
+
+    task_id = self.request.id
+    task_logger = _get_logger(task_id, "subscription")
+    reporter = _get_reporter()
+    db = _get_db()
+
+    try:
+        subscriptions = db.list_subscriptions(enabled_only=True)
+        if not subscriptions:
+            return {"checked": 0, "new_papers": 0}
+
+        total_new = 0
+        from ..engine import PaperSearchEngine
+        from ..config import Config
+        from ..models import SearchQuery, SourceType
+
+        engine = PaperSearchEngine(Config())
+        loop = asyncio.new_event_loop()
+
+        try:
+            for sub in subscriptions:
+                sub_id = sub["id"]
+                sub_name = sub.get("name", sub_id)
+
+                try:
+                    keywords = sub.get("keywords", "")
+                    sources = sub.get("sources", ["arxiv", "semantic_scholar"])
+                    if isinstance(sources, str):
+                        import json as _json
+                        sources = _json.loads(sources)
+                    last_paper_ids = set(sub.get("last_paper_ids", []))
+
+                    stypes = [
+                        SourceType(s) for s in sources
+                        if s in [x.value for x in SourceType]
+                    ]
+                    if not stypes:
+                        stypes = [SourceType.ARXIV, SourceType.SEMANTIC_SCHOLAR]
+
+                    query = SearchQuery(
+                        keywords=keywords,
+                        sources=stypes,
+                        max_results=20,
+                    )
+                    result = loop.run_until_complete(engine.search(query))
+
+                    # Detect new papers vs last_paper_ids
+                    current_paper_ids = []
+                    new_papers = []
+                    for p in result.papers:
+                        pid = db.upsert_paper(p)
+                        current_paper_ids.append(pid)
+                        if pid not in last_paper_ids:
+                            paper_dict = {
+                                "paper_id": pid,
+                                "title": p.title,
+                                "authors": p.authors[:5] if p.authors else [],
+                                "year": p.year,
+                                "abstract": (p.abstract or "")[:300],
+                                "venue": p.venue or "",
+                                "source": p.source.value if hasattr(p.source, "value") else str(p.source),
+                                "doi": p.doi or "",
+                            }
+                            new_papers.append(paper_dict)
+
+                    # Store results
+                    for paper in new_papers:
+                        db.save_subscription_result(sub_id, paper)
+
+                    # Update subscription state
+                    db.update_subscription(
+                        sub_id,
+                        last_checked_at=db._now(),
+                        last_paper_ids=current_paper_ids,
+                    )
+
+                    if new_papers:
+                        total_new += len(new_papers)
+                        # Publish notification via Redis Pub/Sub for API process
+                        reporter.publish_report(
+                            task_id, "subscription", "check",
+                            paper_total=len(new_papers),
+                            extra={
+                                "subscription_id": sub_id,
+                                "subscription_name": sub_name,
+                                "new_papers": new_papers,
+                            },
+                        )
+                        logger.info(
+                            f"Subscription '{sub_name}': {len(new_papers)} new papers"
+                        )
+
+                except Exception as sub_err:
+                    # Per-subscription isolation — one failure doesn't block others
+                    logger.error(
+                        f"Subscription '{sub_name}' check failed: {sub_err}",
+                        exc_info=True,
+                    )
+                    continue
+
+        finally:
+            loop.close()
+
+        reporter.report_done(task_id, {
+            "subscriptions_checked": len(subscriptions),
+            "new_papers_found": total_new,
+        })
+        return {
+            "checked": len(subscriptions),
+            "new_papers": total_new,
+        }
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"subscription_check_task failed: {error_str}")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        reporter.report_error(task_id, error_str)
+        return {"checked": 0, "new_papers": 0, "error": error_str}

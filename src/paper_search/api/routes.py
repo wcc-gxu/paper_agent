@@ -555,53 +555,74 @@ async def export_project(project_id: str, format: str = "bibtex"):
 # Subscriptions
 # ═══════════════════════════════════════════════════════════════
 
+
 @router.get("/subscriptions")
 async def list_subscriptions():
+    """列出所有订阅。"""
     db = _get_db()
-    rows = db.conn.execute(
-        "SELECT key, value FROM user_profile WHERE key LIKE 'subscription:%'"
-    ).fetchall()
-    subs = []
-    for r in rows:
-        config = _json.loads(r["value"]) if isinstance(r["value"], str) else r["value"]
-        subs.append({
-            "id": r["key"].replace("subscription:", ""),
-            "config": config,
-        })
+    subs = db.list_subscriptions()
     return {"total": len(subs), "subscriptions": subs}
 
 
 @router.post("/subscriptions")
 async def create_subscription(req: SubscriptionRequest):
-    """创建研究方向订阅."""
+    """创建研究方向订阅。"""
     db = _get_db()
-    import uuid as _uuid
-    from datetime import datetime, timezone
-
-    sub_id = str(_uuid.uuid4())[:8]
-    config = {
-        "name": req.name,
-        "keywords": req.keywords,
-        "sources": req.sources,
-        "interval_hours": req.interval_hours,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "last_check": "",
-    }
-    db.conn.execute(
-        "INSERT OR REPLACE INTO user_profile (key, value, updated_at) VALUES (?,?,?)",
-        (f"subscription:{sub_id}", _json.dumps(config, ensure_ascii=False),
-         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+    sub_id = db.create_subscription(
+        name=req.name,
+        keywords=req.keywords,
+        sources=req.sources,
+        interval_hours=req.interval_hours,
     )
-    db.conn.commit()
-    return {"success": True, "subscription_id": sub_id, "config": config}
+    sub = db.get_subscription(sub_id)
+    return {"success": True, "subscription": sub}
 
 
 @router.delete("/subscriptions/{subscription_id}")
 async def delete_subscription(subscription_id: str):
+    """删除订阅及其所有推送结果。"""
     db = _get_db()
-    db.conn.execute(
-        "DELETE FROM user_profile WHERE key = ?",
-        (f"subscription:{subscription_id}",),
-    )
-    db.conn.commit()
-    return {"success": True, "message": f"Subscription {subscription_id} deleted"}
+    sub = db.get_subscription(subscription_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    db.delete_subscription(subscription_id)
+    return {"success": True, "message": f"Subscription '{sub.get('name', subscription_id)}' deleted"}
+
+
+@router.get("/subscriptions/{subscription_id}/results")
+async def list_subscription_results(
+    subscription_id: str,
+    since: Optional[str] = Query(None, description="起始时间 (ISO format)"),
+    limit: int = Query(50, le=200),
+):
+    """获取订阅的推送历史。"""
+    db = _get_db()
+    sub = db.get_subscription(subscription_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    results = db.get_subscription_results(subscription_id, since=since, limit=limit)
+    return {
+        "subscription_id": subscription_id,
+        "subscription_name": sub.get("name", ""),
+        "total": len(results),
+        "results": results,
+    }
+
+
+@router.post("/subscriptions/{subscription_id}/check")
+async def trigger_subscription_check(subscription_id: str):
+    """手动触发一次订阅检查（通过 Celery 异步执行）。"""
+    from ..agent.celery_tasks import subscription_check_task
+
+    db = _get_db()
+    sub = db.get_subscription(subscription_id)
+    if sub is None:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    task = subscription_check_task.delay()
+    return {
+        "success": True,
+        "celery_task_id": task.id,
+        "subscription_name": sub.get("name", ""),
+        "message": f"Check triggered for '{sub.get('name', subscription_id)}'",
+    }

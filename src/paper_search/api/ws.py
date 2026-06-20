@@ -128,3 +128,90 @@ class WebSocketManager:
 
 
 ws_manager = WebSocketManager()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Subscription Notification Bridge
+# ═══════════════════════════════════════════════════════════════
+#
+# Celery Worker (subscription_check_task) 发布新论文通知到
+# Redis Pub/Sub channel "agent:notifications"。
+# API 进程后台订阅该 channel，收到通知后通过 ws_manager
+# 推送给所有连接的客户端。
+
+
+async def start_notification_listener(
+    redis_url: str = "redis://localhost:6379/0",
+    agent_id: str = "agent-001",
+):
+    """后台任务: 监听 Redis Pub/Sub 订阅通知并推送到 WebSocket。
+
+    应在 FastAPI startup 事件中调用:
+        asyncio.create_task(start_notification_listener())
+
+    Args:
+        redis_url: Redis 连接 URL
+        agent_id: 默认 Agent ID (用于 WebSocket 广播)
+    """
+    try:
+        import redis.asyncio as aioredis
+    except ImportError:
+        logger.warning(
+            "redis.asyncio not available — subscription notifications disabled"
+        )
+        return
+
+    channel = "agent:notifications"
+
+    try:
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        pubsub = r.pubsub()
+        await pubsub.subscribe(channel)
+        logger.info(f"Notification listener started on channel: {channel}")
+    except Exception as e:
+        logger.warning(f"Failed to connect notification listener: {e}")
+        return
+
+    try:
+        async for message in pubsub.listen():
+            if message["type"] != "message":
+                continue
+
+            try:
+                import json
+                data = json.loads(message["data"])
+            except Exception:
+                continue
+
+            # Forward to connected WebSocket clients
+            subscription_id = data.get("subscription_id", "")
+            subscription_name = data.get("subscription_name", "")
+            new_papers = data.get("new_papers", [])
+
+            envelope = {
+                "role": "system",
+                "type": "subscription",
+                "subType": "new_papers",
+                "agentId": agent_id,
+                "sessionId": "main",
+                "seq": 0,
+                "priority": 2,
+                "payload": {
+                    "subscription_id": subscription_id,
+                    "subscription_name": subscription_name,
+                    "new_papers": new_papers,
+                    "total_new": len(new_papers),
+                },
+            }
+
+            # Broadcast to all active sessions for the default agent
+            await ws_manager.broadcast_to_agent(agent_id, envelope)
+
+    except Exception as e:
+        logger.warning(f"Notification listener disconnected: {e}")
+    finally:
+        try:
+            await pubsub.unsubscribe(channel)
+            await r.close()
+        except Exception:
+            pass
