@@ -148,6 +148,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
     - 永不主动断开连接
     """
     import json as _json
+    import os
     import asyncio as _asyncio
 
     await websocket.accept()
