@@ -194,12 +194,22 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
             try:
                 pubsub = _redis.pubsub()
                 await pubsub.subscribe(output_channel)
-                logger.debug(f"Output relay subscribed: {output_channel}")
+                logger.info("📡 OUTPUT RELAY subscribed: %s", output_channel)
                 async for msg in pubsub.listen():
                     if msg["type"] != "message":
                         continue
                     try:
-                        await websocket.send_text(msg["data"])
+                        data = msg["data"]
+                        # 快速解析 type/subType 用于日志
+                        try:
+                            env = _json.loads(data)
+                            logger.info(
+                                "📤 WS SEND | type=%s/%s size=%d",
+                                env.get("type", "?"), env.get("subType", ""), len(data),
+                            )
+                        except Exception:
+                            logger.info("📤 WS SEND raw (%d bytes)", len(data))
+                        await websocket.send_text(data)
                     except Exception:
                         pass  # 客户端可能已断开，不 crash
             except Exception as e:
@@ -226,7 +236,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
     # ── 主消息循环 (永不主动断开) ──────────────────────
     while True:
         try:
-            raw = await websocket.receive_text()
+            message = await websocket.receive()
         except WebSocketDisconnect:
             client_ip = ""
             try:
@@ -245,16 +255,44 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
             await _asyncio.sleep(0.5)
             continue
 
+        # 检测断开 (Starlette receive() 返回 disconnect dict，不抛异常)
+        if message.get("type") == "websocket.disconnect":
+            logger.info(
+                "🔌 WS DISCONNECT | agent=%s session=%s code=%s",
+                agent_id, session_id, message.get("code", "?"),
+            )
+            break
+
+        # 兼容 text 和 binary 帧（iOS 可能发送 binary ping/message）
+        if "text" in message:
+            raw = message["text"]
+        elif "bytes" in message:
+            raw = message["bytes"].decode("utf-8", errors="replace")
+            logger.info("📩 WS RECV binary (%d bytes): %s", len(message["bytes"]), raw[:200])
+        else:
+            # WebSocket 控制帧 (如 protocol-level ping/pong)，忽略
+            logger.info("📡 WS control frame: type=%s", message.get("type", "?"))
+            continue
+
         # 解析 JSON
         try:
             msg = _json.loads(raw)
         except _json.JSONDecodeError:
+            logger.warning("📩 WS RECV non-JSON (%d chars): %s", len(raw), raw[:200])
             continue  # 忽略无效 JSON，不断线
 
         msg_type = msg.get("type", "")
+        sub_type = msg.get("subType", "")
+        logger.info(
+            "📩 WS RECV | type=%s%s seq=%s size=%d",
+            msg_type,
+            f"/{sub_type}" if sub_type else "",
+            msg.get("seq", 0),
+            len(raw),
+        )
 
-        # 心跳: ping → pong
-        if msg_type == "ping":
+        # 心跳: ping → pong（兼容 type:ping 和 type:heartbeat/subType:ping）
+        if msg_type == "ping" or (msg_type == "heartbeat" and sub_type == "ping"):
             try:
                 await websocket.send_text(_json.dumps({
                     "type": "pong",

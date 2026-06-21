@@ -322,6 +322,10 @@ class AgentRunLoop:
         self._report_listener = None
         self._timer_source = None
 
+        # Redis WS 队列 (API → Daemon 桥接)
+        self._redis_ws_key = f"agent:ws:{agent_id}"
+        self._redis_ws = None
+
         # Observer
         from .event_bus import Observer
         self._observer = Observer()
@@ -330,9 +334,28 @@ class AgentRunLoop:
         self._running = False
         self._ws_send_fn: Optional[Any] = None
 
+        # 输出通道: 默认通过 Redis Pub/Sub 发布 (API output relay 订阅)
+        self._redis = None  # sync Redis client (惰性连接)
+
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def redis(self):
+        """惰性连接 — 同步 Redis 客户端 (Pub/Sub 发布)。"""
+        if self._redis is None:
+            import redis as _redis
+            self._redis = _redis.from_url(self._redis_url, decode_responses=True)
+        return self._redis
+
+    @property
+    def redis_ws(self):
+        """惰性连接 — API → Daemon WS 消息队列。"""
+        if self._redis_ws is None:
+            import redis as _redis
+            self._redis_ws = _redis.from_url(self._redis_url, decode_responses=True)
+        return self._redis_ws
 
     def set_ws_send_fn(self, send_fn):
         self._ws_send_fn = send_fn
@@ -396,8 +419,17 @@ class AgentRunLoop:
             handled = False
 
             # ═══ Source 0: WebSocket (用户交互) ═══
+            # 优先从内存队列取，再 fallback 到 Redis agent:ws:{agent_id}
             for _ in range(self.MAX_WS_PER_TICK):
                 msg = self._ws_source.pop_nowait()
+                if msg is None:
+                    # 从 Redis 桥接 (API LPUSH → Daemon RPOP = FIFO)
+                    try:
+                        raw = self.redis_ws.rpop(self._redis_ws_key)
+                        if raw:
+                            msg = json.loads(raw) if isinstance(raw, str) else raw
+                    except Exception:
+                        pass
                 if msg is None:
                     break
                 await self._dispatch_ws_message(msg)
@@ -467,12 +499,19 @@ class AgentRunLoop:
         """分发 WebSocket 消息到 PlanGraph。"""
         from .event_bus import EventType
         sub_type = msg.get("subType", "")
+        msg_type = msg.get("type", "")
         payload = msg.get("payload", {})
         session_id = msg.get("sessionId", "main")
 
+        logger.info(
+            "📩 DAEMON DISPATCH | type=%s/%s session=%s payload_keys=%s",
+            msg_type, sub_type, session_id, list(payload.keys())[:5] if payload else [],
+        )
+
         if sub_type == "chat":
-            await self._handle_user_message(
-                session_id, payload.get("text", ""), msg)
+            # 兼容 v9.0 协议 (payload.content) 和旧格式 (payload.text)
+            content = payload.get("content") or payload.get("text", "")
+            await self._handle_user_message(session_id, content, msg)
         elif sub_type == "clarify":
             await self._handle_clarification(
                 session_id, payload.get("answers", []))
@@ -517,22 +556,20 @@ class AgentRunLoop:
         from .event_bus import CeleryResultEvent
         if event.is_error:
             logger.error(f"Celery error: task={event.agent_task_id} err={event.error[:200]}")
-            if self._ws_send_fn:
-                await self._ws_send_fn({
-                    "role": "assistant", "type": "task", "subType": "failed",
-                    "agentId": self._agent_id, "sessionId": "main",
-                    "seq": 0, "priority": 1, "timestamp": _now(),
-                    "payload": {"taskId": event.agent_task_id, "error": event.error},
-                })
+            await self._send_ws({
+                "role": "assistant", "type": "task", "subType": "failed",
+                "agentId": self._agent_id, "sessionId": "main",
+                "seq": 0, "priority": 1, "timestamp": _now(),
+                "payload": {"taskId": event.agent_task_id, "error": event.error},
+            })
         else:
             logger.info(f"Celery done: task={event.agent_task_id}")
-            if self._ws_send_fn:
-                await self._ws_send_fn({
-                    "role": "assistant", "type": "task", "subType": "done",
-                    "agentId": self._agent_id, "sessionId": "main",
-                    "seq": 0, "priority": 1, "timestamp": _now(),
-                    "payload": {"taskId": event.agent_task_id, "result": event.result},
-                })
+            await self._send_ws({
+                "role": "assistant", "type": "task", "subType": "done",
+                "agentId": self._agent_id, "sessionId": "main",
+                "seq": 0, "priority": 1, "timestamp": _now(),
+                "payload": {"taskId": event.agent_task_id, "result": event.result},
+            })
 
     async def _handle_report(self, report):
         """处理子Agent 报告 (含生命周期 + 进度)。"""
@@ -555,20 +592,19 @@ class AgentRunLoop:
             self._observer.on_agent_report(tid)
 
         # WS 推送进度
-        if self._ws_send_fn:
-            await self._ws_send_fn({
-                "role": "assistant", "type": "task", "subType": "running",
-                "agentId": self._agent_id, "sessionId": "main",
-                "seq": 0, "priority": 2, "timestamp": _now(),
-                "payload": {
-                    "taskId": tid,
-                    "stage": report.stage,
-                    "stageIndex": report.stage_index,
-                    "totalStages": report.total_stages,
-                    "current": report.paper_index,
-                    "total": report.paper_total,
-                },
-            })
+        await self._send_ws({
+            "role": "assistant", "type": "task", "subType": "running",
+            "agentId": self._agent_id, "sessionId": "main",
+            "seq": 0, "priority": 2, "timestamp": _now(),
+            "payload": {
+                "taskId": tid,
+                "stage": report.stage,
+                "stageIndex": report.stage_index,
+                "totalStages": report.total_stages,
+                "current": report.paper_index,
+                "total": report.paper_total,
+            },
+        })
 
     async def _handle_timer(self, timer):
         """处理定时触发事件。"""
@@ -583,13 +619,12 @@ class AgentRunLoop:
         self._observer.on_agent_failed(task_id, "heartbeat_timeout")
         if self._report_listener:
             await self._report_listener.unsubscribe(task_id)
-        if self._ws_send_fn:
-            await self._ws_send_fn({
-                "role": "assistant", "type": "task", "subType": "failed",
-                "agentId": self._agent_id, "sessionId": "main",
-                "seq": 0, "priority": 1, "timestamp": _now(),
-                "payload": {"taskId": task_id, "error": "Sub-agent lost (heartbeat timeout)"},
-            })
+        await self._send_ws({
+            "role": "assistant", "type": "task", "subType": "failed",
+            "agentId": self._agent_id, "sessionId": "main",
+            "seq": 0, "priority": 1, "timestamp": _now(),
+            "payload": {"taskId": task_id, "error": "Sub-agent lost (heartbeat timeout)"},
+        })
 
     async def _dispatch_graph_output(self, result, session_id: str):
         """将 PlanGraph 输出转为 WS 消息。"""
@@ -625,11 +660,28 @@ class AgentRunLoop:
             })
 
     async def _send_ws(self, envelope: dict):
+        """发送 WS 消息到 iOS。
+
+        优先使用注入的 _ws_send_fn (ws_handler 模式)，
+        否则 fallback 到 Redis Pub/Sub (app.py output relay 订阅)。
+        """
         if self._ws_send_fn:
             try:
                 await self._ws_send_fn(envelope)
+                return
             except Exception as e:
-                logger.error(f"WS send failed: {e}")
+                logger.error(f"WS send (ws_send_fn) failed: {e}")
+
+        # Fallback: Redis Pub/Sub → API output relay → WebSocket
+        session_id = envelope.get("sessionId", "main")
+        output_channel = f"agent:output:{self._agent_id}:{session_id}"
+        try:
+            data = json.dumps(envelope, ensure_ascii=False, default=str)
+            self.redis.publish(output_channel, data)
+            logger.debug("📤 DAEMON PUBLISH → %s type=%s/%s",
+                         output_channel, envelope.get("type"), envelope.get("subType", ""))
+        except Exception as e:
+            logger.error(f"WS send (redis pub) failed: {e}")
 
     async def _run_health_check(self):
         status = {}
