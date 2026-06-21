@@ -26,11 +26,19 @@ class WebSocketManager:
         if session_id not in self._connections[agent_id]:
             self._connections[agent_id][session_id] = []
         self._connections[agent_id][session_id].append(websocket)
-        logger.debug(
-            "WS connected: agent=%s, session=%s, total_sessions=%d, conns_in_session=%d",
-            agent_id, session_id,
-            len(self._connections[agent_id]),
-            len(self._connections[agent_id][session_id]),
+        # 提取客户端 IP（兼容不同 proxy 层级）
+        client_ip = ""
+        try:
+            client = getattr(websocket, "client", None)
+            if client:
+                client_ip = f"{client.host}:{client.port}"
+            else:
+                client_ip = "unknown"
+        except Exception:
+            client_ip = "unknown"
+        logger.info(
+            "📱 WS CONNECT | agent=%s session=%s client=%s total_conns=%d",
+            agent_id, session_id, client_ip, self.total_connections,
         )
 
     async def disconnect(self, agent_id: str, session_id: str, websocket):
@@ -43,7 +51,10 @@ class WebSocketManager:
                 del self._connections[agent_id][session_id]
             if not self._connections[agent_id]:
                 del self._connections[agent_id]
-        logger.debug("WS disconnected: agent=%s, session=%s", agent_id, session_id)
+        logger.info(
+            "🔌 WS DISCONNECT | agent=%s session=%s total_conns=%d",
+            agent_id, session_id, self.total_connections,
+        )
 
     async def broadcast(self, agent_id: str, session_id: str, message: dict):
         """向指定 agent+session 的所有连接广播消息."""

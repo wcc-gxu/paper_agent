@@ -21,6 +21,17 @@ from .routes import router
 from .ws import ws_manager
 
 logger = logging.getLogger(__name__)
+# 确保 WS 连接日志可见（uvicorn 只启用自己的 handler，根 logger 是 WARNING）
+_pkg_logger = logging.getLogger("paper_search.api")
+_pkg_logger.setLevel(logging.INFO)
+if not _pkg_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _pkg_logger.addHandler(_h)
+    _pkg_logger.propagate = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -217,7 +228,17 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         try:
             raw = await websocket.receive_text()
         except WebSocketDisconnect:
-            logger.info(f"WS client disconnected: agent={agent_id}, session={session_id}")
+            client_ip = ""
+            try:
+                c = getattr(websocket, "client", None)
+                if c:
+                    client_ip = f"{c.host}:{c.port}"
+            except Exception:
+                pass
+            logger.info(
+                "🔌 WS DISCONNECT | agent=%s session=%s client=%s",
+                agent_id, session_id, client_ip or "unknown",
+            )
             break
         except Exception as e:
             logger.warning(f"WS recv error: {e}, continuing...")
