@@ -38,6 +38,14 @@ class KnowledgeQuestion(BaseModel):
     question: str
     top_k: int = 5
     use_fulltext: bool = True
+
+
+class DeviceRegisterRequest(BaseModel):
+    """Phase 1: iOS 设备注册 APNs token。"""
+    agent_id: str = "agent-001"
+    device_token: str = Field(..., min_length=8, description="APNs device token (hex)")
+    platform: str = "ios"
+    bundle_id: str = ""
     project_id: Optional[str] = None
 
 
@@ -625,4 +633,58 @@ async def trigger_subscription_check(subscription_id: str):
         "celery_task_id": task.id,
         "subscription_name": sub.get("name", ""),
         "message": f"Check triggered for '{sub.get('name', subscription_id)}'",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 1: Device Registration (APNs)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.post("/devices/register")
+async def register_device(req: DeviceRegisterRequest):
+    """注册 iOS 设备 token 用于 APNs 推送 (Phase 1 骨架)。
+
+    iOS 启动时获得 device_token 后调用此端点。
+    Server 端把 token 存到 device_tokens 表；当用户离线且 outbox 收到
+    high/urgent 消息时，APNsPusher 会推送预览到这些 token。
+    """
+    db = _get_db()
+    if not req.device_token or len(req.device_token) < 8:
+        raise HTTPException(status_code=400, detail="Invalid device_token")
+    try:
+        db.register_device_token(
+            agent_id=req.agent_id,
+            device_token=req.device_token,
+            platform=req.platform,
+            bundle_id=req.bundle_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Register failed: {e}")
+    return {
+        "success": True,
+        "agent_id": req.agent_id,
+        "platform": req.platform,
+    }
+
+
+@router.get("/devices/{agent_id}")
+async def list_devices(agent_id: str):
+    """列出某 agent 的活跃设备 token (调试用)。"""
+    db = _get_db()
+    tokens = db.get_active_device_tokens(agent_id)
+    # 脱敏 token
+    return {
+        "agent_id": agent_id,
+        "count": len(tokens),
+        "devices": [
+            {
+                "platform": t["platform"],
+                "bundle_id": t.get("bundle_id", ""),
+                "token_prefix": (t["device_token"] or "")[:12],
+                "created_at": t["created_at"],
+                "last_seen_at": t["last_seen_at"],
+            }
+            for t in tokens
+        ],
     }

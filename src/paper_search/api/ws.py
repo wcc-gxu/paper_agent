@@ -105,6 +105,24 @@ class WebSocketManager:
             for conns in sessions.values()
         )
 
+    def get_online_sessions(self, agent_id: str) -> list[str]:
+        """Phase 1: 列出某 agent 当前在线的 session_id（outbox_poller 用）。"""
+        return list(self._connections.get(agent_id, {}).keys())
+
+    def get_websocket(self, agent_id: str, session_id: str):
+        """Phase 1: 获取某 agent+session 的首个 ws 连接（outbox_poller 用）。
+
+        多个连接到同一 session 的场景很少见；返回首个即可。
+        如需广播到该 session 所有连接，请用 broadcast()。
+        """
+        conns = self._connections.get(agent_id, {}).get(session_id, [])
+        return conns[0] if conns else None
+
+    def is_agent_online(self, agent_id: str) -> bool:
+        """Phase 1: 判断 agent 是否有任意活跃连接。"""
+        sessions = self._connections.get(agent_id, {})
+        return any(conns for conns in sessions.values())
+
     async def send_and_persist(self, agent_id: str, session_id: str,
                                 envelope: dict, store=None) -> int:
         """发送 WS 消息并持久化到 MessageStore。

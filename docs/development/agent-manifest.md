@@ -43,20 +43,20 @@
     "bound_since": "2026-06-16T08:00:00Z"
   },
   "runtime": {
-    "plan_graph": {
-      "module": "paper_search.agent.graphs.plan_graph",
-      "class": "PlanGraph",
-      "thread_id": "agent-001-plan"
+    "main_agent": {
+      "module": "paper_search.agent.main_agent",
+      "class": "MainAgent",
+      "nodes": ["intent_classify", "scenario_plan", "inline_reply", "execute_plan", "evaluate_completion"]
     },
-    "checkpoint": {
+    "event_source": {
       "backend": "sqlite",
       "path": "~/.paper_search/agent.db",
-      "table": "langgraph_checkpoints"
+      "table": "agent_events"
     },
-    "event_bus": {
+    "outbox": {
       "backend": "redis",
       "url": "redis://localhost:6379/0",
-      "queue": "agent:events"
+      "key_pattern": "outbox:{agent_id}"
     },
     "llm": {
       "provider": "volcano",
@@ -169,16 +169,16 @@
   │        ├── AgentDB (manifest.memory.mid_term.db_path)
   │        ├── ChromaStoreV2 (manifest.memory.long_term.chroma_path)
   │        ├── LLM 客户端 (manifest.runtime.llm)
-  │        ├── Redis 事件总线 (manifest.runtime.event_bus)
+  │        ├── Redis outbox + 入站队列 (manifest.runtime.outbox)
   │        └── Celery (复用 Redis broker)
   │     ③ 创建 MemoryManager → 加载 4 层记忆
-  │     ④ 编译 LangGraph Plan Graph
-  │        ├── 从 SQLite checkpoint (thread_id) 恢复 Plan Graph 状态
-  │        └── 如果 checkpoint 存在 → 恢复到崩溃前节点
-  │     ⑤ 从 agent_registry 表恢复活跃子 Agent
-  │     ⑥ 检查 Redis 事件队列 → 回放未处理事件
-  │     ⑦ 启动 FastAPI + WebSocket
-  │     ⑧ 标记 agent.status = "active"
+  │     ④ 创建 MainAgent → 5 节点显式状态机
+  │        ├── 调 _recover_pending_turns 扫 agent_events 表
+  │        ├── 对未完成的 correlation_id 做 _replay → _resume_from_state
+  │        └── waiting_for=clarification/approval 的轮次推 high 提醒
+  │     ⑤ 启动 outbox_poller (每个 agent_id 一个协程)
+  │     ⑥ 启动 FastAPI + WebSocket
+  │     ⑦ 标记 agent.status = "active"
   │
   └── 3. 创建流程 (首次启动):
         ① 生成 agent_id = "agent-001"

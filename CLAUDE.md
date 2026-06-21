@@ -2,17 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **架构文档索引**: [agent-runloop.md](docs/development/agent-runloop.md) — AgentRunLoop · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [phase2-plan.md](docs/development/phase2-plan.md) — Phase 2 计划
+> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent 5 节点 · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — MemGPT 记忆
 
 ## 项目概述
 
 Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/下载/阅读/综述/知识库沉淀。支持视频分享链接解析+下载+转写+LLM总结。
 
 - **产品形态**: Python 后端 (FastAPI + WebSocket) + iOS 客户端
-- **决策模型**: Plan-then-Execute (LangGraph StateGraph)
-- **事件驱动**: AgentRunLoop + EventBus (PriorityQueue) + Redis BRPOP + Pub/Sub
-- **存储**: SQLite (元数据) + ChromaDB (向量) + Redis (事件) + 文件系统 (PDF/MD/Video)
-- **定时任务**: Celery Beat (订阅检查 + 前沿追踪)
+- **主 Agent**: MainAgent (5 节点显式状态机 + JSON Schema 强约束)
+- **消息链路**: Outbox 模式 (Redis List + SQLite 持久化 + APNs 离线推送)
+- **存储**: SQLite (元数据+消息+事件源) + ChromaDB (向量) + Redis (队列) + 文件系统 (PDF/MD/Video)
+- **定时任务**: Celery Beat (订阅检查 + health_check + cleanup_logs)
 
 ## 启动方式
 
@@ -20,39 +20,23 @@ Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/
 # 一键启动全部 5 个服务（跳过已在运行的）
 bash scripts/start-all.sh
 
-# 查看服务状态
+# 查看状态 / 停止
 bash scripts/start-all.sh --status
-
-# 停止全部
 bash scripts/start-all.sh --stop
 
 # 手动逐个启动:
-# 终端 1: Redis
 redis-server
-
-# 终端 2: Celery Worker
 celery -A paper_search.agent.celery_app worker --loglevel=info --concurrency=4
-
-# 终端 3: Celery Beat (订阅定时检查)
 celery -A paper_search.agent.celery_app beat --loglevel=info
-
-# 终端 4: API Server
 uvicorn paper_search.api.app:app --host 0.0.0.0 --port 8000
-
-# 终端 5: Agent Daemon
 python -m paper_search.agent.daemon
 ```
 
 ### 依赖安装
 
 ```bash
-# 全部依赖
-pip install -e ".[all]"
-
-# 仅核心 (不含视频处理)
-pip install -e ".[agent,celery,web]"
-
-# 系统依赖
+pip install -e ".[all]"             # 全部
+pip install -e ".[agent,celery,web]" # 不含视频
 sudo apt install ffmpeg redis-server
 ```
 
@@ -60,85 +44,159 @@ sudo apt install ffmpeg redis-server
 
 ## 核心架构
 
-### 事件流 (AgentRunLoop)
+### 主 Agent — 5 节点状态机 (MainAgent)
 
 ```
-WebSocket 消息  →  RunLoop(prio=0)  →  PlanGraph
-Celery 完成     →  Redis BRPOP     →  RunLoop(prio=1)  →  PlanGraph
-Celery 进度     →  Redis BRPOP     →  RunLoop(prio=2)  →  PlanGraph
-子Agent 报告    →  Redis Pub/Sub   →  RunLoop(prio=1~2) →  PlanGraph
-订阅通知        →  Redis Pub/Sub   →  API 进程 → WebSocket 推送
-Timer 定时      →  RunLoop(prio=3)  →  PlanGraph
+WS 消息 → BRPOP agent:ws:{agent_id}
+              ↓
+       intent_classify (LLM #1, JSON Schema)
+              ↓
+       intent_kind ∈ {business, chat, meta, unsupported}
+              ↓
+        ┌─────┴─────┐
+   business        chat/meta/unsupported
+       ↓                 ↓
+  scenario_plan      inline_reply (LLM 流式 thinking+text)
+   (LLM #2)             ↓
+       ↓             END (message/text)
+   needs_clarify? → ask_user_question → (回答后再 plan)
+       ↓
+   needs_approval? → propose_plan → (用户批准)
+       ↓
+   execute_plan (并行调度 tools[] / sub_agent / ios_tool / ask_user)
+       ↓
+   evaluate_completion (LLM #4)
+       ↓
+   satisfied? → END | needs_more → execute_plan (最多 3 次迭代)
 ```
 
-### PlanGraph (主 Agent)
+文件: [src/paper_search/agent/main_agent.py](src/paper_search/agent/main_agent.py) · prompts/schemas: [main_agent_prompts.py](src/paper_search/agent/main_agent_prompts.py)
+
+### 17 个业务场景
+
+`intent_classify` 把用户消息映射到 17 个 scenario_id 之一：
+
+| ID | 场景 | 实现 |
+|---|---|---|
+| S1 | 文献调研/筛选 | ingest |
+| S2 | 文献综述生成 (7阶段) | ingest |
+| S3 | 每日前沿追踪 (订阅) | celery beat + subscription |
+| S4 | 论文精读/提炼 | tool (extract_knowledge/read_paper) |
+| S5 | 方法对比 | ingest |
+| S6 | 研究空白分析 | clustering + discover_gaps |
+| S7 | 进度查看 | tool (paper_status) |
+| S8 | 聚类 + 全景图 | clustering |
+| S9 | 引用追溯 | citation_chase |
+| S10 | RAG 问答 (已入库) | rad_query |
+| S11 | 批量搜索 | ingest x N |
+| S12 | 学术翻译/术语库 | translation |
+| S13 | 视频解析 | video |
+| S14 | 导出/清理 | tool (paper_export/paper_clean) |
+| S15 | iOS 自动化 | ios_tool |
+| S16 | 运维操作 | tool (service/docker/pip) |
+| S17 | 记忆操作 | tool (search_memory/extract_to_long_term) |
+
+非业务请求（chat/meta/unsupported）走 `inline_reply` 直接 LLM 回复，不走任何子 Agent。
+
+### LLM JSON Schema 强约束
+
+主 Agent 的 LLM 调用全部通过 `llm_client_v2.chat_json(schema=PydanticClass)` 强制结构化输出：
+
+- `IntentClassifyResult` — intent_kind + scenario_id + confidence + reasoning
+- `ScenarioPlanResult` — summary + needs_clarification + needs_approval + permissions + **tools[] 一次性返回所有调用**
+- `EvaluateCompletionResult` — satisfied + needs_more_tools + final_message
+
+### 出站消息链路 — Outbox 模式
 
 ```
-START → parse_intent → (clarify? → await_clarify →) generate_plan
-      → await_approval → await_permissions → execute_plan
-      → overall_evaluate → (satisfied? → END | adjust → generate_plan)
+MainAgent → outbox_publish() ─┬─ SQLite ws_messages (持久化)
+                               └─ Redis LPUSH outbox:{agent_id}
+                                        ↓
+                              outbox_poller (API 进程)
+                                  BRPOP
+                                  ↓
+                          ┌───────────────┐
+                          │ iOS 在线?     │
+                          └──┬────────┬───┘
+                            yes      no
+                             ↓        ↓
+                       ws.send_text   APNs (priority∈high/urgent)
+                       mark_delivered
 ```
 
-- `parse_intent`: LLM 解析用户意图 (PromptOptimizer Stage 1)
-- `clarify`: LLM 生成澄清问题 (Stage 2)
-- `await_clarify` / `await_approval` / `await_permissions`: LangGraph interrupt 节点
-- `generate_plan`: LLM 生成结构化方案 (Stage 3)
-- `execute_plan`: 委托 ExecuteGraph 调度子 Agent
-- `overall_evaluate`: LLM 评估执行结果
+文件: [outbox.py](src/paper_search/agent/outbox.py) · [outbox_poller.py](src/paper_search/api/outbox_poller.py) · [apns_pusher.py](src/paper_search/api/apns_pusher.py) (Phase 1 骨架，aioapns 后补)
 
-### ExecuteGraph → 7 种子 Agent
+### 消息重要性
 
-```
-execute_graph.py (调度层)
-    ├── IngestAgent        search→evaluate→download→convert→index→rank→[verify]→survey
-    ├── RADQueryAgent      parse→route→search→evaluate(refine loop)→format
-    ├── ClusteringAgent    load→cluster→label→visualize→detect
-    ├── CitationChaseAgent resolve→check→fetch→filter→ingest→decide(loop)→summarize
-    ├── HistoryAgent       analyze→generate_plan→archive→merge→skip→notify
-    ├── TranslationAgent   route→translate|build|enrich
-    └── VideoAgent         parse_link→fetch_metadata→download→extract_audio
-                           →transcribe→summarize→analyze→notify
-```
+| priority_kind | 含义 | 在线 | 离线 |
+|---|---|---|---|
+| silent | 流式 thinking delta | WS 推 | 丢弃 |
+| normal | tool 进度 | WS 推 + 持久化 | 持久化 |
+| high | 任务完成/失败/plan卡片/澄清 | WS 推 + 持久化 | 持久化 + APNs |
+| urgent | 错误/订阅推送 | WS 推 + 持久化 + APNs | 持久化 + APNs |
 
-### 论文入库流水线 (IngestAgent)
+### iOS 上线同步
 
 ```
-search_papers  →  (papers in SQLite)
-    → evaluate_papers → filter by relevance_score
-        → download_paper  →  (updates pdf_path)
-            → convert_paper  →  (updates markdown_path)
-                → index_paper  →  (ChromaDB: 6 collections)
-                    → [verify] → rank_papers → generate_survey
+[iOS] WS connect → [Server] WS accept + outbox_poller 启动
+[iOS] send {type: "sync_request", payload: {last_msg_id?: "..."}}
+[Server] 拉 ws_messages 中本 session 未送达的消息 → 逐条 send_text
+         → send {type: "sync_complete", payload: {synced_count: N}}
 ```
 
-### 视频解析流水线 (VideoAgent)
+### 记忆系统 — MemGPT 4 层
+
+详见 [docs/development/memory-system.md](docs/development/memory-system.md)
+
+| 层 | 存储 | 用途 |
+|---|---|---|
+| ShortTerm | 进程内 deque (~8k tokens) | 当前会话滑动窗口 |
+| MidTerm | SQLite (task_checkpoints) | 长任务进度快照 |
+| LongTerm | SQLite + ChromaDB | 知识条目、对话摘要、用户画像 |
+| MetaMemory | SQLite (user_preferences/strategy_log/error_patterns) | 偏好、策略学习 |
+
+主 Agent 入口 `_build_history_context` 注入 `MetaMemory.profile + ShortTerm.get_context(8k)`；
+LLM 主动调 `summarize_memory / extract_to_long_term / search_memory` 工具管理记忆。
+
+### 事件源 Checkpoint
+
+所有主 Agent 状态变更写 `agent_events` 表（15 种 event_type）。daemon 重启时：
 
 ```
-parse_link  →  fetch_metadata (yt-dlp)  →  download_video  →  extract_audio (ffmpeg)
-    →  transcribe (faster-whisper)  →  summarize (LLM)  →  analyze (LLM)  →  notify (SQLite)
+_recover_pending_turns()
+  → 找 turn_started 但无 turn_completed 的 correlation_id
+  → _replay(events) 重建 state.phase / waiting_for
+  → _resume_from_state():
+       waiting_for ∈ {clarification, approval} → 推 high 提示给 iOS，标 turn_completed (用户回复时开新轮)
+       running tools → 标失败 + error 推送
+       其他 phase → 标 abandoned
 ```
 
-- 长视频 (>10分钟): 跳过转录，基于标题/简介生成摘要
-- 双策略下载: yt-dlp 直连 → 失败/缺 cookie → CloakBrowser 提取 cookie → yt-dlp 重试
-- 支持 6 平台 URL 识别: 抖音(短链/长链/口令)/TikTok/B站/YouTube/小红书/快手
-- Cookie 缓存: 30 分钟 TTL
-
-### 每日前沿追踪 (Subscription System)
+### 7 个子 Agent（被 MainAgent 通过 `kind=sub_agent` 调度）
 
 ```
-Celery Beat (每 N 分钟) → subscription_check_task
-    → 遍历启用订阅 → Engine.search() → 对比 last_paper_ids
-    → 新论文存入 subscription_results → Redis Pub/Sub agent:notifications
-    → API 进程 start_notification_listener() → ws_manager.broadcast()
+IngestAgent (graphs/ingest_graph.py)         search→evaluate→download→convert→index→rank→[verify]→survey
+RADQueryAgent (graphs/rad_query_graph.py)    parse→route→search→evaluate(refine)→format
+ClusteringAgent (graphs/clustering_graph.py)  load→cluster→label→visualize→detect
+CitationChaseAgent (graphs/citation_chase_graph.py) resolve→check→fetch→filter→ingest→decide(loop)→summarize
+HistoryAgent (graphs/history_graph.py)        analyze→generate_plan→archive→merge→skip→notify
+TranslationAgent (graphs/translation_graph.py) route→translate|build|enrich
+VideoAgent (graphs/video_graph.py)            parse_link→fetch_metadata→download→extract_audio→transcribe→summarize→analyze→notify
 ```
 
-### WebSocket 协议 (v7.0)
+每个子 Agent 在收尾时调 `reporter.publish_lifecycle(task_id, "agent_done"|"agent_failed", ...)`，主 Agent 据此判定真正完成（解决了 v2 误把 per-paper status=done 当作 agent 完成的 P0 Bug）。
 
-7 大类消息: `heartbeat` / `phase` / `thinking` / `message` / `tool` / `review` / `error`
+---
 
-握手: 首条消息必须是 `message(chat, seq=1)` → Server 返回 `phase(connected)`
+## 服务进程 (5 个)
 
-完整连接地址: `ws://localhost:8000/ws/chat/agent-001/main`
+| # | 服务 | 命令 | 端口 |
+|---|------|------|:---:|
+| 1 | Redis | `redis-server` | 6379 |
+| 2 | Celery Worker | `celery -A paper_search.agent.celery_app worker --concurrency=4` | — |
+| 3 | Celery Beat | `celery -A paper_search.agent.celery_app beat` | — |
+| 4 | API Server | `uvicorn paper_search.api.app:app --host 0.0.0.0 --port 8000` | 8000 |
+| 5 | Agent Daemon | `python -m paper_search.agent.daemon` | — |
 
 ---
 
@@ -147,94 +205,86 @@ Celery Beat (每 N 分钟) → subscription_check_task
 ```
 src/paper_search/
 ├── agent/                          # Agent 核心
-│   ├── daemon.py                   # 守护进程 + AgentRunLoop
-│   ├── event_bus.py                # 统一事件总线 (PriorityQueue + Redis源 + Timer源 + Observer)
-│   ├── db.py                       # SQLite 持久化 (AgentDB, 14 张表)
-│   ├── memory.py                   # 4 层记忆系统
-│   ├── llm_client_v2.py            # 多供应商 LLM (流式+重试+工具调用)
-│   ├── llm_client.py               # V1 客户端 (向后兼容)
-│   ├── prompt_optimizer.py         # 3 阶段提示词优化 (Parse/Clarify/Generate)
+│   ├── daemon.py                   # 守护进程 + AgentBootstrap + MainAgent 启动
+│   ├── main_agent.py               # MainAgent 5 节点状态机（替代 v1/v2）
+│   ├── main_agent_prompts.py       # 17 scenario 定义 + 3 节点 Pydantic schema
+│   ├── outbox.py                   # 出站消息双写 (SQLite + Redis List)
+│   ├── db.py                       # SQLite 持久化 (AgentDB)
+│   ├── memory.py                   # MemGPT 4 层记忆 (ShortTerm/MidTerm/LongTerm/Meta)
+│   ├── llm_client_v2.py            # 多供应商 LLM (含 chat_json 结构化输出)
 │   ├── tool_registry.py            # 56 个工具注册
 │   ├── celery_app.py               # Celery 配置 + Beat 定时调度
-│   ├── celery_tasks.py             # 9 个异步 Task + 订阅检查
-│   ├── reporter.py                 # Celery→Agent 双通道上报 (LPUSH + Pub/Sub) + 跨进程通知
-│   ├── task_event_adapter.py       # 任务事件→WS 协议信封
+│   ├── celery_tasks.py             # 9 个异步 Task + 订阅 + health_check + cleanup_logs
+│   ├── reporter.py                 # Celery → Agent 双通道上报 (LPUSH + Pub/Sub + lifecycle)
 │   ├── task_logger.py              # 任务 JSON 日志
-│   ├── sub_agent.py                # PipelineRunner 编排器 (进程内 + Celery 分发)
-│   ├── verifier.py                 # 引用三步校验 (格式/匹配/事实)
-│   ├── video_downloader.py         # yt-dlp 封装 + URL解析 + CloakBrowser 降级
-│   ├── video_browser.py            # CloakBrowser 封装 (链接解析 + cookie 导出)
-│   ├── knowledge.py                # RAG 问答 + 知识提取 + 知识发现
+│   ├── sub_agent.py                # PipelineRunner 编排器
+│   ├── verifier.py                 # 引用三步校验
+│   ├── video_downloader.py         # yt-dlp 封装
+│   ├── video_browser.py            # CloakBrowser 封装
+│   ├── knowledge.py                # RAG 问答 + 知识提取
 │   ├── chroma_store.py             # ChromaDB 6 集合
-│   ├── pdf_converter.py            # PDF→Markdown (pymupdf4llm)
+│   ├── pdf_converter.py            # PDF→Markdown
 │   ├── chunker.py                  # Section-aware 分块
 │   ├── journal_ranker.py           # CCF+SCI 期刊分级
 │   │
-│   └── graphs/                     # LangGraph 图定义
-│       ├── plan_graph.py           # 主 Agent (7 节点)
-│       ├── execute_graph.py        # 子 Agent 调度层 (8 种 Agent)
-│       ├── ingest_graph.py         # 论文入库 (8 节点, 含可选 verify)
-│       ├── rad_query_graph.py      # RAG 问答 (5 节点)
-│       ├── clustering_graph.py     # 聚类 (5 节点)
-│       ├── citation_chase_graph.py # 引用追溯 (7 节点 + loop)
-│       ├── history_graph.py        # 历史处理 (Plan+Execute)
-│       ├── translation_graph.py    # 术语翻译 (工具型)
-│       └── video_graph.py          # 视频解析 (8 节点: 链接→下载→转写→总结→分析)
+│   └── graphs/                     # 7 子 Agent (LangGraph StateGraph)
+│       ├── ingest_graph.py
+│       ├── rad_query_graph.py
+│       ├── clustering_graph.py
+│       ├── citation_chase_graph.py
+│       ├── history_graph.py
+│       ├── translation_graph.py
+│       └── video_graph.py
 │
 ├── api/                            # FastAPI 层
-│   ├── app.py                      # 应用入口 + /ws/chat/{agent_id}/{session_id} + lifespan
-│   ├── routes.py                   # REST: /tasks, /papers, /projects, /knowledge, /ingest, /subscriptions
-│   ├── ws.py                       # WebSocket 连接管理器 + 订阅通知监听器
-│   ├── ws_handler.py               # WS 事件循环 (握手/重连回放)
-│   ├── message_store.py            # 消息持久化 + 智能回放
+│   ├── app.py                      # 应用入口 + WebSocket /ws/chat/{agent}/{session}
+│   ├── routes.py                   # REST + /api/devices/register (APNs)
+│   ├── ws.py                       # WebSocketManager (含 get_online_sessions)
+│   ├── outbox_poller.py            # 消费 outbox List → WS / APNs 分发
+│   ├── apns_pusher.py              # APNs 推送 (Phase 1 骨架)
+│   ├── message_store.py            # 消息查询/回放（Phase 1 重写）
 │   ├── auth.py                     # Bearer Token 认证
 │   └── middleware.py               # 速率限制
 │
 ├── providers/                      # 7 个搜索来源
-├── downloaders/                    # HTTP + Playwright 下载
+├── downloaders/                    # HTTP + Playwright
 ├── cli/                            # 13 个 CLI 命令
 ├── engine.py                       # PaperSearchEngine 门面
-├── models.py                       # Pydantic 数据模型 (含 Video + Subscription)
-└── config.py                       # 配置管理 (含 videos/cookies 路径)
+├── models.py                       # Pydantic 模型
+└── config.py                       # 配置管理
 ```
 
 ---
 
-## 运行中的服务 (5 个进程)
+## SQLite 关键表（Phase 1 新增）
 
-| # | 服务 | 命令 | 端口 |
-|---|------|------|:---:|
-| 1 | **Redis** | `redis-server` | 6379 |
-| 2 | **Celery Worker** | `celery -A paper_search.agent.celery_app worker --concurrency=4` | — |
-| 3 | **Celery Beat** | `celery -A paper_search.agent.celery_app beat` | — |
-| 4 | **API Server** | `uvicorn paper_search.api.app:app --host 0.0.0.0 --port 8000` | 8000 |
-| 5 | **Agent Daemon** | `python -m paper_search.agent.daemon` | — |
-
-启动/状态/停止: `bash scripts/start-all.sh [--status|--stop]`
+| 表 | 用途 | Phase |
+|---|---|---|
+| `ws_messages` | 出站消息持久化（msg_id/priority_kind/delivered_sessions/apns_sent_at） | Phase 1 扩展 |
+| `device_tokens` | iOS APNs 设备 token | Phase 1 |
+| `agent_events` | 主 Agent 状态变更事件（crash recovery 事件源） | Phase 4 |
+| `task_checkpoints` | MidTerm 任务快照（MemoryManager） | 已有 |
+| `knowledge_entries` | LongTerm 知识条目 | 已有 |
+| `user_preferences` | MetaMemory 用户偏好 | 已有 |
 
 ---
 
-## 事件通信技术选型
+## Redis Key 清单
 
-| 场景 | 技术 | 理由 |
-|------|------|------|
-| **同进程** (Daemon 内部状态) | `asyncio.PriorityQueue` | 纳秒级，零序列化，无需外部依赖 |
-| **跨进程** (Celery → Daemon 完成/错误) | Redis **BRPOP** (List) | Celery Worker 独立进程；阻塞等待无空转 |
-| **跨进程** (子Agent 实时进度) | Redis **Pub/Sub** → `agent:reports:{task_id}` | 一对多广播，主Agent 按 task_id 订阅/取消 |
-| **跨进程** (订阅通知 → WebSocket) | Redis **Pub/Sub** → `agent:notifications` | Celery Worker → API 进程桥接 |
-| **定时器** | `asyncio.sleep` | 简单可靠，无需 Celery Beat |
-| **定时订阅检查** | Celery **Beat** + `subscription_check_task` | 持久化调度，支持 crontab |
-| **不选** Redis Streams | — | 场景是实时推送+消费即丢弃，Streams 过度设计 |
-| **不选** Kafka/RabbitMQ | — | 单机部署，不需要消息中间件复杂度 |
-
-4 个事件源全部向同一个 PriorityQueue 投递。RunLoop 逐个消费，不并发。低 prio 值先出队。
+| Key | 类型 | 作用 |
+|---|---|---|
+| `agent:ws:{agent_id}` | List | iOS → Agent 入站消息队列 |
+| `agent:ws:{agent_id}:parked` | List | _wait_ws_reply 暂存的不匹配消息（下轮重入） |
+| `outbox:{agent_id}` | List | **新** Agent → iOS 出站队列 (替代 agent:output Pub/Sub) |
+| `agent:reports:{task_id}` | Pub/Sub | 子 Agent → 主 Agent 进度 + lifecycle |
+| `agent:notifications` | Pub/Sub | Celery Beat 订阅检查 → API |
 
 ---
 
 ## Environment (.env)
 
 | Variable | Purpose |
-|----------|---------|
+|---|---|
 | `VOLCANO_API_KEY` | LLM (火山方舟) |
 | `SEMANTIC_SCHOLAR_API_KEY` | Semantic Scholar 1 req/s |
 | `ELSEVIER_API_KEY` | ScienceDirect |
@@ -245,25 +295,7 @@ src/paper_search/
 | `CLOAKBROWSER_HEADLESS` | 浏览器无头模式 (默认 `1`) |
 | `SUBSCRIPTION_CHECK_INTERVAL_MINUTES` | 订阅检查间隔 (默认 `60`) |
 | `API_KEY` | Bearer Token (REST API 认证，不设则禁用) |
-
----
-
-## 子 Agent 独立日志
-
-```
-~/.paper_search/logs/
-├── agent.log                        # 全局日志
-└── sub_agents/
-    ├── ingest/
-    │   └── task-{YYYYMMDD}-{seq}.jsonl    # 按 task_id 分文件
-    ├── citation_chase/
-    │   └── task-{YYYYMMDD}-{seq}.jsonl
-    ├── video/
-    │   └── task-{YYYYMMDD}-{seq}.jsonl    # 视频解析日志
-    └── ...
-```
-
-每条日志带 `task_id` + `agent_type` + `timestamp`，可按任务过滤。
+| `APNS_KEY_PATH` / `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` / `APNS_USE_SANDBOX` | APNs 推送 (Phase 1 骨架就位，aioapns 后补) |
 
 ---
 
@@ -271,7 +303,7 @@ src/paper_search/
 
 ```
 # Core
-langgraph>=0.2.0, langgraph-checkpoint-sqlite>=1.0.0
+langgraph>=0.2.0              # 仅子 Agent 内部使用
 fastapi>=0.110, uvicorn[standard]>=0.27
 celery[redis]>=5.4, redis>=5.0
 httpx>=0.27, pydantic>=2
@@ -279,11 +311,14 @@ arxiv>=2.3, biopython, metapub
 pymupdf4llm, chromadb
 python-dotenv, rich>=13
 
-# Video (optional — pip install -e ".[video]")
-yt-dlp>=2024.12           # 多平台视频下载 (1800+ 站点)
-faster-whisper>=1.1.0     # 本地语音识别 (CTranslate2 加速)
-cloakbrowser>=0.3         # 反检测浏览器 (cookie 提取 + 链接解析)
-ffmpeg                    # 系统级依赖 (apt install ffmpeg)
+# Video (optional)
+yt-dlp>=2024.12
+faster-whisper>=1.1.0
+cloakbrowser>=0.3
+ffmpeg
+
+# APNs (待集成)
+# aioapns>=3.1
 ```
 
 Python >= 3.11
@@ -293,31 +328,30 @@ Python >= 3.11
 ## 当前项目进度
 
 | 模块 | 状态 | 说明 |
-|------|:---:|------|
-| **AgentLoop v2 (新)** | ✅ | WebSocket 驱动, LLM tool-calling loop, BRPOP 非阻塞 |
-| WebSocket 协议 v9.0 | ✅ | 无握手, ping/pong 直连, tool 消息统一, 永不主动断开 |
-| API Server (中继化) | ✅ | 纯收发中继, recv→LPUSH Redis, Pub/Sub→WS send |
-| PlanGraph (原主Agent) | 🔶 | 保留但不再使用, 被 AgentLoop v2 替代 |
-| ExecuteGraph (调度层) | ✅ | 8 种 Agent 完整调度 |
+|---|:---:|---|
+| MainAgent (5 节点) | ✅ | 替代 v1 (PlanGraph) 和 v2 (AgentLoop) |
+| LLM JSON Schema 强约束 | ✅ | IntentClassifyResult / ScenarioPlanResult / EvaluateCompletionResult |
+| 17 业务场景 | ✅ | 完整覆盖 + intent_classify 路由 |
+| Outbox 模式 (持久化+队列) | ✅ | 所有出站消息双写 |
+| outbox_poller (WS/APNs 分发) | ✅ | 每 agent 一个 poller，按在线状态分发 |
+| APNs 推送 | 🔶 | 骨架就位（device_tokens 表 + REST 端点 + APNsPusher），aioapns 真实集成后补 |
+| 上线历史同步 | ✅ | sync_request/sync_complete 协议 |
+| MemGPT 4 层记忆 | ✅ | 已接入 MainAgent；5 个记忆工具补齐真实实现 |
+| 事件源 Checkpoint | ✅ | agent_events 表 + _replay + _resume_from_state |
+| WebSocket 协议 v9.0 | ✅ | 无握手 + ping/pong + tool 统一 + 新增 propose_plan / sync_request |
+| API Server (中继化) | ✅ | LPUSH→Agent + outbox_poller→WS |
 | 7 种子 Agent | ✅ | Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video |
-| Celery 任务 | ✅ | 9 个 task (含 search/evaluate/rank/sub_agent/subscription_check) |
-| 每日前沿追踪 | ✅ | 订阅 CRUD + Celery Beat + Pub/Sub → WebSocket 推送 |
-| 视频解析 (VideoAgent) | ✅ | yt-dlp + Whisper + LLM + CloakBrowser 双策略 |
-| ToolRegistry | ✅ | 56 个工具注册 |
-| Memory (4 层) | ✅ | 短期/中期/长期/元记忆 |
-| Verifier (引用校验) | ✅ | 3 步校验 (格式/匹配/事实) |
-| AgentRunLoop v1 (原) | 🔶 | 保留, daemon.py --new-loop=False 可用 |
-| 启动脚本 | ✅ | `scripts/start-all.sh` (5 服务统一管理) |
-| 文档 | ✅ | 架构/协议/产品规格/CLAUDE.md 完整 |
-| 测试 | 🔶 | 62 passed, 覆盖率 ~11% (6 文件 / 55 模块) |
+| 子 Agent lifecycle 上报 | ✅ | sub_agent_task 收尾发 agent_done/agent_failed |
+| Celery 任务 | ✅ | 9 个 task + Beat 三个 schedule (subscription/health_check/cleanup_logs) |
+| ToolRegistry | ✅ | 56 个工具 |
+| 文档 | ✅ | CLAUDE.md / main-agent.md 同步 |
+| 测试 | 🔶 | 各模块有单元/集成测试；端到端 LLM 测试需配 API key |
 
-### 待开发
+### 待办
 
 | # | 功能 | 工作量 |
 |---|------|:---:|
-| 1 | AgentLoop v2 完整上线 (替掉 v1) | 2-3天 |
-| 2 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5天 |
-| 3 | 论文精读 (单篇深度提取) | 2-3天 |
-| 4 | APNs 离线推送 | 3-5天 |
-| 5 | Docker 部署 | 2-3天 |
-| 6 | 测试覆盖率提升 | 持续 |
+| 1 | aioapns 真实集成 + iOS 端注册流程 | 3-5天 |
+| 2 | 可视化 (t-SNE/UMAP 研究方向图前端) | 3-5天 |
+| 3 | Docker 部署 | 2-3天 |
+| 4 | 测试覆盖率提升 | 持续 |

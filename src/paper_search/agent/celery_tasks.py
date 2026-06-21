@@ -590,6 +590,14 @@ def sub_agent_task(
 
     stages = {}
 
+    # 发布 lifecycle: agent_started（订阅方用来确认订阅生效）
+    reporter.publish_lifecycle(
+        task_id=log_id,
+        agent_type="ingest",
+        lifecycle="agent_started",
+        summary=f"开始入库: {user_query[:80]}",
+    )
+
     try:
         # ── Stage 1: Search ──
         task_logger.stage_start(log_id, "search", 1, 7)
@@ -607,6 +615,14 @@ def sub_agent_task(
         if not papers:
             task_logger.task_done(log_id, {"stages": stages})
             reporter.report_done(log_id, {"stages": stages})
+            # 新增: 发布 agent_done lifecycle
+            reporter.publish_lifecycle(
+                task_id=log_id,
+                agent_type="ingest",
+                lifecycle="agent_done",
+                summary="未搜索到论文",
+                result={"stages": stages, "total_papers": 0},
+            )
             return {"stages": stages, "total_papers": 0, "error": ""}
 
         # ── Stage 2: Evaluate ──
@@ -718,6 +734,14 @@ def sub_agent_task(
             "stages": stages,
             "total_papers": total_papers,
         })
+        # 新增: 发布 agent_done lifecycle (订阅方依此判定子 Agent 完成)
+        reporter.publish_lifecycle(
+            task_id=log_id,
+            agent_type="ingest",
+            lifecycle="agent_done",
+            summary=f"入库完成: 共处理 {total_papers} 篇论文",
+            result={"stages": stages, "total_papers": total_papers},
+        )
         return {"stages": stages, "total_papers": total_papers, "error": ""}
 
     except Exception as e:
@@ -725,6 +749,14 @@ def sub_agent_task(
         logger.error(f"sub_agent_task failed: {error_str}")
         task_logger.task_error(log_id, error_str, "")
         reporter.report_error(log_id, error_str)
+        # 新增: 发布 agent_failed lifecycle
+        reporter.publish_lifecycle(
+            task_id=log_id,
+            agent_type="ingest",
+            lifecycle="agent_failed",
+            summary=f"入库失败: {error_str[:120]}",
+            error=error_str,
+        )
         return {"stages": stages, "total_papers": 0, "error": error_str}
 
 
@@ -856,3 +888,85 @@ def subscription_check_task(self) -> dict:
             raise self.retry(exc=e)
         reporter.report_error(task_id, error_str)
         return {"checked": 0, "new_papers": 0, "error": error_str}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase 5: System Timers migrated from v1 TimerEventSource
+# ═══════════════════════════════════════════════════════════════
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=30)
+def health_check_task(self) -> dict:
+    """系统健康检查（原 v1 TimerEventSource health_check）。
+
+    每 20 分钟运行，检查:
+      - SQLite 可读写
+      - Redis 连通性
+      - 磁盘空间
+    失败时打印 warning，不抛异常（避免 Celery 反复重试）。
+    """
+    import shutil
+    result = {"sqlite": False, "redis": False, "disk_free_gb": 0.0}
+    # SQLite
+    try:
+        db = _get_db()
+        db.conn.execute("SELECT 1").fetchone()
+        result["sqlite"] = True
+    except Exception as e:
+        logger.warning(f"[health_check] SQLite failed: {e}")
+
+    # Redis
+    try:
+        import redis as _redis
+        r = _redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                            decode_responses=True)
+        r.ping()
+        result["redis"] = True
+    except Exception as e:
+        logger.warning(f"[health_check] Redis failed: {e}")
+
+    # Disk
+    try:
+        from ..config import get_data_dir
+        usage = shutil.disk_usage(get_data_dir())
+        result["disk_free_gb"] = round(usage.free / (1024 ** 3), 2)
+        if result["disk_free_gb"] < 1.0:
+            logger.warning(f"[health_check] Low disk: {result['disk_free_gb']} GB free")
+    except Exception as e:
+        logger.warning(f"[health_check] Disk check failed: {e}")
+
+    if not (result["sqlite"] and result["redis"]):
+        logger.warning(f"[health_check] FAILED: {result}")
+    else:
+        logger.info(f"[health_check] OK: {result}")
+    return result
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=60)
+def cleanup_logs_task(self) -> dict:
+    """日志清理（原 v1 TimerEventSource cleanup_logs）。
+
+    每天 00:30 运行。清理 ~/.paper_search/logs/ 下:
+      - 30 天前的 agent.log.* 滚动归档
+      - 30 天前的 sub_agents/*/*.jsonl
+    """
+    import time
+    from pathlib import Path
+    log_dir = Path.home() / ".paper_search" / "logs"
+    if not log_dir.exists():
+        return {"removed": 0, "skipped": "log dir not found"}
+
+    cutoff = time.time() - (30 * 86400)  # 30 days
+    removed = 0
+    for f in log_dir.rglob("*"):
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                # 不清理当前活跃的 agent.log
+                if f.name == "agent.log":
+                    continue
+                f.unlink()
+                removed += 1
+        except Exception as e:
+            logger.debug(f"[cleanup_logs] skip {f}: {e}")
+    logger.info(f"[cleanup_logs] removed {removed} old log files")
+    return {"removed": removed}

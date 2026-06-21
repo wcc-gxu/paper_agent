@@ -154,11 +154,15 @@ LOG_FILE=/root/.paper_search/logs/agent.log
 TASK_LOG_DIR=/root/.paper_search/logs/tasks
 LOG_MAX_DAYS=30
 
-# ── iOS 推送 ─────────────────────────────
+# ── iOS 推送 (Phase 1 骨架就位，aioapns 真集成后补) ───
+# 配置后即可通过 POST /api/devices/register 注册设备 token；
+# 当前 APNsPusher 内部仅 logger.info 占位，
+# 后续接入 aioapns 时把 apns_pusher.push 内部替换为真实推送即可。
 APNS_KEY_PATH=/app/certs/apns.p8
 APNS_KEY_ID=ABC123
 APNS_TEAM_ID=DEF456
 APNS_TOPIC=com.your.app
+APNS_USE_SANDBOX=1
 ```
 
 ---

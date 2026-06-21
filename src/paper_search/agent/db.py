@@ -154,9 +154,46 @@ CREATE TABLE IF NOT EXISTS ws_messages (
     payload TEXT NOT NULL DEFAULT '{}',
     priority INTEGER DEFAULT 0,
     created_at TEXT NOT NULL,
-    is_replay INTEGER DEFAULT 0
+    is_replay INTEGER DEFAULT 0,
+    -- Phase 1 新增字段：消息送达 / APNs / 关联追踪
+    msg_id TEXT DEFAULT '',                   -- UUID，发送端生成
+    correlation_id TEXT DEFAULT '',           -- 关联一轮对话（事件源 Checkpoint 用）
+    priority_kind TEXT DEFAULT 'normal',      -- silent | normal | high | urgent
+    delivered_at TEXT DEFAULT '',             -- 首次成功送达时间
+    delivered_sessions TEXT DEFAULT '[]',     -- JSON 数组：已收到此消息的 session_id 列表
+    apns_sent_at TEXT DEFAULT ''              -- APNs 推送时间
 );
 CREATE INDEX IF NOT EXISTS idx_ws_messages_lookup ON ws_messages(agent_id, session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_ws_messages_msg_id ON ws_messages(msg_id);
+CREATE INDEX IF NOT EXISTS idx_ws_messages_undelivered ON ws_messages(agent_id, session_id, delivered_at, priority_kind);
+CREATE INDEX IF NOT EXISTS idx_ws_messages_correlation ON ws_messages(correlation_id);
+
+-- Phase 1 新增：iOS 设备 token 表（APNs 推送目标）
+CREATE TABLE IF NOT EXISTS device_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    device_token TEXT NOT NULL,
+    platform TEXT NOT NULL DEFAULT 'ios',     -- ios | android (future)
+    bundle_id TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    active INTEGER DEFAULT 1,
+    UNIQUE(agent_id, device_token)
+);
+CREATE INDEX IF NOT EXISTS idx_device_tokens_agent ON device_tokens(agent_id, active);
+
+-- Phase 1 新增：Agent 事件源（用于 Phase 4 的 Checkpoint）
+CREATE TABLE IF NOT EXISTS agent_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_events_session ON agent_events(agent_id, session_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_correlation ON agent_events(correlation_id, event_id);
 
 CREATE TABLE IF NOT EXISTS videos (
     id TEXT PRIMARY KEY,
@@ -223,8 +260,18 @@ _MIGRATIONS = [
     # agent_tasks 表迁移（v7.0: task 类型 + 后台任务支持）
     ("agent_tasks", "ALTER TABLE agent_tasks ADD COLUMN mode TEXT DEFAULT 'foreground'"),
     ("agent_tasks", "ALTER TABLE agent_tasks ADD COLUMN name TEXT"),
+    # Phase 1 ws_messages 扩展（消息送达 + APNs + 关联追踪）
+    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN msg_id TEXT DEFAULT ''"),
+    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN correlation_id TEXT DEFAULT ''"),
+    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN priority_kind TEXT DEFAULT 'normal'"),
+    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN delivered_at TEXT DEFAULT ''"),
+    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN delivered_sessions TEXT DEFAULT '[]'"),
+    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN apns_sent_at TEXT DEFAULT ''"),
     # 索引
     ("papers", "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)"),
+    ("ws_messages", "CREATE INDEX IF NOT EXISTS idx_ws_messages_msg_id ON ws_messages(msg_id)"),
+    ("ws_messages", "CREATE INDEX IF NOT EXISTS idx_ws_messages_undelivered ON ws_messages(agent_id, session_id, delivered_at, priority_kind)"),
+    ("ws_messages", "CREATE INDEX IF NOT EXISTS idx_ws_messages_correlation ON ws_messages(correlation_id)"),
 ]
 
 
@@ -633,10 +680,258 @@ class AgentDB:
 
     # ── WS 消息持久化 ──────────────────────────────────────
 
+    def save_outbox_envelope(self, envelope: dict, correlation_id: str = "") -> str:
+        """Phase 1: 保存出站信封到 ws_messages 表（含 msg_id / priority_kind 等扩展字段）。
+
+        envelope 必须包含 type, role, agentId, sessionId, timestamp。
+        如缺 msg_id 会自动生成 UUID 并写回 envelope（in-place 修改）。
+        如缺 priorityKind 默认 'normal'（流式 thinking 应显式设 'silent'）。
+
+        Returns:
+            msg_id（UUID 字符串）
+        """
+        import json as _json
+        if not envelope.get("msg_id"):
+            envelope["msg_id"] = str(uuid.uuid4())
+        msg_id = envelope["msg_id"]
+
+        agent_id = envelope.get("agentId", "")
+        session_id = envelope.get("sessionId", "")
+        role = envelope.get("role", "assistant")
+        msg_type = envelope.get("type", "")
+        subtype = envelope.get("subType", "") or ""
+        payload = envelope.get("payload", {})
+        priority_kind = envelope.get("priorityKind", "normal")
+        created_at = envelope.get("timestamp", self._now())
+
+        payload_str = (_json.dumps(payload, ensure_ascii=False, default=str)
+                       if not isinstance(payload, str) else payload)
+
+        self.conn.execute(
+            """INSERT INTO ws_messages
+               (agent_id, session_id, role, type, subtype, payload, priority,
+                created_at, msg_id, correlation_id, priority_kind,
+                delivered_at, delivered_sessions, apns_sent_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (agent_id, session_id, role, msg_type, subtype, payload_str,
+             0, created_at, msg_id, correlation_id, priority_kind,
+             "", "[]", ""),
+        )
+        self.conn.commit()
+        return msg_id
+
+    def mark_message_delivered(self, msg_id: str, session_id: str):
+        """Phase 1: 标记消息已送达某 session（用于离线同步排重）。
+
+        delivered_at 首次送达时设置；delivered_sessions JSON 数组累加。
+        """
+        import json as _json
+        row = self.conn.execute(
+            "SELECT delivered_at, delivered_sessions FROM ws_messages WHERE msg_id=?",
+            (msg_id,),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            sessions = _json.loads(row["delivered_sessions"] or "[]")
+        except (ValueError, TypeError):
+            sessions = []
+        if session_id not in sessions:
+            sessions.append(session_id)
+        new_delivered_at = row["delivered_at"] or self._now()
+        self.conn.execute(
+            "UPDATE ws_messages SET delivered_at=?, delivered_sessions=? WHERE msg_id=?",
+            (new_delivered_at, _json.dumps(sessions), msg_id),
+        )
+        self.conn.commit()
+
+    def mark_message_apns_sent(self, msg_id: str):
+        """Phase 1: 标记消息已经触发过 APNs 推送（不重复推）。"""
+        self.conn.execute(
+            "UPDATE ws_messages SET apns_sent_at=? WHERE msg_id=? AND apns_sent_at=''",
+            (self._now(), msg_id),
+        )
+        self.conn.commit()
+
+    def get_undelivered_messages(self, agent_id: str, session_id: str,
+                                  since_msg_id: str = "",
+                                  hours: int = 24,
+                                  limit: int = 500) -> list[dict]:
+        """Phase 1: 获取未送达到指定 session 的消息（按重要性过滤）。
+
+        策略:
+          - priority_kind='silent' 不参与同步（流式 thinking 不回放）
+          - 默认 24h 内的消息
+          - delivered_sessions 不含本 session_id 即视为未送达
+          - 同 taskId 的 normal 进度消息只保留最后一条（按 payload.taskId 去重）
+
+        Args:
+            since_msg_id: 如果非空，只返回此 msg_id 之后的消息（基于 id 自增）
+        """
+        import json as _json
+        from datetime import timedelta
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        params = [agent_id, session_id, cutoff]
+        since_clause = ""
+        if since_msg_id:
+            row = self.conn.execute(
+                "SELECT id FROM ws_messages WHERE msg_id=?", (since_msg_id,),
+            ).fetchone()
+            if row:
+                since_clause = "AND id > ?"
+                params.append(row["id"])
+
+        rows = self.conn.execute(
+            f"""SELECT * FROM ws_messages
+               WHERE agent_id=?
+                 AND (session_id=? OR session_id='main')
+                 AND created_at >= ?
+                 AND priority_kind != 'silent'
+                 {since_clause}
+               ORDER BY id ASC
+               LIMIT ?""",
+            (*params, limit),
+        ).fetchall()
+
+        # 反序列化 + 过滤：本 session 已送达的跳过
+        out = []
+        progress_by_task = {}  # taskId → idx in out (用于去重)
+        for r in rows:
+            try:
+                delivered = _json.loads(r["delivered_sessions"] or "[]")
+            except (ValueError, TypeError):
+                delivered = []
+            if session_id in delivered:
+                continue
+            try:
+                payload = _json.loads(r["payload"] or "{}")
+            except (ValueError, TypeError):
+                payload = {}
+
+            entry = {
+                "msg_id": r["msg_id"],
+                "type": r["type"],
+                "subType": r["subtype"],
+                "role": r["role"],
+                "agentId": r["agent_id"],
+                "sessionId": r["session_id"],
+                "timestamp": r["created_at"],
+                "priorityKind": r["priority_kind"] or "normal",
+                "correlation_id": r["correlation_id"] or "",
+                "payload": payload,
+            }
+
+            # normal sub_progress 同 taskId 去重保最后一条
+            if (r["priority_kind"] == "normal"
+                    and r["type"] == "tool"
+                    and r["subtype"] == "sub_progress"):
+                task_id = payload.get("taskId", "")
+                if task_id:
+                    if task_id in progress_by_task:
+                        out[progress_by_task[task_id]] = entry
+                        continue
+                    progress_by_task[task_id] = len(out)
+
+            out.append(entry)
+        return out
+
+    # ── Device Tokens (Phase 1, APNs) ──────────────────
+
+    def register_device_token(self, agent_id: str, device_token: str,
+                              platform: str = "ios", bundle_id: str = "") -> int:
+        """Phase 1: 注册 / 更新 iOS 设备 token。"""
+        now = self._now()
+        cursor = self.conn.execute(
+            """INSERT INTO device_tokens (agent_id, device_token, platform, bundle_id, created_at, last_seen_at, active)
+               VALUES (?,?,?,?,?,?,1)
+               ON CONFLICT(agent_id, device_token) DO UPDATE SET
+                 last_seen_at=excluded.last_seen_at,
+                 active=1,
+                 platform=excluded.platform,
+                 bundle_id=excluded.bundle_id""",
+            (agent_id, device_token, platform, bundle_id, now, now),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_active_device_tokens(self, agent_id: str) -> list[dict]:
+        """Phase 1: 获取某 agent 的所有活跃设备 token。"""
+        rows = self.conn.execute(
+            "SELECT * FROM device_tokens WHERE agent_id=? AND active=1",
+            (agent_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def deactivate_device_token(self, agent_id: str, device_token: str):
+        """Phase 1: 标记设备 token 失效（如 APNs Unregistered 错误）。"""
+        self.conn.execute(
+            "UPDATE device_tokens SET active=0 WHERE agent_id=? AND device_token=?",
+            (agent_id, device_token),
+        )
+        self.conn.commit()
+
+    # ── Agent Events (Phase 4 Checkpoint 准备) ───────────
+
+    def record_agent_event(self, agent_id: str, session_id: str,
+                           correlation_id: str, event_type: str,
+                           payload: dict) -> int:
+        """Phase 4 准备: 写入主 Agent 内部状态变更事件。"""
+        import json as _json
+        cursor = self.conn.execute(
+            """INSERT INTO agent_events
+               (agent_id, session_id, correlation_id, event_type, payload, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (agent_id, session_id, correlation_id, event_type,
+             _json.dumps(payload, ensure_ascii=False, default=str), self._now()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def get_events_by_correlation(self, correlation_id: str) -> list[dict]:
+        """Phase 4 准备: 获取一轮对话的全部事件（按时间顺序）。"""
+        import json as _json
+        rows = self.conn.execute(
+            "SELECT * FROM agent_events WHERE correlation_id=? ORDER BY event_id ASC",
+            (correlation_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            try:
+                payload = _json.loads(r["payload"] or "{}")
+            except (ValueError, TypeError):
+                payload = {}
+            out.append({
+                "event_id": r["event_id"],
+                "agent_id": r["agent_id"],
+                "session_id": r["session_id"],
+                "correlation_id": r["correlation_id"],
+                "event_type": r["event_type"],
+                "payload": payload,
+                "created_at": r["created_at"],
+            })
+        return out
+
+    def get_pending_correlations(self, agent_id: str) -> list[str]:
+        """Phase 4 准备: 列出未完成（有 turn_started 但无 turn_completed）的 correlation_id。"""
+        rows = self.conn.execute(
+            """SELECT DISTINCT correlation_id FROM agent_events
+               WHERE agent_id=? AND event_type='turn_started'
+                 AND correlation_id NOT IN (
+                   SELECT correlation_id FROM agent_events
+                   WHERE event_type='turn_completed'
+                 )""",
+            (agent_id,),
+        ).fetchall()
+        return [r["correlation_id"] for r in rows]
+
     def save_ws_message(self, agent_id: str, session_id: str, seq: int,
                         role: str, type_: str, subtype: str = "",
                         payload: dict | str = None, priority: int = 0) -> int:
-        """保存 WS 消息到持久化表."""
+        """[Legacy] 保存 WS 消息到持久化表 — 旧路径兼容。
+
+        新代码应使用 save_outbox_envelope。
+        """
         import json as _json
         if payload is None:
             payload = {}

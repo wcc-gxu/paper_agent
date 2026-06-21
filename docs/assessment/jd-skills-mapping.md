@@ -161,7 +161,7 @@
 | **PDF 处理** | pymupdf4llm (PDF → 结构化 Markdown) | ✅ 已完成 |
 | **引用管理** | BibTeX 导出 + citation_chase (1-hop) | ✅ 已完成 |
 | **期刊等级** | CCF + SCI → 统一 A+/A/B/C 等级 | ✅ 已完成 |
-| **iOS 推送** | APNs (离线通知) | 📋 规划中 |
+| **iOS 推送** | APNs (离线通知) | 🔶 骨架就位 (device_tokens + register API + APNsPusher 占位；aioapns 真集成后补) |
 | **跨平台** | Ubuntu Server + iOS Client + Docker | 📋 规划中 |
 | **开源实践** | 完整文档 (产品+架构+协议+部署) | 🔧 编写中 |
 

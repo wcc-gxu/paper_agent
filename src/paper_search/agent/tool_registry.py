@@ -621,41 +621,195 @@ class ToolRegistry:
 
     def _register_summarize_memory(self):
         async def summarize_memory(messages_json: str) -> str:
-            return json.dumps({"summary": "Memory compression via LLM (placeholder)", "original_count": len(json.loads(messages_json))})
-        self.register(name="summarize_memory", description="压缩旧对话为摘要。参数: messages_json (消息列表JSON)", func=summarize_memory,
-                      metadata=ToolMetadata(category="memory"))
+            """Phase 4: 真正调 LLM 压缩 ShortTerm 段落。
+
+            messages_json: JSON 数组，含 {role, content}
+            返回 {summary, original_count}
+            """
+            try:
+                msgs = json.loads(messages_json) if isinstance(messages_json, str) else messages_json
+            except Exception as e:
+                return json.dumps({"error": f"invalid messages_json: {e}"})
+            if not msgs:
+                return json.dumps({"summary": "", "original_count": 0})
+
+            mem = self._get_memory_manager()
+            transcript = "\n".join(
+                f"[{m.get('role','?')}] {m.get('content','')[:500]}" for m in msgs
+            )
+
+            # 调用 LLMClientV2 压缩
+            try:
+                from .llm_client_v2 import LLMClientV2
+                llm = LLMClientV2()
+                resp = await llm.chat(
+                    messages=[{"role": "user",
+                                "content": "请把以下对话压缩成 ≤200 字中文要点摘要（保留人物/决策/关键事实，去掉寒暄）：\n\n" + transcript}],
+                    system="你是一个对话摘要助手。",
+                    temperature=0.2,
+                )
+                summary = getattr(resp, "content", None) or str(resp)
+            except Exception as e:
+                summary = f"[summarize failed: {e}] {transcript[:200]}"
+
+            # 应用到 ShortTerm
+            try:
+                mem.short_term.set_summary(summary)
+            except Exception:
+                pass
+            return json.dumps({"summary": summary, "original_count": len(msgs)},
+                              ensure_ascii=False)
+        self.register(
+            name="summarize_memory",
+            description="把多条历史消息压缩成摘要并替换 short_term。参数: messages_json (JSON 数组[{role,content}])",
+            func=summarize_memory,
+            metadata=ToolMetadata(category="memory"),
+        )
 
     def _register_delete_memory(self):
         def delete_memory(message_ids: str) -> str:
-            ids = json.loads(message_ids) if message_ids.startswith("[") else [message_ids]
-            return json.dumps({"deleted": len(ids), "ids": ids})
-        self.register(name="delete_memory", description="删除冗余消息。参数: message_ids (消息ID列表JSON)", func=delete_memory,
-                      metadata=ToolMetadata(category="memory"))
+            """Phase 4: 真删除（ShortTerm + LongTerm）。
+
+            message_ids: JSON 数组，或单个字符串 ID。
+            支持 knowledge_entries 表中的 id 删除。
+            """
+            try:
+                ids = json.loads(message_ids) if message_ids.startswith("[") else [message_ids]
+            except Exception:
+                ids = [message_ids]
+
+            mem = self._get_memory_manager()
+            deleted = 0
+            # 尝试 long_term 删
+            try:
+                for mid in ids:
+                    row = mem._db.conn.execute(
+                        "DELETE FROM knowledge_entries WHERE id=?", (mid,),
+                    )
+                    deleted += row.rowcount or 0
+                mem._db.conn.commit()
+            except Exception as e:
+                logger.debug(f"delete_memory long_term failed: {e}")
+
+            # short_term: 用 deque 难以按 id 精准删；仅按位置粗删
+            try:
+                if hasattr(mem.short_term, "_turns"):
+                    before = len(mem.short_term._turns)
+                    mem.short_term._turns = type(mem.short_term._turns)(
+                        t for t in mem.short_term._turns
+                        if getattr(t, "id", None) not in ids
+                    )
+                    deleted += before - len(mem.short_term._turns)
+            except Exception:
+                pass
+
+            return json.dumps({"deleted": deleted, "ids": ids})
+        self.register(
+            name="delete_memory",
+            description="从短期+长期记忆中删除指定条目。参数: message_ids (JSON 数组或单 ID)",
+            func=delete_memory,
+            metadata=ToolMetadata(category="memory"),
+        )
 
     def _register_extract_to_long_term(self):
         def extract_to_long_term(content_json: str) -> str:
-            items = json.loads(content_json) if isinstance(content_json, str) else content_json
+            """Phase 4: 写 SQLite + ChromaDB 索引。
+
+            content_json: JSON 数组，每项 {key, value, type, paper_id?}
+            """
+            try:
+                items = json.loads(content_json) if isinstance(content_json, str) else content_json
+            except Exception as e:
+                return json.dumps({"error": f"invalid content_json: {e}"})
+
             mem = self._get_memory_manager()
+            from ..agent.memory import KnowledgeEntry
+            extracted = 0
             for item in items:
-                from ..agent.memory import KnowledgeEntry
-                entry = KnowledgeEntry(
-                    id="", title=item.get("key", "extracted"),
-                    content=item.get("value", ""),
-                    category=item.get("type", "finding"),
-                    source_paper_id=item.get("paper_id", ""),
-                    source_paper_title="",
-                )
-                mem.long_term.add_knowledge(entry)
-            return json.dumps({"extracted": len(items)})
-        self.register(name="extract_to_long_term", description="提取持久知识到长期记忆。参数: content_json (知识条目JSON数组)", func=extract_to_long_term,
-                      metadata=ToolMetadata(category="memory"))
+                try:
+                    entry = KnowledgeEntry(
+                        id="", title=item.get("key", "extracted"),
+                        content=item.get("value", ""),
+                        category=item.get("type", "finding"),
+                        source_paper_id=item.get("paper_id", ""),
+                        source_paper_title=item.get("paper_title", ""),
+                    )
+                    entry_id = mem.long_term.add_knowledge(entry)
+                    extracted += 1
+                    # ChromaDB 索引（如果 chroma_store 可用）
+                    chroma = getattr(mem.long_term, "_chroma", None)
+                    if chroma is not None:
+                        try:
+                            # 写入 agent_knowledge collection（如不存在则跳过）
+                            col = (getattr(chroma, "get_collection", None)
+                                   or getattr(chroma, "collection", None))
+                            if callable(col):
+                                col_obj = col("agent_knowledge")
+                            else:
+                                col_obj = None
+                            if col_obj and hasattr(col_obj, "add"):
+                                col_obj.add(
+                                    ids=[entry_id or entry.title],
+                                    documents=[entry.content],
+                                    metadatas=[{
+                                        "category": entry.category,
+                                        "title": entry.title,
+                                        "source_paper_id": entry.source_paper_id,
+                                    }],
+                                )
+                        except Exception as e:
+                            logger.debug(f"chroma index for knowledge failed: {e}")
+                except Exception as e:
+                    logger.debug(f"extract item failed: {e}")
+            return json.dumps({"extracted": extracted, "total": len(items)})
+        self.register(
+            name="extract_to_long_term",
+            description="把要点条目存入长期记忆（SQLite + 向量索引）。参数: content_json (JSON 数组[{key,value,type,paper_id?}])",
+            func=extract_to_long_term,
+            metadata=ToolMetadata(category="memory"),
+        )
 
     def _register_tag_memory(self):
         def tag_memory(message_id: str, tags: str) -> str:
-            tag_list = json.loads(tags) if isinstance(tags, str) else tags
-            return json.dumps({"message_id": message_id, "tags": tag_list, "success": True})
-        self.register(name="tag_memory", description="给消息打标签。参数: message_id, tags (标签列表JSON)", func=tag_memory,
-                      metadata=ToolMetadata(category="memory"))
+            """Phase 4: 在 knowledge_entries 的 metadata 中追加 tags。"""
+            try:
+                tag_list = json.loads(tags) if isinstance(tags, str) else tags
+            except Exception:
+                tag_list = [tags]
+
+            mem = self._get_memory_manager()
+            try:
+                # knowledge_entries 表如果有 tags 字段就更新；
+                # 没有就放 metadata JSON 字段
+                row = mem._db.conn.execute(
+                    "SELECT metadata FROM knowledge_entries WHERE id=?",
+                    (message_id,),
+                ).fetchone()
+                if not row:
+                    return json.dumps({"error": "message_id not found",
+                                        "message_id": message_id})
+                try:
+                    meta = json.loads(row["metadata"] or "{}")
+                except Exception:
+                    meta = {}
+                existing = set(meta.get("tags", []))
+                existing.update(tag_list)
+                meta["tags"] = sorted(existing)
+                mem._db.conn.execute(
+                    "UPDATE knowledge_entries SET metadata=? WHERE id=?",
+                    (json.dumps(meta), message_id),
+                )
+                mem._db.conn.commit()
+                return json.dumps({"message_id": message_id, "tags": list(existing),
+                                    "success": True})
+            except Exception as e:
+                return json.dumps({"error": str(e), "message_id": message_id})
+        self.register(
+            name="tag_memory",
+            description="给长期记忆条目打标签。参数: message_id (knowledge_entries.id), tags (JSON 数组)",
+            func=tag_memory,
+            metadata=ToolMetadata(category="memory"),
+        )
 
     def _register_get_user_preference(self):
         def get_user_preference(key: str) -> str:

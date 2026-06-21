@@ -42,11 +42,24 @@ SUBSCRIPTION_CHECK_INTERVAL_MINUTES = int(
     os.getenv("SUBSCRIPTION_CHECK_INTERVAL_MINUTES", "60")
 )
 
-# ── Celery Beat: 订阅定时检查 ──
+# ── Celery Beat: 定时任务 ──
+# Phase 5: 把 v1 TimerEventSource 的两个系统 Timer 迁到这里
 app.conf.beat_schedule = {
     "check-subscriptions": {
         "task": "paper_search.agent.celery_tasks.subscription_check_task",
         "schedule": crontab(minute=f"*/{max(SUBSCRIPTION_CHECK_INTERVAL_MINUTES, 1)}"),
+        "options": {"queue": "default"},
+    },
+    # 系统健康检查（原 v1: TimerEventSource health_check 每 1200s）→ 每 20 分钟
+    "health-check": {
+        "task": "paper_search.agent.celery_tasks.health_check_task",
+        "schedule": crontab(minute="*/20"),
+        "options": {"queue": "default"},
+    },
+    # 日志清理（原 v1: TimerEventSource cleanup_logs 每 86400s）→ 每天 00:30
+    "cleanup-logs": {
+        "task": "paper_search.agent.celery_tasks.cleanup_logs_task",
+        "schedule": crontab(hour=0, minute=30),
         "options": {"queue": "default"},
     },
 }

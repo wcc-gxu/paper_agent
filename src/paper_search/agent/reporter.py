@@ -133,6 +133,7 @@ class Reporter:
         """
         channel = f"agent:reports:{task_id}"
         message = {
+            "type": "progress",  # 区分于 lifecycle
             "task_id": task_id,
             "agent_type": agent_type,
             "stage": stage,
@@ -149,6 +150,40 @@ class Reporter:
             self.redis.publish(channel, json.dumps(message, ensure_ascii=False, default=str))
         except Exception as e:
             logger.warning(f"Failed to publish report to {channel}: {e}")
+
+    def publish_lifecycle(self, task_id: str, agent_type: str,
+                          lifecycle: str, summary: str = "",
+                          result: dict = None, error: str = ""):
+        """发布子 Agent 生命周期事件 (Pub/Sub → agent:reports:{task_id})。
+
+        与 publish_report 的"per-stage progress"不同，lifecycle 事件代表
+        整个子 Agent 的"启动 / 完成 / 失败"，由订阅方用来判定子 Agent
+        是否真的结束（替代 v2 误判 per-paper status=done 的 Bug）。
+
+        Args:
+            task_id: 任务 ID
+            agent_type: 子 Agent 类型
+            lifecycle: "agent_started" | "agent_done" | "agent_failed"
+            summary: 简短描述（给 iOS 展示）
+            result: 完整结果（done 时）
+            error: 错误信息（failed 时）
+        """
+        channel = f"agent:reports:{task_id}"
+        message = {
+            "type": "lifecycle",  # 关键标记：订阅方依赖此字段判定完成
+            "task_id": task_id,
+            "agent_type": agent_type,
+            "lifecycle": lifecycle,
+            "summary": summary,
+            "result": result or {},
+            "error": error,
+            "timestamp": _now(),
+        }
+        try:
+            self.redis.publish(channel, json.dumps(message, ensure_ascii=False, default=str))
+            logger.info(f"[LIFECYCLE] task={task_id} agent={agent_type} {lifecycle}")
+        except Exception as e:
+            logger.warning(f"Failed to publish lifecycle to {channel}: {e}")
 
     def publish_notification(self, notification: dict):
         """发布跨进程通知到 agent:notifications channel。

@@ -115,6 +115,11 @@ async def lifespan(app: FastAPI):
 
     yield
     logger.info("Paper Agent API shutting down...")
+    try:
+        from .outbox_poller import stop_all_pollers
+        await stop_all_pollers()
+    except Exception as e:
+        logger.warning(f"stop_all_pollers failed: {e}")
     if _db:
         _db.close()
     if _engine:
@@ -151,11 +156,13 @@ app.include_router(router)
 
 @app.websocket("/ws/chat/{agent_id}/{session_id}")
 async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
-    """WebSocket 中继 — v9.0 无握手协议。
+    """WebSocket 中继 — v9.0 无握手协议 + Phase 1 outbox 模式。
 
     - 连接即用，不需要握手
-    - 收消息 → LPUSH Redis → Daemon 消费
-    - Daemon 回复 → Pub/Sub → WS send → iOS
+    - 收消息 → LPUSH agent:ws:{agent_id} → Daemon 消费
+    - Daemon 通过 outbox_publish 写消息 → API 进程的 outbox_poller
+      从 outbox:{agent_id} BRPOP → 这里 send_text
+    - sync_request: iOS 发 sync_request → 拉取未送达的历史消息回放
     - 永不主动断开连接
     """
     import json as _json
@@ -185,38 +192,13 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
         return
 
     ws_queue = f"agent:ws:{agent_id}"
-    output_channel = f"agent:output:{agent_id}:{session_id}"
 
-    # ── 后台 Task: Redis Pub/Sub → WebSocket ───────────
-    async def _output_relay():
-        """订阅 Daemon output channel，转发到 WebSocket。不断线重连。"""
-        while True:
-            try:
-                pubsub = _redis.pubsub()
-                await pubsub.subscribe(output_channel)
-                logger.info("📡 OUTPUT RELAY subscribed: %s", output_channel)
-                async for msg in pubsub.listen():
-                    if msg["type"] != "message":
-                        continue
-                    try:
-                        data = msg["data"]
-                        # 快速解析 type/subType 用于日志
-                        try:
-                            env = _json.loads(data)
-                            logger.info(
-                                "📤 WS SEND | type=%s/%s size=%d",
-                                env.get("type", "?"), env.get("subType", ""), len(data),
-                            )
-                        except Exception:
-                            logger.info("📤 WS SEND raw (%d bytes)", len(data))
-                        await websocket.send_text(data)
-                    except Exception:
-                        pass  # 客户端可能已断开，不 crash
-            except Exception as e:
-                logger.warning(f"Output relay error, reconnecting: {e}")
-                await _asyncio.sleep(1)
-
-    relay_task = _asyncio.create_task(_output_relay())
+    # ── Phase 1: 启动 outbox_poller (每个 agent 一个，幂等) ──────
+    from .outbox_poller import start_poller
+    db = get_db()
+    poller_task = start_poller(agent_id, ws_manager, db,
+                                redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    logger.info("📡 OutboxPoller running for agent=%s", agent_id)
 
     # ── Redis LPUSH helper ──────────────────────────────
     async def _push_to_redis(msg: dict):
@@ -232,6 +214,50 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 logger.warning(f"Redis LPUSH attempt {attempt+1}/3: {e}")
                 await _asyncio.sleep(0.5)
         return False
+
+    # ── Phase 1: sync_request 处理（拉历史消息） ──────────
+    async def _handle_sync_request(msg: dict):
+        """iOS 重连后请求拉取未送达的历史消息。
+
+        请求格式: {type: "sync_request", payload: {last_msg_id?: "..."}}
+        响应: 多条历史 envelope + {type: "sync_complete", payload: {synced_count: N}}
+        """
+        payload = msg.get("payload", {}) or {}
+        last_msg_id = payload.get("last_msg_id", "")
+        try:
+            history = db.get_undelivered_messages(
+                agent_id, session_id, since_msg_id=last_msg_id,
+            )
+        except Exception as e:
+            logger.warning(f"sync_request: get_undelivered failed: {e}")
+            history = []
+
+        synced = 0
+        for env in history:
+            try:
+                await websocket.send_text(_json.dumps(env, ensure_ascii=False, default=str))
+                mid = env.get("msg_id", "")
+                if mid:
+                    try:
+                        db.mark_message_delivered(mid, session_id)
+                    except Exception:
+                        pass
+                synced += 1
+            except Exception as e:
+                logger.warning(f"sync_request: send failed at #{synced}: {e}")
+                break
+
+        try:
+            await websocket.send_text(_json.dumps({
+                "type": "sync_complete",
+                "role": "assistant",
+                "agentId": agent_id,
+                "sessionId": session_id,
+                "payload": {"synced_count": synced},
+            }, ensure_ascii=False))
+        except Exception:
+            pass
+        logger.info("🔄 SYNC | agent=%s sess=%s replayed=%d", agent_id, session_id, synced)
 
     # ── 主消息循环 (永不主动断开) ──────────────────────
     while True:
@@ -304,15 +330,16 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 pass
             continue
 
+        # Phase 1: sync_request → 回放未送达历史
+        if msg_type == "sync_request":
+            await _handle_sync_request(msg)
+            continue
+
         # 所有其他消息 → LPUSH Redis
         await _push_to_redis(msg)
 
     # ── 清理 ────────────────────────────────────────────
-    relay_task.cancel()
-    try:
-        await relay_task
-    except _asyncio.CancelledError:
-        pass
+    # poller_task 不在这里 stop（其他 session 可能还要用），由 lifespan 关闭
     if _redis:
         await _redis.close()
     await ws_manager.disconnect(agent_id, session_id, websocket)
