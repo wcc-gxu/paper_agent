@@ -2,14 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent 5 节点 · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — MemGPT 记忆
+> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent 6 节点 · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — MemGPT 记忆
 
 ## 项目概述
 
 Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/下载/阅读/综述/知识库沉淀。支持视频分享链接解析+下载+转写+LLM总结。
 
 - **产品形态**: Python 后端 (FastAPI + WebSocket) + iOS 客户端
-- **主 Agent**: MainAgent (5 节点显式状态机 + JSON Schema 强约束)
+- **主 Agent**: MainAgent (6 节点显式状态机 + JSON Schema 强约束，含 safety 前置过滤)
 - **消息链路**: Outbox 模式 (Redis List + SQLite 持久化 + APNs 离线推送)
 - **存储**: SQLite (元数据+消息+事件源) + ChromaDB (向量) + Redis (队列) + 文件系统 (PDF/MD/Video)
 - **定时任务**: Celery Beat (订阅检查 + health_check + cleanup_logs)
@@ -44,37 +44,49 @@ sudo apt install ffmpeg redis-server
 
 ## 核心架构
 
-### 主 Agent — 5 节点状态机 (MainAgent)
+### 主 Agent — 6 节点状态机 (MainAgent)
 
 ```
 WS 消息 → BRPOP agent:ws:{agent_id}
               ↓
-       intent_classify (LLM #1, JSON Schema)
+       safety_filter (regex 黑名单 → 命中时 LLM 二次确认, SafetyResult)
+              ↓
+       safe? ─── no ──→ 推 high 拒答 → END
+              ↓ yes
+       intent_classify (LLM #1, IntentClassifyResult)
               ↓
        intent_kind ∈ {business, chat, meta, unsupported}
               ↓
-        ┌─────┴─────┐
-   business        chat/meta/unsupported
-       ↓                 ↓
-  scenario_plan      inline_reply (LLM 流式 thinking+text)
-   (LLM #2)             ↓
-       ↓             END (message/text)
-   needs_clarify? → ask_user_question → (回答后再 plan)
-       ↓
-   needs_approval? → propose_plan → (用户批准)
-       ↓
-   execute_plan (并行调度 tools[] / sub_agent / ios_tool / ask_user)
-       ↓
+       intent_kind == business?
+              ↓
+         ┌────┴────┐
+        yes        no
+         ↓          ↓
+   maybe_clarify_low_confidence (C3)
+   ├ 高置信 scenarios → 保留
+   ├ 部分高 → 留高丢低
+   └ 全低 → ask_user 列候选 + "都不是"
+         ↓             ↓
+   scenario_plan    inline_reply (LLM 流式 thinking+text)
+   (LLM #2,            ↓
+    ScenarioPlanResult)  END
+   ├ 多 scenario 时逐场景生成子 plan → 合并 tools[]
+   ├ needs_clarify? → ask_user_question
+   ├ needs_approval? → propose_plan
+   └ execute_plan (并行调度 tools[] / sub_agent / ios_tool / ask_user)
+         ↓
    evaluate_completion (LLM #4)
-       ↓
+         ↓
    satisfied? → END | needs_more → execute_plan (最多 3 次迭代)
 ```
 
 文件: [src/paper_search/agent/main_agent.py](src/paper_search/agent/main_agent.py) · prompts/schemas: [main_agent_prompts.py](src/paper_search/agent/main_agent_prompts.py)
 
+**C1 安全前置（2026-06-22 新增）**：regex 黑名单只覆盖最高频的 prompt injection / jailbreak / PII 提取模式，命中后由小 LLM 二次确认避免误杀学术语境。`INTENT_ASK_THRESHOLD` 环境变量（默认 0.6）控制 C3 灰区阈值。
+
 ### 17 个业务场景
 
-`intent_classify` 把用户消息映射到 17 个 scenario_id 之一：
+`intent_classify` 把用户消息映射到 1~N 个 scenario_id（**支持复合意图**，2026-06-22 起）。LLM 返回 `scenarios: list[ScenarioMatch]`，每个场景独立判断 confidence：
 
 | ID | 场景 | 实现 |
 |---|---|---|
@@ -102,7 +114,8 @@ WS 消息 → BRPOP agent:ws:{agent_id}
 
 主 Agent 的 LLM 调用全部通过 `llm_client_v2.chat_json(schema=PydanticClass)` 强制结构化输出：
 
-- `IntentClassifyResult` — intent_kind + scenario_id + confidence + reasoning
+- `SafetyResult` — safe + risk_kind ∈ {prompt_injection, jailbreak, pii_leak, other} + user_message（C1 安全前置）
+- `IntentClassifyResult` — intent_kind + **scenarios: list[ScenarioMatch]**（C2 支持复合意图）+ overall_confidence + reasoning
 - `ScenarioPlanResult` — summary + needs_clarification + needs_approval + permissions + **tools[] 一次性返回所有调用**
 - `EvaluateCompletionResult` — satisfied + needs_more_tools + final_message
 
@@ -206,8 +219,8 @@ VideoAgent (graphs/video_graph.py)            parse_link→fetch_metadata→down
 src/paper_search/
 ├── agent/                          # Agent 核心
 │   ├── daemon.py                   # 守护进程 + AgentBootstrap + MainAgent 启动
-│   ├── main_agent.py               # MainAgent 5 节点状态机（替代 v1/v2）
-│   ├── main_agent_prompts.py       # 17 scenario 定义 + 3 节点 Pydantic schema
+│   ├── main_agent.py               # MainAgent 6 节点状态机（含 safety 前置 + 复合意图）
+│   ├── main_agent_prompts.py       # 17 scenario 定义 + 4 节点 Pydantic schema (Safety/Intent/Plan/Eval)
 │   ├── outbox.py                   # 出站消息双写 (SQLite + Redis List)
 │   ├── db.py                       # SQLite 持久化 (AgentDB)
 │   ├── memory.py                   # MemGPT 4 层记忆 (ShortTerm/MidTerm/LongTerm/Meta)
@@ -294,6 +307,7 @@ src/paper_search/
 | `WHISPER_MODEL_SIZE` | Whisper 模型大小 (默认 `small`) |
 | `CLOAKBROWSER_HEADLESS` | 浏览器无头模式 (默认 `1`) |
 | `SUBSCRIPTION_CHECK_INTERVAL_MINUTES` | 订阅检查间隔 (默认 `60`) |
+| `INTENT_ASK_THRESHOLD` | C3 灰区阈值 (默认 `0.6`)：所有 scenario.confidence < 此值时触发 ask_user 让用户挑选场景 |
 | `API_KEY` | Bearer Token (REST API 认证，不设则禁用) |
 | `APNS_KEY_PATH` / `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` / `APNS_USE_SANDBOX` | APNs 推送 (Phase 1 骨架就位，aioapns 后补) |
 
@@ -329,9 +343,11 @@ Python >= 3.11
 
 | 模块 | 状态 | 说明 |
 |---|:---:|---|
-| MainAgent (5 节点) | ✅ | 替代 v1 (PlanGraph) 和 v2 (AgentLoop) |
-| LLM JSON Schema 强约束 | ✅ | IntentClassifyResult / ScenarioPlanResult / EvaluateCompletionResult |
-| 17 业务场景 | ✅ | 完整覆盖 + intent_classify 路由 |
+| MainAgent (6 节点) | ✅ | 替代 v1 (PlanGraph) 和 v2 (AgentLoop)；2026-06-22 新增 safety 前置 |
+| LLM JSON Schema 强约束 | ✅ | SafetyResult / IntentClassifyResult / ScenarioPlanResult / EvaluateCompletionResult |
+| 17 业务场景 | ✅ | 完整覆盖 + intent_classify 路由（**支持复合意图，scenarios=list**） |
+| 安全前置 (C1) | ✅ | regex 黑名单 + LLM 二次确认（注入/越狱/PII 提取拦截） |
+| 灰区 ask_user (C3) | ✅ | scenario.confidence < 0.6 时列候选场景让用户选 |
 | Outbox 模式 (持久化+队列) | ✅ | 所有出站消息双写 |
 | outbox_poller (WS/APNs 分发) | ✅ | 每 agent 一个 poller，按在线状态分发 |
 | APNs 推送 | 🔶 | 骨架就位（device_tokens 表 + REST 端点 + APNsPusher），aioapns 真实集成后补 |

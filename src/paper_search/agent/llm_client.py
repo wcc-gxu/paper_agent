@@ -244,9 +244,14 @@ class LLMClient:
         try:
             result = await self._chat_json(self.RELEVANCE_SYSTEM_PROMPT, user_message)
         except Exception as e:
-            logger.warning(f"相关性评估失败: {e}")
-            # 降级：默认相关
-            return RelevanceJudgment(score=0.5, reason="评估失败，默认保留", is_relevant=True)
+            # L4 fail-closed：评估失败 → 默认不相关（不再保留垃圾论文进入语料库）
+            # 上游 evaluate_batch 收到 is_relevant=False 时会自动剔除
+            logger.warning(
+                f"相关性评估失败: {e}, FAIL-CLOSED → is_relevant=False (剔除该篇)"
+            )
+            return RelevanceJudgment(
+                score=0.0, reason=f"评估失败 ({e})，按不相关处理", is_relevant=False,
+            )
 
         return RelevanceJudgment(
             score=float(result.get("score", 0.5)),
@@ -376,8 +381,20 @@ class LLMClient:
 ## 建议
 根据搜索结果，给出进一步研究的建议（2-3 条）"""
 
-    async def generate_report(self, user_query: str, papers: list, judgments: list) -> str:
-        """Stage 6: 生成搜索报告。"""
+    async def generate_report(
+        self,
+        user_query: str,
+        papers: list,
+        judgments: list,
+        db=None,
+        project_id: Optional[str] = None,
+    ) -> str:
+        """Stage 6: 生成搜索报告。
+
+        L2 反幻觉：传入 db 时，对生成的报告做 CitationVerifier 引用校验
+        （parse + match，不做 fact-check 以控成本）。校验失败的引用会被标记
+        ⚠️[verify] 或删除，报告末尾附审计段。
+        """
         # 按评分排序
         scored = sorted(
             zip(papers, judgments),
@@ -397,7 +414,17 @@ class LLMClient:
             f"搜索结果 (共 {len(papers)} 篇，展示前30):\n" + "\n".join(paper_summaries)
         )
         try:
-            return await self._chat(self.REPORT_SYSTEM_PROMPT, user_message, temperature=0.5)
+            report = await self._chat(self.REPORT_SYSTEM_PROMPT, user_message, temperature=0.5)
         except Exception as e:
-            logger.error(f"报告生成失败: {e}")
-            return f"# 搜索报告\n\n搜索: {user_query}\n找到 {len(papers)} 篇论文\n\n(报告生成失败: {e})"
+            logger.error(f"报告生成失败 ({type(e).__name__})", exc_info=True)
+            return (
+                f"# 搜索报告\n\n搜索: {user_query}\n找到 {len(papers)} 篇论文\n\n"
+                f"(报告生成失败：{type(e).__name__}，详见服务日志)"
+            )
+
+        # L2 反幻觉：CitationVerifier 校验引用
+        if db is not None:
+            from .verifier import verify_and_wrap_report
+            report = await verify_and_wrap_report(report, db, project_id)
+
+        return report

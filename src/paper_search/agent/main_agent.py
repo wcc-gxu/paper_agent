@@ -21,6 +21,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -31,9 +33,12 @@ from .main_agent_prompts import (
     SCENARIOS,
     EvaluateCompletionResult,
     IntentClassifyResult,
+    SafetyResult,
+    ScenarioMatch,
     ScenarioPlanResult,
     ToolCallSpec,
     build_intent_classify_prompt,
+    build_safety_filter_prompt,
     build_scenario_plan_prompt,
 )
 from .outbox import outbox_publish
@@ -47,6 +52,45 @@ TOOL_TIMEOUT_SEC = 5 * 60        # CLI 工具默认 5 分钟
 SUB_AGENT_TIMEOUT_SEC = 30 * 60  # 子 Agent 默认 30 分钟
 IOS_TIMEOUT_SEC = 2 * 60         # iOS 工具默认 2 分钟
 ASK_USER_TIMEOUT_SEC = 30 * 60   # 等用户回答最长 30 分钟
+
+# C3: 灰区阈值 — 当所有 scenario.confidence 都低于此值时，触发 ask_user 让用户挑选
+# 可通过环境变量 INTENT_ASK_THRESHOLD 覆盖（默认 0.6）
+INTENT_ASK_THRESHOLD = float(os.getenv("INTENT_ASK_THRESHOLD", "0.6"))
+
+# C1: 安全前置过滤的 regex 黑名单（毫秒级兜底；命中后再让小 LLM 二次确认）
+# 只覆盖最高频的注入/越狱模式，宁缺勿滥避免误杀正常学术提问
+_SAFETY_REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
+    # prompt injection
+    ("prompt_injection", re.compile(
+        r"(忽略|ignore|disregard|forget).{0,15}(前面|above|previous|all|之前).{0,10}(指令|instruction|prompt|rule|规则)",
+        re.IGNORECASE)),
+    ("prompt_injection", re.compile(
+        r"(system\s*:|<\s*system\s*>|你的(系统|底层)\s*(prompt|提示|指令))",
+        re.IGNORECASE)),
+    ("prompt_injection", re.compile(
+        r"(输出|reveal|show|print|dump).{0,20}(完整|整个|全部|full|entire|raw).{0,10}(prompt|提示词|system\s*message)",
+        re.IGNORECASE)),
+    # jailbreak
+    ("jailbreak", re.compile(
+        r"(假装|pretend|act\s+as|你现在是|now\s+you\s+are).{0,30}(DAN|不受限|没有限制|no\s+restriction|jailbroken)",
+        re.IGNORECASE)),
+    # pii / secret leak attempts
+    ("pii_leak", re.compile(
+        r"(列出|输出|发送|export|list|dump).{0,15}(所有|全部|all)?\s*(API\s*key|token|密钥|\.env|环境变量)",
+        re.IGNORECASE)),
+    ("pii_leak", re.compile(
+        # 中文动宾倒装：把/将 ... API key/密钥 ... 列出/发出/打印/告诉
+        r"(把|将|要).{0,20}(API\s*key|token|密钥|\.env|环境变量).{0,20}(列出|发出|输出|告诉|打印|说出|展示)",
+        re.IGNORECASE)),
+]
+
+
+def _safety_regex_check(text: str) -> Optional[str]:
+    """对 user_content 跑 regex 黑名单。命中返回 risk_kind，否则 None。"""
+    for kind, pat in _SAFETY_REGEX_PATTERNS:
+        if pat.search(text):
+            return kind
+    return None
 
 
 def _now() -> str:
@@ -174,13 +218,33 @@ class MainAgent:
     # ── 一轮对话调度 ───────────────────────────────────
 
     async def _run_turn(self, session_id: str, user_content: str):
-        """节点 1 (intent_classify) → 分支到 inline_reply 或 scenario_plan。"""
-        # 节点 1: 意图分类
+        """节点 0 (safety_filter) → 节点 1 (intent_classify) → 分支。"""
+        # 节点 0: C1 安全前置过滤（regex 兜底 + 命中时 LLM 二次确认）
+        safety = await self._node_safety_filter(session_id, user_content)
+        self._record_event(session_id, "safety_checked", safety.model_dump())
+        if not safety.safe:
+            await self._push(
+                session_id, "message", "text", "assistant",
+                payload={"content": safety.user_message
+                         or "抱歉，这个请求超出我能帮助的范围。"},
+                priority_kind="high",
+            )
+            logger.info("🛡️ safety BLOCKED | risk=%s reason=%s",
+                        safety.risk_kind, safety.reasoning[:80])
+            return
+
+        # 节点 1: 意图分类（C2: 现在 scenarios 是 list）
         intent = await self._node_intent_classify(session_id, user_content)
         self._record_event(session_id, "intent_classified", intent.model_dump())
 
-        if intent.intent_kind == "business" and intent.scenario_id:
-            # 节点 2A: 业务场景规划
+        # C3: business 但全部 scenario 都低于阈值 → 询问用户挑选
+        if intent.intent_kind == "business":
+            intent = await self._maybe_clarify_low_confidence(
+                session_id, user_content, intent,
+            )
+
+        if intent.intent_kind == "business" and intent.scenarios:
+            # 节点 2A: 业务场景规划（C2: 传入 scenarios list）
             await self._node_scenario_plan(session_id, user_content, intent)
         else:
             # 节点 2B: 闲聊 / meta / unsupported 直接回复
@@ -209,10 +273,55 @@ class MainAgent:
 
         self._record_event(session_id, "turn_completed", {"outcome": "done"})
 
+    # ── 节点 0: safety_filter (C1) ─────────────────────
+
+    async def _node_safety_filter(self, session_id: str,
+                                   user_content: str) -> SafetyResult:
+        """C1: 安全前置过滤 — 仅识别对抗性输入（注入/越狱/PII 提取尝试）。
+
+        策略：regex 黑名单先跑（90%+ 输入秒过且不调 LLM）；
+              regex 命中才走小模型二次确认（避免误杀，比如学术讨论 prompt injection 本身）。
+        """
+        # 1. regex 兜底
+        regex_hit = _safety_regex_check(user_content)
+        if regex_hit is None:
+            return SafetyResult(safe=True, reasoning="regex_pass")
+
+        logger.info("🛡️ safety regex hit: kind=%s, asking LLM to confirm", regex_hit)
+
+        # 2. 命中规则 → 调 LLM 二次确认（避免学术语境的误杀）
+        try:
+            data = await self._llm.chat_json(
+                messages=[{"role": "user", "content": user_content}],
+                schema=SafetyResult,
+                temperature=0.0,
+                system=build_safety_filter_prompt(),
+            )
+            result = SafetyResult.model_validate(data)
+            # LLM 没标 risk_kind 但又说 unsafe → 补 regex 命中的类型
+            if not result.safe and not result.risk_kind:
+                result.risk_kind = regex_hit  # type: ignore[assignment]
+            return result
+        except Exception as e:
+            # L4 fail-closed：regex 已命中，LLM 又不可用 → 默认按 unsafe 处理
+            # （宁可误杀也不放行注入攻击；regex 命中本身就说明文本可疑）
+            logger.warning(
+                f"safety LLM confirm failed: {e}, FAIL-CLOSED → safe=False (regex hit: {regex_hit})"
+            )
+            return SafetyResult(
+                safe=False,
+                risk_kind=regex_hit,  # type: ignore[arg-type]
+                reasoning=f"regex_hit_{regex_hit}_llm_unavailable_fail_closed",
+                user_message="抱歉，系统暂时无法处理这个请求，请稍后再试或换个表述。",
+            )
+
     # ── 节点 1: intent_classify ────────────────────────
 
     async def _node_intent_classify(self, session_id: str, user_content: str) -> IntentClassifyResult:
-        """LLM 把用户消息分类到 business/chat/meta/unsupported。"""
+        """LLM 把用户消息分类到 business/chat/meta/unsupported。
+
+        C2 改造：business 时 scenarios 是 list，支持复合意图（一条消息触发多场景）。
+        """
         history = self._build_history_context(session_id, limit=20)
         messages = history + [{"role": "user", "content": user_content}]
         system = build_intent_classify_prompt()
@@ -227,8 +336,8 @@ class MainAgent:
         except Exception as e:
             logger.warning(f"intent_classify LLM failed: {e}, defaulting to chat")
             return IntentClassifyResult(
-                intent_kind="chat", scenario_id=None,
-                confidence=0.0, reasoning=f"LLM error: {e}",
+                intent_kind="chat", scenarios=[],
+                overall_confidence=0.0, reasoning=f"LLM error: {e}",
             )
 
         try:
@@ -236,91 +345,192 @@ class MainAgent:
         except Exception as e:
             logger.warning(f"intent_classify schema invalid: {e}, raw={data}")
             return IntentClassifyResult(
-                intent_kind="chat", scenario_id=None,
-                confidence=0.0, reasoning=f"Invalid schema: {e}",
+                intent_kind="chat", scenarios=[],
+                overall_confidence=0.0, reasoning=f"Invalid schema: {e}",
             )
 
-        # 置信度低 → 退化到 chat
-        if result.intent_kind == "business" and result.confidence < 0.5:
-            logger.info(f"Low confidence ({result.confidence}), treating as chat")
+        # 整体置信度过低 → 降级为 chat（保留旧行为）
+        if result.intent_kind == "business" and result.overall_confidence < 0.5:
+            logger.info(
+                f"Low overall_confidence ({result.overall_confidence}), treating as chat",
+            )
             result.intent_kind = "chat"
-            result.scenario_id = None
+            result.scenarios = []
 
         logger.info(
-            "🧭 intent_classify | kind=%s scenario=%s conf=%.2f",
-            result.intent_kind, result.scenario_id, result.confidence,
+            "🧭 intent_classify | kind=%s scenarios=%s overall=%.2f",
+            result.intent_kind,
+            [(s.scenario_id, round(s.confidence, 2)) for s in result.scenarios],
+            result.overall_confidence,
         )
         return result
+
+    # ── C3: 灰区处理 — 低置信度时让用户挑选 ────────────
+
+    async def _maybe_clarify_low_confidence(
+        self, session_id: str, user_content: str,
+        intent: IntentClassifyResult,
+    ) -> IntentClassifyResult:
+        """C3: 当所有 scenario 都低于 INTENT_ASK_THRESHOLD 时，问用户挑选。
+
+        逻辑：
+          - 没有 scenario（business 但 list 空）→ 把所有 17 场景列出来让用户挑（不推荐，避免）；
+            这里我们直接降级为 chat（让 inline_reply 处理）
+          - 至少 1 个 scenario.confidence >= 阈值 → 保留这些高置信度的，过滤掉低的，正常进入 plan
+          - 全部 < 阈值（但都 > 0.3，否则 overall_confidence 已经降级过了）→ ask_user，
+            列出所有 candidate scenarios + "都不是"选项
+        """
+        if not intent.scenarios:
+            # business 但场景列表空 → 降级为 chat
+            logger.info("intent=business 但 scenarios 空，降级为 chat")
+            intent.intent_kind = "chat"
+            return intent
+
+        high_conf = [s for s in intent.scenarios
+                     if s.confidence >= INTENT_ASK_THRESHOLD]
+        if high_conf:
+            # 有至少一个高置信度场景 → 保留高的，丢弃低的
+            if len(high_conf) != len(intent.scenarios):
+                dropped = [s.scenario_id for s in intent.scenarios
+                           if s.confidence < INTENT_ASK_THRESHOLD]
+                logger.info(
+                    "C3: 保留高置信场景 %s，过滤低置信 %s",
+                    [s.scenario_id for s in high_conf], dropped,
+                )
+            intent.scenarios = high_conf
+            return intent
+
+        # 全部低于阈值 → ask_user 挑选
+        return await self._ask_user_pick_scenario(session_id, user_content, intent)
+
+    async def _ask_user_pick_scenario(
+        self, session_id: str, user_content: str,
+        intent: IntentClassifyResult,
+    ) -> IntentClassifyResult:
+        """C3: 列出所有 candidate scenarios 让用户挑（可多选）。
+
+        用户回复后，把所选 scenarios 注入 intent.scenarios（confidence 设为 1.0），
+        其它分支继续走 _node_scenario_plan。
+        """
+        options = []
+        for sm in intent.scenarios:
+            sc = SCENARIOS.get(sm.scenario_id) or {}
+            options.append(
+                f"{sm.scenario_id}: {sc.get('name', sm.scenario_id)} "
+                f"（{sc.get('description', '')[:40]}）"
+            )
+        options.append("都不是 / 重新描述")
+
+        call_id = _new_call_id()
+        question_payload = {
+            "id": call_id,
+            "questions": [{
+                "id": "scenario_pick",
+                "question": (
+                    f"我对你的请求「{user_content[:60]}」有几种可能的理解，"
+                    "请帮我确认是哪一种（可多选）："
+                ),
+                "type": "multi_choice",
+                "options": options,
+            }],
+            "context": (
+                "我会按你选择的场景来规划。"
+                f"（参考依据：{intent.reasoning[:80]}）"
+            ),
+        }
+        await self._push(session_id, "tool", "ask_user_question",
+                         "assistant", payload=question_payload,
+                         priority_kind="high")
+        self._record_event(session_id, "intent_clarify_requested",
+                           {"candidates": [s.model_dump() for s in intent.scenarios],
+                            "msg_id": call_id})
+        reply = await self._wait_ws_reply(session_id, "tool", "ask_user_question",
+                                          timeout=ASK_USER_TIMEOUT_SEC)
+        if reply is None:
+            # 超时 → 降级为 chat
+            intent.intent_kind = "chat"
+            intent.scenarios = []
+            return intent
+
+        answers = reply.get("answers", [])
+        # 答案形如 [{"id": "scenario_pick", "value": ["S1: 文献调研 ...", "..."]}]
+        # 或 [{"id": "scenario_pick", "value": "S1: 文献调研 ..."}]
+        chosen_labels: list[str] = []
+        for a in answers:
+            v = a.get("value") or a.get("answer")
+            if isinstance(v, list):
+                chosen_labels.extend(str(x) for x in v)
+            elif v:
+                chosen_labels.append(str(v))
+
+        # 解析回 scenario_id（label 开头格式为 "Sx: ..."）
+        chosen_sids: list[str] = []
+        for lab in chosen_labels:
+            if ":" in lab:
+                sid = lab.split(":", 1)[0].strip()
+                if sid in SCENARIOS:
+                    chosen_sids.append(sid)
+
+        if not chosen_sids:
+            # 用户选了"都不是" → 降级为 chat
+            logger.info("C3: 用户表示候选场景都不对，降级为 chat")
+            intent.intent_kind = "chat"
+            intent.scenarios = []
+            return intent
+
+        # 注入用户选择，confidence 直接置 1.0（因为用户亲口说的）
+        intent.scenarios = [
+            ScenarioMatch(scenario_id=sid, confidence=1.0,  # type: ignore[arg-type]
+                          reasoning="user_picked")
+            for sid in chosen_sids
+        ]
+        self._record_event(session_id, "intent_clarify_received",
+                           {"chosen": chosen_sids})
+        logger.info("C3: 用户确认场景 %s", chosen_sids)
+        return intent
 
     # ── 节点 2A: scenario_plan (business) ─────────────
 
     async def _node_scenario_plan(self, session_id: str, user_content: str,
                                    intent: IntentClassifyResult):
-        """业务场景：生成结构化 plan，可能含 clarify/approval，最后执行。"""
-        scenario_id = intent.scenario_id
-        if not scenario_id or scenario_id not in SCENARIOS:
+        """业务场景：生成结构化 plan，可能含 clarify/approval，最后执行。
+
+        C2 改造：intent.scenarios 是 list，可能含 1~N 个场景。
+          - 单场景：和原有行为一致
+          - 多场景：为每个场景生成子 plan，合并 tools[]、permissions、summary 后统一审批+执行
+        """
+        scenarios = intent.scenarios
+        if not scenarios:
             await self._push(session_id, "error", "INTERNAL_ERROR", "system",
-                             payload={"message": f"未知场景 {scenario_id}"},
+                             payload={"message": "无可用场景"},
                              priority_kind="urgent")
             return
 
-        # 迭代生成 plan：如果 needs_clarification，问完再调一次
-        history = self._build_history_context(session_id, limit=20)
-        messages = history + [{"role": "user", "content": user_content}]
-        system = build_scenario_plan_prompt(scenario_id)
-        plan: Optional[ScenarioPlanResult] = None
-
-        for clarify_round in range(3):  # 最多 3 次澄清
-            try:
-                data = await self._llm.chat_json(
-                    messages=messages, schema=ScenarioPlanResult,
-                    temperature=0.2, system=system,
-                )
-                plan = ScenarioPlanResult.model_validate(data)
-            except Exception as e:
-                logger.warning(f"scenario_plan LLM/schema failed: {e}")
+        # 校验每个 scenario_id 都合法
+        for sm in scenarios:
+            if sm.scenario_id not in SCENARIOS:
                 await self._push(session_id, "error", "INTERNAL_ERROR", "system",
-                                 payload={"message": f"方案生成失败: {e}"},
+                                 payload={"message": f"未知场景 {sm.scenario_id}"},
                                  priority_kind="urgent")
                 return
 
-            self._record_event(session_id, "scenario_planned", plan.model_dump())
-            logger.info(
-                "📋 scenario_plan | sid=%s clarify=%s approval=%s tools=%d",
-                plan.scenario_id, plan.needs_clarification, plan.needs_approval,
-                len(plan.tools),
+        # 逐个场景生成子 plan
+        sub_plans: list[ScenarioPlanResult] = []
+        for idx, sm in enumerate(scenarios):
+            sub_plan = await self._plan_one_scenario(
+                session_id, user_content, sm.scenario_id,
+                scenario_idx=idx,
             )
+            if sub_plan is None:
+                return  # 已发 error 或超时
+            sub_plans.append(sub_plan)
 
-            if plan.needs_clarification and plan.clarification_questions:
-                # 发 ask_user_question，等用户回答
-                msg_id = await self._push(session_id, "tool", "ask_user_question",
-                                          "assistant", payload={
-                                              "id": _new_call_id(),
-                                              "questions": [q.model_dump()
-                                                            for q in plan.clarification_questions],
-                                              "context": plan.summary,
-                                          })
-                self._record_event(session_id, "clarification_requested",
-                                   {"questions": [q.model_dump() for q in plan.clarification_questions],
-                                    "msg_id": msg_id})
-                reply = await self._wait_ws_reply(session_id, "tool", "ask_user_question",
-                                                  timeout=ASK_USER_TIMEOUT_SEC)
-                if reply is None:
-                    return  # 超时已发 error
-                answers = reply.get("answers", [])
-                self._record_event(session_id, "clarification_received",
-                                   {"answers": answers})
-                # 把答案追加到上下文，再问 LLM
-                messages.append({
-                    "role": "user",
-                    "content": "针对你刚才的问题，我的回答是：" + json.dumps(answers, ensure_ascii=False),
-                })
-                continue
-
-            break
-
-        if plan is None:
-            return
+        # 合并多个子 plan → 一个 ScenarioPlanResult
+        plan = self._merge_sub_plans(sub_plans)
+        logger.info(
+            "📋 scenario_plan merged | scenarios=%s tools=%d approval=%s",
+            [p.scenario_id for p in sub_plans], len(plan.tools), plan.needs_approval,
+        )
 
         # 需要审批 → propose_plan 卡片
         if plan.needs_approval:
@@ -355,6 +565,125 @@ class MainAgent:
 
         # 执行 + 评估循环
         await self._execute_with_evaluation(session_id, user_content, plan)
+
+    async def _plan_one_scenario(
+        self, session_id: str, user_content: str, scenario_id: str,
+        scenario_idx: int = 0,
+    ) -> Optional[ScenarioPlanResult]:
+        """为单个场景生成 ScenarioPlanResult（含 clarify 循环）。
+
+        scenario_idx 用于在多场景模式下给 call_id 加前缀，避免不同场景的 call_id 撞车。
+        """
+        history = self._build_history_context(session_id, limit=20)
+        messages = history + [{"role": "user", "content": user_content}]
+        system = build_scenario_plan_prompt(scenario_id)
+        plan: Optional[ScenarioPlanResult] = None
+
+        for clarify_round in range(3):  # 最多 3 次澄清
+            try:
+                data = await self._llm.chat_json(
+                    messages=messages, schema=ScenarioPlanResult,
+                    temperature=0.2, system=system,
+                )
+                plan = ScenarioPlanResult.model_validate(data)
+            except Exception as e:
+                logger.warning(f"scenario_plan LLM/schema failed (sid={scenario_id}): {e}")
+                await self._push(session_id, "error", "INTERNAL_ERROR", "system",
+                                 payload={"message": f"方案生成失败 ({scenario_id}): {e}"},
+                                 priority_kind="urgent")
+                return None
+
+            self._record_event(session_id, "scenario_planned", plan.model_dump())
+            logger.info(
+                "📋 scenario_plan | sid=%s clarify=%s approval=%s tools=%d",
+                plan.scenario_id, plan.needs_clarification, plan.needs_approval,
+                len(plan.tools),
+            )
+
+            if plan.needs_clarification and plan.clarification_questions:
+                msg_id = await self._push(session_id, "tool", "ask_user_question",
+                                          "assistant", payload={
+                                              "id": _new_call_id(),
+                                              "questions": [q.model_dump()
+                                                            for q in plan.clarification_questions],
+                                              "context": plan.summary,
+                                          })
+                self._record_event(session_id, "clarification_requested",
+                                   {"questions": [q.model_dump() for q in plan.clarification_questions],
+                                    "msg_id": msg_id, "scenario_id": scenario_id})
+                reply = await self._wait_ws_reply(session_id, "tool", "ask_user_question",
+                                                  timeout=ASK_USER_TIMEOUT_SEC)
+                if reply is None:
+                    return None
+                answers = reply.get("answers", [])
+                self._record_event(session_id, "clarification_received",
+                                   {"answers": answers, "scenario_id": scenario_id})
+                messages.append({
+                    "role": "user",
+                    "content": "针对你刚才的问题，我的回答是：" + json.dumps(answers, ensure_ascii=False),
+                })
+                continue
+            break
+
+        if plan is None:
+            return None
+
+        # 在多场景模式下给 call_id 加前缀，避免合并时撞车
+        if scenario_idx > 0:
+            prefix = f"s{scenario_idx}_"
+            rewritten_tools = []
+            id_map: dict[str, str] = {}
+            for t in plan.tools:
+                new_id = prefix + t.call_id
+                id_map[t.call_id] = new_id
+                rewritten_tools.append(t.model_copy(update={"call_id": new_id}))
+            # 修正 depends_on 引用
+            for t in rewritten_tools:
+                t.depends_on = [id_map.get(dep, dep) for dep in t.depends_on]
+            plan = plan.model_copy(update={"tools": rewritten_tools})
+
+        return plan
+
+    def _merge_sub_plans(self, sub_plans: list[ScenarioPlanResult]) -> ScenarioPlanResult:
+        """把多个 sub-plan 合并成一个 ScenarioPlanResult。
+
+        - tools: 顺序拼接（call_id 已在 _plan_one_scenario 加前缀防撞车）
+        - summary: 多场景时拼接 "场景 Sx: ..." 段落
+        - needs_approval: 任一 true → true
+        - permissions_required: union（保序去重）
+        - estimated_time_seconds: 求和
+        - scenario_id: 多场景时拼接 "S1+S12"
+        """
+        if len(sub_plans) == 1:
+            return sub_plans[0]
+
+        merged_tools = []
+        for p in sub_plans:
+            merged_tools.extend(p.tools)
+
+        summary_parts = []
+        for p in sub_plans:
+            summary_parts.append(f"【{p.scenario_id}】{p.summary}")
+        merged_summary = "\n\n".join(summary_parts)[:300]
+
+        merged_permissions: list = []
+        seen = set()
+        for p in sub_plans:
+            for perm in p.permissions_required:
+                if perm not in seen:
+                    merged_permissions.append(perm)
+                    seen.add(perm)
+
+        return ScenarioPlanResult(
+            scenario_id="+".join(p.scenario_id for p in sub_plans),
+            summary=merged_summary,
+            needs_clarification=False,  # clarify 已在子 plan 阶段解决
+            clarification_questions=[],
+            needs_approval=any(p.needs_approval for p in sub_plans),
+            permissions_required=merged_permissions,  # type: ignore[arg-type]
+            estimated_time_seconds=sum(p.estimated_time_seconds for p in sub_plans),
+            tools=merged_tools,
+        )
 
     async def _execute_with_evaluation(self, session_id: str,
                                         user_content: str,
@@ -690,10 +1019,16 @@ class MainAgent:
             )
             return EvaluateCompletionResult.model_validate(data)
         except Exception as e:
-            logger.warning(f"evaluate_completion LLM/schema failed: {e}")
+            # L4 fail-closed：评估器出错 → satisfied=False（不再谎称完成）
+            # 上游 _execute_with_evaluation 看到 needs_more_tools=[] 会兜底回一句给用户
+            logger.warning(
+                f"evaluate_completion LLM/schema failed: {e}, FAIL-CLOSED → satisfied=False"
+            )
             return EvaluateCompletionResult(
-                satisfied=True, reasoning=f"评估失败 ({e})，按已完成处理",
-                needs_more_tools=[], final_message="任务已执行完成。",
+                satisfied=False,
+                reasoning=f"评估器异常 ({e})，无法确认任务是否完成",
+                needs_more_tools=[],
+                final_message="抱歉，评估环节出现异常，请稍后重试或换个表述。",
             )
 
     # ── Helpers ────────────────────────────────────────

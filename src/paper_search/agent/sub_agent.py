@@ -512,7 +512,11 @@ class PipelineRunner:
                     "venue": p.get("venue", ""),
                 })
 
-            report = await self.llm.generate_report(user_query, papers_for_report, [])
+            # L2 反幻觉：传入 db + project_id 让 generate_report 调 CitationVerifier
+            report = await self.llm.generate_report(
+                user_query, papers_for_report, [],
+                db=self.db, project_id=project_id,
+            )
 
             from ..config import get_outputs_dir
             output_dir = get_outputs_dir() / project_id

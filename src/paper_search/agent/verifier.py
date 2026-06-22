@@ -525,3 +525,102 @@ def quick_verify_citation(db, author_surname: str, year: int, project_id: str = 
         return None
 
     return dict(rows[0])
+
+
+# ═══════════════════════════════════════════════════════════════
+# Phase A L2 — 通用接入函数
+# ═══════════════════════════════════════════════════════════════
+
+
+def format_citation_audit(vreport: VerificationReport) -> str:
+    """格式化引用校验审计段，附在报告末尾。
+
+    L2 反幻觉钩子的公共格式化逻辑，避免 LLMClient/LLMClientV2 重复实现。
+    """
+    lines = ["---", "## 📋 引用校验报告（L2 反幻觉）", ""]
+    lines.append(
+        f"- 总计引用：**{vreport.citations_found}**　"
+        f"匹配成功：**{vreport.citations_matched}**　"
+        f"事实校验通过：**{vreport.citations_verified}**　"
+        f"需审核：**{vreport.citations_flagged}**　"
+        f"已删除：**{vreport.citations_deleted}**"
+    )
+    flagged = [m for m in vreport.details if m.action in ("flag", "delete")]
+    if flagged:
+        lines.append("")
+        lines.append("### 校验失败明细")
+        for m in flagged[:10]:
+            lines.append(
+                f"- `{m.raw_text}` → **{m.action}** "
+                f"({m.fix_suggestion or '无法在论文库中匹配'})"
+            )
+        if len(flagged) > 10:
+            lines.append(f"- _（另 {len(flagged) - 10} 条略，详见日志）_")
+    return "\n".join(lines)
+
+
+async def verify_and_wrap_report(
+    report: str,
+    db,
+    project_id: Optional[str] = None,
+) -> str:
+    """L2 反幻觉公共钩子 — 给 generate_report 调用收尾.
+
+    - parse + match 校验（不调 fact-check LLM 以控成本）
+    - 校验失败 → 标 ⚠️[verify] / 删除
+    - 失败率 >50% → 报告前加 ⚠️ 告警
+    - verifier 自身异常 → fail-closed，加全局警告
+
+    Args:
+        report: LLM 生成的 markdown 草稿
+        db: AgentDB 实例，传 None 则直接返回原文
+        project_id: 限定校验范围的项目 ID
+
+    Returns:
+        校验后的报告文本（附审计段或前置告警）
+    """
+    if db is None:
+        return report
+
+    try:
+        verifier = CitationVerifier(db=db, llm_client=None)  # 轻量模式
+        vreport = await verifier.verify(report, project_id=project_id, auto_fix=True)
+    except Exception as e:
+        logger.warning(
+            f"L2 citation verify failed ({type(e).__name__}), FAIL-CLOSED → 加全局警告"
+        )
+        return (
+            "> ⚠️ **引用校验未完成**："
+            "本报告的引用未通过自动校验流程，请人工审核后再使用。\n\n"
+            + report
+        )
+
+    if vreport.citations_found == 0:
+        return report  # 没引用，无需附审计
+
+    audit = format_citation_audit(vreport)
+    verified = vreport.verified_text + "\n\n" + audit
+
+    fail_rate = (
+        vreport.citations_deleted + vreport.citations_flagged
+    ) / vreport.citations_found
+    if fail_rate > 0.5:
+        verified = (
+            f"> ⚠️ **引用校验告警**："
+            f"本报告 {vreport.citations_found} 条引用中 "
+            f"{vreport.citations_deleted + vreport.citations_flagged} 条未通过校验"
+            f"（失败率 {fail_rate:.0%}），强烈建议人工逐条审核。\n\n"
+            + verified
+        )
+    return verified
+
+
+__all__ = [
+    "CitationParser",
+    "CitationVerifier",
+    "CitationMatch",
+    "VerificationReport",
+    "verify_and_wrap_report",
+    "format_citation_audit",
+    "quick_verify_citation",
+]

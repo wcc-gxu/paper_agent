@@ -46,7 +46,7 @@
     "main_agent": {
       "module": "paper_search.agent.main_agent",
       "class": "MainAgent",
-      "nodes": ["intent_classify", "scenario_plan", "inline_reply", "execute_plan", "evaluate_completion"]
+      "nodes": ["safety_filter", "intent_classify", "scenario_plan", "inline_reply", "execute_plan", "evaluate_completion"]
     },
     "event_source": {
       "backend": "sqlite",
@@ -172,7 +172,7 @@
   │        ├── Redis outbox + 入站队列 (manifest.runtime.outbox)
   │        └── Celery (复用 Redis broker)
   │     ③ 创建 MemoryManager → 加载 4 层记忆
-  │     ④ 创建 MainAgent → 5 节点显式状态机
+  │     ④ 创建 MainAgent → 6 节点显式状态机（含 safety 前置）
   │        ├── 调 _recover_pending_turns 扫 agent_events 表
   │        ├── 对未完成的 correlation_id 做 _replay → _resume_from_state
   │        └── waiting_for=clarification/approval 的轮次推 high 提醒

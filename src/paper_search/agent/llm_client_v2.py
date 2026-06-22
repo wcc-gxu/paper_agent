@@ -1133,8 +1133,20 @@ class LLMClientV2:
 
         return result
 
-    async def generate_report(self, user_query: str, papers: list, judgments: list) -> str:
-        """Stage 6: 生成搜索报告."""
+    async def generate_report(
+        self,
+        user_query: str,
+        papers: list,
+        judgments: list,
+        db=None,
+        project_id: Optional[str] = None,
+    ) -> str:
+        """Stage 6: 生成搜索报告.
+
+        L2 反幻觉：传入 db 时，对生成的报告做 CitationVerifier 引用校验
+        （parse + match，不做 fact-check 以控成本）。校验失败的引用会被标记
+        ⚠️[verify] 或删除，报告末尾附审计段。
+        """
         scored = sorted(
             zip(papers, judgments),
             key=lambda x: x[1].score,
@@ -1148,13 +1160,26 @@ class LLMClientV2:
                 f"  理由: {j.reason}"
             )
 
-        response = await self.chat(
-            messages=[ChatMessage(role="user", content=(
-                f"用户搜索: {user_query}\n\n"
-                f"搜索结果 (共 {len(papers)} 篇，展示前30):\n" + "\n".join(paper_summaries)
-            ))],
-            system=self.REPORT_SYSTEM_PROMPT,
-            temperature=0.5,
-        )
+        try:
+            response = await self.chat(
+                messages=[ChatMessage(role="user", content=(
+                    f"用户搜索: {user_query}\n\n"
+                    f"搜索结果 (共 {len(papers)} 篇，展示前30):\n" + "\n".join(paper_summaries)
+                ))],
+                system=self.REPORT_SYSTEM_PROMPT,
+                temperature=0.5,
+            )
+            report = response.content
+        except Exception as e:
+            logger.error(f"报告生成失败 ({type(e).__name__})", exc_info=True)
+            return (
+                f"# 搜索报告\n\n搜索: {user_query}\n找到 {len(papers)} 篇论文\n\n"
+                f"(报告生成失败：{type(e).__name__}，详见服务日志)"
+            )
 
-        return response.content
+        # L2 反幻觉：CitationVerifier 校验引用
+        if db is not None:
+            from .verifier import verify_and_wrap_report
+            report = await verify_and_wrap_report(report, db, project_id)
+
+        return report
