@@ -3,6 +3,8 @@
 > v1.1 | 2026-06-22 | 替代 `agent-runloop.md` (v1 AgentRunLoop) 与 v2 AgentLoop
 > v1.1 变更：新增 safety_filter（节点 0，C1）、intent_classify 改为 list[ScenarioMatch]（C2 复合意图）、ask_user 灰区澄清（C3）
 
+> ⚠️ **协议迁移中**：本文描述的消息类型名（`ask_user_question` / `propose_plan` / `tool/sub_*` / `message/thinking` / `tool/ios_request`）是**当前代码**的 v9 实现。目标协议 v10 已在 [websocket-protocol.md](websocket-protocol.md) 定义——内部 CoT 不再泄漏给用户（删除 `message/thinking`）、新增 `status` 阶段反馈、`ask` 统一所有交互入口、`tool/*` 统一进度汇报。代码迁移按 v10 文档附录 checklist 进行，迁移完成后本文同步更新。
+
 ---
 
 ## 一、设计理念

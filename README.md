@@ -224,7 +224,7 @@ paper_agant/
 | [产品架构设计](docs/product/product-architecture-plan.md) | 需求→产品→架构→技术→难点→开发计划 |
 | [CLAUDE.md](CLAUDE.md) | 拓扑/Agent/工具/代码组织 |
 | [AgentRunLoop](docs/development/agent-runloop.md) | 事件循环/调度/Timer |
-| [WebSocket 协议](docs/development/websocket-protocol.md) | 7 大类 × 22 种子类消息 |
+| [WebSocket 协议](docs/development/websocket-protocol.md) | v10 · 5 卡片 / 12 消息 / `status` 阶段反馈 / `ask` 单一交互入口 |
 | [Phase 2 计划](docs/development/phase2-plan.md) | 24 问题 + 实施步骤 |
 | [CLAUDE.md](CLAUDE.md) | 代码参考卡 |
 

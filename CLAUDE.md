@@ -354,7 +354,7 @@ Python >= 3.11
 | 上线历史同步 | ✅ | sync_request/sync_complete 协议 |
 | MemGPT 4 层记忆 | ✅ | 已接入 MainAgent；5 个记忆工具补齐真实实现 |
 | 事件源 Checkpoint | ✅ | agent_events 表 + _replay + _resume_from_state |
-| WebSocket 协议 v9.0 | ✅ | 无握手 + ping/pong + tool 统一 + 新增 propose_plan / sync_request |
+| WebSocket 协议 v10.0 | ✅ | 5 卡片 / 12 消息 / 内部编排不可见 / `status` 阶段反馈 / `ask` 单一交互入口(5 种 kind)/ `capabilities` 信封上报 |
 | API Server (中继化) | ✅ | LPUSH→Agent + outbox_poller→WS |
 | 7 种子 Agent | ✅ | Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video |
 | 子 Agent lifecycle 上报 | ✅ | sub_agent_task 收尾发 agent_done/agent_failed |
