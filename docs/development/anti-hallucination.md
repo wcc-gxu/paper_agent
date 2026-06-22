@@ -748,7 +748,7 @@ tests/anti_hallucination/
 
 - [CLAUDE.md](CLAUDE.md) — 反幻觉小节，删除"引用三步校验"散落表述
 - [docs/development/main-agent.md](docs/development/main-agent.md) — 加 §3.6 output_verify 节点
-- [docs/development/architecture.md](docs/development/architecture.md) — 修复/重写
+- [CLAUDE.md](CLAUDE.md) — 架构文档已迁移至此，替换原 architecture.md
 - [docs/product/product-architecture-plan.md](docs/product/product-architecture-plan.md#L419-L435) — 替换"严格校验四步"为本文档引用
 - [docs/assessment/jd-skills-mapping.md](docs/assessment/jd-skills-mapping.md#L54) — CitationVerifier 状态从🔧→✅
 - [docs/development/agent-manifest.md](docs/development/agent-manifest.md) — nodes 数组加 `output_verify`

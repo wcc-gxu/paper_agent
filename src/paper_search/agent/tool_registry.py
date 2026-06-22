@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ToolMetadata:
-    """工具元数据标签（对应 architecture.md §5.1）."""
+    """工具元数据标签（对应 CLAUDE.md §工具注册）."""
     location: str = "server"       # "server" | "ios"
     category: str = ""             # search | download | convert | index | analyze | export | manage | kb | subscription | system | network | memory | ios
     is_idempotent: bool = False     # 重试安全

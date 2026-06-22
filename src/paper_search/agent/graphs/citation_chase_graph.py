@@ -203,9 +203,10 @@ class CitationChaseAgent:
                 j = await self._llm.evaluate_relevance(p, f"引用自: {seed_title}")
                 evaluated.append({**c, "score": j.score, "reason": j.reason, "is_relevant": j.is_relevant})
             except Exception:
-                evaluated.append({**c, "score": 0.5, "reason": "评估失败", "is_relevant": True})
+                logger.warning(f"相关性评估失败 for {title[:30]}, FAIL-CLOSED → is_relevant=False")
+                evaluated.append({**c, "score": 0.0, "reason": f"评估失败", "is_relevant": False})
 
-        relevant = [e for e in evaluated if e.get("is_relevant", True)]
+        relevant = [e for e in evaluated if e.get("is_relevant", False)]
         logger.info(f"Filter: {len(relevant)}/{len(evaluated)} relevant")
         return {"evaluated": evaluated, "relevant": relevant}
 

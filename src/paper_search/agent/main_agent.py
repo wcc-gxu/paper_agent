@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -54,8 +55,15 @@ IOS_TIMEOUT_SEC = 2 * 60         # iOS 工具默认 2 分钟
 ASK_USER_TIMEOUT_SEC = 30 * 60   # 等用户回答最长 30 分钟
 
 # C3: 灰区阈值 — 当所有 scenario.confidence 都低于此值时，触发 ask_user 让用户挑选
-# 可通过环境变量 INTENT_ASK_THRESHOLD 覆盖（默认 0.6）
-INTENT_ASK_THRESHOLD = float(os.getenv("INTENT_ASK_THRESHOLD", "0.6"))
+# 可通过环境变量 INTENT_ASK_THRESHOLD 覆盖（默认 0.6）。
+# 设计为函数而非模块级常量，确保运行时修改 env 后生效，且测试可以 patch os.environ
+# 而无须关心 import 顺序。
+def _intent_ask_threshold() -> float:
+    return float(os.getenv("INTENT_ASK_THRESHOLD", "0.6"))
+
+
+# 向后兼容：暴露当前默认值作模块常量（不参与运行时分支判断；分支用 _intent_ask_threshold()）
+INTENT_ASK_THRESHOLD = 0.6
 
 # C1: 安全前置过滤的 regex 黑名单（毫秒级兜底；命中后再让小 LLM 二次确认）
 # 只覆盖最高频的注入/越狱模式，宁缺勿滥避免误杀正常学术提问
@@ -85,10 +93,35 @@ _SAFETY_REGEX_PATTERNS: list[tuple[str, re.Pattern]] = [
 ]
 
 
+def _normalize_for_safety(text: str) -> str:
+    """对用户输入做 NFKC 归一化 + 去零宽 + 折叠空白，避免 homoglyph / 全角 / 零宽空格绕过 regex。
+
+    - NFKC 把全角 'ｉｇｎｏｒｅ' / 罗马数字 'Ⅰ' / 兼容字符折成 ASCII 形态
+    - 删除 U+200B/200C/200D/FEFF 等零宽 + U+00AD 软连字符
+    - 同时输出一个"无空白"版本拼回原串末尾，让"忽 略前面的指令"（中间插空格的）也能被
+      `忽略` 触发命中
+    """
+    if not text:
+        return text
+    normed = unicodedata.normalize("NFKC", text)
+    stripped = "".join(
+        ch for ch in normed
+        if ch not in ("​", "‌", "‍", "﻿", "­")
+        and (ch >= " " or ch in ("\n", "\t"))
+    )
+    # 把所有空白塞掉再拼到末尾 — 一次 regex 同时覆盖"原文"和"折叠版"两个视角
+    no_space = re.sub(r"\s+", "", stripped)
+    return stripped + "\n" + no_space
+
+
 def _safety_regex_check(text: str) -> Optional[str]:
-    """对 user_content 跑 regex 黑名单。命中返回 risk_kind，否则 None。"""
+    """对 user_content 跑 regex 黑名单。命中返回 risk_kind，否则 None。
+
+    输入会先做 NFKC 归一化 + 去零宽，避免攻击者用全角字符 / 零宽空格绕过。
+    """
+    probe = _normalize_for_safety(text)
     for kind, pat in _SAFETY_REGEX_PATTERNS:
-        if pat.search(text):
+        if pat.search(probe):
             return kind
     return None
 
@@ -386,13 +419,14 @@ class MainAgent:
             intent.intent_kind = "chat"
             return intent
 
+        threshold = _intent_ask_threshold()
         high_conf = [s for s in intent.scenarios
-                     if s.confidence >= INTENT_ASK_THRESHOLD]
+                     if s.confidence >= threshold]
         if high_conf:
             # 有至少一个高置信度场景 → 保留高的，丢弃低的
             if len(high_conf) != len(intent.scenarios):
                 dropped = [s.scenario_id for s in intent.scenarios
-                           if s.confidence < INTENT_ASK_THRESHOLD]
+                           if s.confidence < threshold]
                 logger.info(
                     "C3: 保留高置信场景 %s，过滤低置信 %s",
                     [s.scenario_id for s in high_conf], dropped,
@@ -413,6 +447,8 @@ class MainAgent:
         其它分支继续走 _node_scenario_plan。
         """
         options = []
+        # 候选 sid 列表（按 options 出现顺序），用于把"用户回了整数索引"映射回 scenario_id
+        candidate_sids = [sm.scenario_id for sm in intent.scenarios]
         for sm in intent.scenarios:
             sc = SCENARIOS.get(sm.scenario_id) or {}
             options.append(
@@ -432,6 +468,8 @@ class MainAgent:
                 ),
                 "type": "multi_choice",
                 "options": options,
+                # 显式 values 与 options 一一对应，让 iOS 可以直接回这个 id 而非文本标签
+                "values": candidate_sids + ["__none__"],
             }],
             "context": (
                 "我会按你选择的场景来规划。"
@@ -453,23 +491,44 @@ class MainAgent:
             return intent
 
         answers = reply.get("answers", [])
-        # 答案形如 [{"id": "scenario_pick", "value": ["S1: 文献调研 ...", "..."]}]
-        # 或 [{"id": "scenario_pick", "value": "S1: 文献调研 ..."}]
-        chosen_labels: list[str] = []
+        # 答案可能是：
+        #   - 整数索引 [0, 2]
+        #   - 字符串 "S1" / "S1: ..." / "S1：..." (全角冒号) / "0" / 已去前缀的标题
+        #   - 上面的混合数组
+        raw_values: list = []
         for a in answers:
-            v = a.get("value") or a.get("answer")
+            v = a.get("value")
+            if v is None:
+                v = a.get("answer")
             if isinstance(v, list):
-                chosen_labels.extend(str(x) for x in v)
-            elif v:
-                chosen_labels.append(str(v))
+                raw_values.extend(v)
+            elif v is not None:
+                raw_values.append(v)
 
-        # 解析回 scenario_id（label 开头格式为 "Sx: ..."）
         chosen_sids: list[str] = []
-        for lab in chosen_labels:
-            if ":" in lab:
-                sid = lab.split(":", 1)[0].strip()
-                if sid in SCENARIOS:
-                    chosen_sids.append(sid)
+        parse_failed = False
+        for val in raw_values:
+            sid = self._parse_scenario_choice(val, options, candidate_sids)
+            if sid == "__none__":
+                # 用户明确选了"都不是"
+                continue
+            if sid is None:
+                parse_failed = True
+                continue
+            if sid in SCENARIOS and sid not in chosen_sids:
+                chosen_sids.append(sid)
+
+        if parse_failed and not chosen_sids:
+            # 明确区分"协议解析失败"vs"用户选都不是"，避免审计日志看不出 bug
+            logger.warning(
+                "C3: 无法解析用户的场景选择 raw=%s options=%s",
+                raw_values, options,
+            )
+            self._record_event(session_id, "intent_clarify_parse_failed",
+                               {"raw_values": [str(v)[:80] for v in raw_values]})
+            intent.intent_kind = "chat"
+            intent.scenarios = []
+            return intent
 
         if not chosen_sids:
             # 用户选了"都不是" → 降级为 chat
@@ -488,6 +547,68 @@ class MainAgent:
                            {"chosen": chosen_sids})
         logger.info("C3: 用户确认场景 %s", chosen_sids)
         return intent
+
+    @staticmethod
+    def _parse_scenario_choice(
+        value, options: list[str], candidate_sids: list[str],
+    ) -> Optional[str]:
+        """把用户对 scenario_pick 的一项回答解析成 scenario_id。
+
+        支持多种 iOS 端协议形态：
+          - int 0..N-1：直接当 options 索引（最后一项是 __none__）
+          - str "S1" / "s1"：直接当 scenario_id（大小写不敏感）
+          - str "0" / "1"：数字字符串，当索引
+          - str "S1: ..." 或 "S1：..."（全角冒号）：取冒号前 token
+          - 完整 option 字面量：等值匹配 options 数组找索引
+          - 完整 "都不是 / 重新描述"：返回 "__none__"
+        返回 None 表示协议解析失败（调用方据此区分"用户选都不是"和"客户端协议错"）。
+        """
+        # 数字索引
+        if isinstance(value, bool):
+            return None  # 防止 True/False 被 int() 吞掉
+        if isinstance(value, int):
+            if 0 <= value < len(candidate_sids):
+                return candidate_sids[value]
+            if value == len(candidate_sids):
+                return "__none__"
+            return None
+
+        if not isinstance(value, str):
+            value = str(value)
+        v = value.strip()
+        if not v:
+            return None
+
+        # 全字面量等值（先看是不是命中"都不是"）
+        if v in ("__none__", "都不是 / 重新描述", "都不是", "都不對", "都不对"):
+            return "__none__"
+
+        # 全字面量等值匹配 options
+        for i, opt in enumerate(options):
+            if v == opt:
+                if i < len(candidate_sids):
+                    return candidate_sids[i]
+                return "__none__"
+
+        # 纯数字字符串
+        if v.isdigit():
+            return MainAgent._parse_scenario_choice(int(v), options, candidate_sids)
+
+        # 先按冒号（半角/全角）切首段
+        for sep in (":", "：", " "):
+            if sep in v:
+                head = v.split(sep, 1)[0].strip()
+                up = head.upper()
+                if up in SCENARIOS:
+                    return up
+                break
+
+        # 整串大写后是否是 scenario_id
+        up = v.upper()
+        if up in SCENARIOS:
+            return up
+
+        return None
 
     # ── 节点 2A: scenario_plan (business) ─────────────
 
@@ -515,15 +636,36 @@ class MainAgent:
                 return
 
         # 逐个场景生成子 plan
+        # 改进点：单个场景失败不再整体 abort —— 在多场景模式下尽量保留成功的部分
         sub_plans: list[ScenarioPlanResult] = []
+        failed_sids: list[str] = []
         for idx, sm in enumerate(scenarios):
             sub_plan = await self._plan_one_scenario(
                 session_id, user_content, sm.scenario_id,
                 scenario_idx=idx,
             )
             if sub_plan is None:
-                return  # 已发 error 或超时
+                failed_sids.append(sm.scenario_id)
+                continue
             sub_plans.append(sub_plan)
+
+        if not sub_plans:
+            # 全部失败 → 整体放弃（_plan_one_scenario 已对每个失败 push 过 error）
+            return
+
+        if failed_sids and len(scenarios) > 1:
+            # 部分失败、部分成功 → 告知用户哪些没规划上，再继续执行成功的
+            await self._push(
+                session_id, "message", "text", "assistant",
+                payload={"content": (
+                    f"部分场景规划失败（{', '.join(failed_sids)}），"
+                    f"将只执行成功的 {', '.join(p.scenario_id for p in sub_plans)} 部分。"
+                )},
+                priority_kind="high",
+            )
+            self._record_event(session_id, "scenario_partial_planned",
+                               {"failed": failed_sids,
+                                "succeeded": [p.scenario_id for p in sub_plans]})
 
         # 合并多个子 plan → 一个 ScenarioPlanResult
         plan = self._merge_sub_plans(sub_plans)
@@ -531,6 +673,25 @@ class MainAgent:
             "📋 scenario_plan merged | scenarios=%s tools=%d approval=%s",
             [p.scenario_id for p in sub_plans], len(plan.tools), plan.needs_approval,
         )
+
+        # 合并后仍 needs_clarification（任一 sub-plan 3 轮 clarify 后 LLM 还在问）
+        # → 显式告知用户并终止，避免在欠规约的 plan 上盲跑工具
+        if plan.needs_clarification:
+            unresolved = "；".join(
+                q.question if hasattr(q, "question") else str(q)
+                for q in (plan.clarification_questions or [])
+            )[:500]
+            await self._push(
+                session_id, "message", "text", "assistant",
+                payload={"content": (
+                    "我对你的需求还有不清楚的地方，请补充说明后再发一次：\n"
+                    + (unresolved or "（请提供更多细节）")
+                )},
+                priority_kind="high",
+            )
+            self._record_event(session_id, "plan_unresolved_clarification",
+                               {"unresolved": unresolved})
+            return
 
         # 需要审批 → propose_plan 卡片
         if plan.needs_approval:
@@ -650,6 +811,7 @@ class MainAgent:
         - tools: 顺序拼接（call_id 已在 _plan_one_scenario 加前缀防撞车）
         - summary: 多场景时拼接 "场景 Sx: ..." 段落
         - needs_approval: 任一 true → true
+        - needs_clarification: 任一 true → true（澄清问题 union；下游应再问一轮）
         - permissions_required: union（保序去重）
         - estimated_time_seconds: 求和
         - scenario_id: 多场景时拼接 "S1+S12"
@@ -674,11 +836,18 @@ class MainAgent:
                     merged_permissions.append(perm)
                     seen.add(perm)
 
+        # 任一 sub-plan 三轮 clarify 后仍 needs_clarification=True → 合并保留信号，
+        # 让上游能据此再问一轮或显式中止，避免在欠规约的 plan 上盲跑工具。
+        merged_clarify_qs: list = []
+        for p in sub_plans:
+            if p.needs_clarification:
+                merged_clarify_qs.extend(p.clarification_questions or [])
+
         return ScenarioPlanResult(
             scenario_id="+".join(p.scenario_id for p in sub_plans),
             summary=merged_summary,
-            needs_clarification=False,  # clarify 已在子 plan 阶段解决
-            clarification_questions=[],
+            needs_clarification=any(p.needs_clarification for p in sub_plans),
+            clarification_questions=merged_clarify_qs,
             needs_approval=any(p.needs_approval for p in sub_plans),
             permissions_required=merged_permissions,  # type: ignore[arg-type]
             estimated_time_seconds=sum(p.estimated_time_seconds for p in sub_plans),

@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent 6 节点 · [architecture.md](docs/development/architecture.md) — 系统拓扑 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — MemGPT 记忆
+> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent 6 节点 · [anti-hallucination.md](docs/development/anti-hallucination.md) — 反幻觉策略 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — MemGPT 记忆
 
 ## 项目概述
 

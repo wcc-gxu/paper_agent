@@ -74,6 +74,7 @@ class VerificationReport:
     citations_flagged: int  # 需要人工审核的
     citations_deleted: int  # 无法修复已删除的
     details: list[CitationMatch] = field(default_factory=list)
+    fact_check_run: bool = True  # 是否执行了 LLM 事实校验（vs 仅做存在性匹配）
 
     @property
     def verification_summary(self) -> str:
@@ -267,7 +268,10 @@ class CitationVerifier:
             matches.append(match)
 
         # Step 3: 事实校验 (如果有 LLM)
-        if self._llm:
+        # 仅在配置了 LLM 时才做事实校验；否则 claim_verified 保持 False，
+        # 但下游不能把"未校验"当作"校验失败"。
+        ran_claim_verify = bool(self._llm)
+        if ran_claim_verify:
             matches = await self._verify_claims(matches)
 
         # Step 4: 确定处理动作
@@ -275,9 +279,13 @@ class CitationVerifier:
             if not m.matched:
                 m.action = "delete"
                 m.fix_suggestion = "无法在论文库中找到匹配论文"
-            elif m.matched and m.claim_verified:
+            elif not ran_claim_verify:
+                # 轻量模式：仅做存在性匹配，不做事实校验 → 匹配上即 keep。
+                # 上游 format_citation_audit 会显式标注"事实校验未运行"，避免误导。
                 m.action = "keep"
-            elif m.matched and not m.claim_verified:
+            elif m.claim_verified:
+                m.action = "keep"
+            else:
                 if m.claim_score > 0.5:
                     m.action = "flag"
                     m.fix_suggestion = "声明可能与原文不完全一致，建议人工审核"
@@ -299,6 +307,7 @@ class CitationVerifier:
             citations_flagged=sum(1 for m in matches if m.action == "flag"),
             citations_deleted=sum(1 for m in matches if m.action == "delete"),
             details=matches,
+            fact_check_run=ran_claim_verify,
         )
 
     async def _match_citation(self, raw_citation: dict, project_id: str = None) -> CitationMatch:
@@ -538,10 +547,16 @@ def format_citation_audit(vreport: VerificationReport) -> str:
     L2 反幻觉钩子的公共格式化逻辑，避免 LLMClient/LLMClientV2 重复实现。
     """
     lines = ["---", "## 📋 引用校验报告（L2 反幻觉）", ""]
+    if vreport.fact_check_run:
+        fact_line = (
+            f"事实校验通过：**{vreport.citations_verified}**　"
+        )
+    else:
+        fact_line = "事实校验：**未运行**（仅做存在性匹配）　"
     lines.append(
         f"- 总计引用：**{vreport.citations_found}**　"
         f"匹配成功：**{vreport.citations_matched}**　"
-        f"事实校验通过：**{vreport.citations_verified}**　"
+        + fact_line +
         f"需审核：**{vreport.citations_flagged}**　"
         f"已删除：**{vreport.citations_deleted}**"
     )

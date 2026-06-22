@@ -511,7 +511,11 @@ class KnowledgeBase:
                 f"| {p.get('source', '')} | {p.get('venue', '')}"
             )
 
-        report = await self._llm.generate_report(user_query, papers, judgments=[])
+        # L2 反幻觉：传 db + project_id 让 generate_report 走 CitationVerifier
+        report = await self._llm.generate_report(
+            user_query, papers, judgments=[],
+            db=self._db, project_id=project_id,
+        )
 
         # 保存
         out_dir = get_outputs_dir(project_id)

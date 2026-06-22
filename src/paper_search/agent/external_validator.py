@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -60,16 +61,18 @@ class ExtractedReference:
 
     @property
     def cache_key(self) -> str:
-        """缓存键：DOI > arxiv_id > (title+first_author+year) MD5。"""
+        """缓存键：DOI > arxiv_id > (title+first_author+year) MD5。
+
+        用完整 32-hex MD5 而非截断 16-hex，避免不同 (title, author, year) 三元组
+        在 64-bit 空间里偶尔碰撞导致缓存别名（让一篇幻觉论文蹭到另一篇的 exists=True）。
+        """
         if self.doi:
             return f"doi:{self.doi.lower()}"
         if self.arxiv_id:
             return f"arxiv:{self.arxiv_id.lower()}"
-        # 用标题+作者+年份组合
-        import hashlib
         fa = (self.authors[0] if self.authors else "").lower().strip()
         sig = f"{self.title.lower().strip()}|{fa}|{self.year or ''}"
-        return f"md5:{hashlib.md5(sig.encode('utf-8')).hexdigest()[:16]}"
+        return f"md5:{hashlib.md5(sig.encode('utf-8')).hexdigest()}"
 
 
 @dataclass
@@ -100,13 +103,38 @@ _ARXIV_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 标题相似度用的极简 stopword 表（够 Crossref 标题对比即可，不上 NLP）
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "of", "in", "on", "for", "to", "with",
+    "via", "using", "based", "by", "from", "is", "are", "be", "this", "that",
+    "we", "our", "as",
+})
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _title_tokens(title: str) -> set[str]:
+    """把标题切成去停用词的 token 集合，用于粗 Jaccard 相似度。"""
+    if not title:
+        return set()
+    return {t for t in _TOKEN_RE.findall(title.lower()) if t not in _STOPWORDS and len(t) > 1}
+
 
 def extract_identifiers(raw_text: str) -> tuple[Optional[str], Optional[str]]:
     """从原始引用文本里抓 DOI / arxiv_id，找不到返回 (None, None)。"""
     doi_match = _DOI_RE.search(raw_text)
     arxiv_match = _ARXIV_RE.search(raw_text)
+
+    # 清理 DOI 尾部可能附带的句尾标点：. , ; : ) 等
+    doi = None
+    if doi_match:
+        doi = doi_match.group(0).rstrip(".,;:)!?")
+        # 如果 rstrip 后变空则丢弃（整段都是标点的极端情况）
+        if not doi:
+            doi = None
+
     return (
-        doi_match.group(0) if doi_match else None,
+        doi,
         arxiv_match.group(1) if arxiv_match else None,
     )
 
@@ -167,12 +195,27 @@ class ExternalValidator:
         self._ensure_cache_schema()
 
     def _ensure_cache_schema(self):
-        """首次使用时建表（幂等）。"""
+        """首次使用时建表（幂等）。
+
+        关键：用独立 sqlite3 连接执行 DDL，避免 executescript() 在共享 conn 上
+        触发隐式 COMMIT — 否则任何外层未提交的事务会被强制提交。
+        """
         if self._db is None:
             return
         try:
-            self._db.conn.executescript(CACHE_SCHEMA)
-            self._db.conn.commit()
+            import sqlite3
+            db_path = getattr(self._db, "db_path", None) or getattr(self._db, "path", None)
+            if db_path:
+                # 独立连接，绝不污染主连接的事务状态
+                with sqlite3.connect(str(db_path)) as ddl_conn:
+                    ddl_conn.executescript(CACHE_SCHEMA)
+            else:
+                # 拿不到路径时退而求其次 — 用 execute 逐条而非 executescript，
+                # 避免隐式 COMMIT。
+                cur = self._db.conn.cursor()
+                for stmt in [s.strip() for s in CACHE_SCHEMA.split(";") if s.strip()]:
+                    cur.execute(stmt)
+                # 不在这里 commit；让上层事务边界决定
         except Exception as e:
             logger.warning(f"建 external_validations 表失败: {e}")
 
@@ -251,7 +294,16 @@ class ExternalValidator:
     async def _query_crossref_bibliographic(
         self, title: str, author: str = "", year: Optional[int] = None
     ) -> Optional[dict]:
-        """用 title+author+year 模糊查 Crossref。"""
+        """用 title+author+year 模糊查 Crossref，返回**高置信**候选或 None。
+
+        反幻觉关键：Crossref 标题查询会对任意关键词返回结果（150M+ 记录），
+        必须验证返回项与请求的相似度，否则会把幻觉论文映射到一篇无关真论文。
+
+        通过门槛：
+          - 命中项标题与请求标题 token 重合率 ≥ 0.6（粗 Jaccard）
+          - 若指定了 year，命中项年份必须在 ±1 范围内
+        否则返回 None（让上层标 exists=False，触发幻觉警告）。
+        """
         params = {"query.bibliographic": title, "rows": 5}
         if author:
             params["query.author"] = author
@@ -262,27 +314,66 @@ class ExternalValidator:
         items = (r.json().get("message") or {}).get("items") or []
         if not items:
             return None
-        # 找年份最匹配的
+
+        request_tokens = _title_tokens(title)
+        if not request_tokens:
+            return None
+
+        best_item = None
+        best_score = 0.0
         for item in items:
-            issued = item.get("issued", {}).get("date-parts", [[None]])
-            iy = (issued[0][0] if issued and issued[0] else None)
-            if year and iy and abs(int(iy) - int(year)) <= 1:
-                return item
-        return items[0]  # 兜底取首个
+            cand_title = (item.get("title") or [""])[0]
+            if not cand_title:
+                continue
+            cand_tokens = _title_tokens(cand_title)
+            if not cand_tokens:
+                continue
+            overlap = len(request_tokens & cand_tokens)
+            score = overlap / max(len(request_tokens | cand_tokens), 1)
+
+            # 年份门：要求请求年与命中年差 ≤ 1（无年信息则不卡）
+            if year:
+                issued = item.get("issued", {}).get("date-parts", [[None]])
+                iy = (issued[0][0] if issued and issued[0] else None)
+                if iy is None or abs(int(iy) - int(year)) > 1:
+                    continue
+
+            if score > best_score:
+                best_score = score
+                best_item = item
+
+        # 没有候选通过相似度门槛 → 视为未找到（绝不返回 items[0] 兜底，
+        # 否则 Crossref 几乎对任何输入都"找得到"，反幻觉防线形同虚设）
+        if best_score < 0.6 or best_item is None:
+            return None
+        return best_item
+
+    class _ArxivUnreachable(Exception):
+        """arXiv API 不可达（非 200/解析失败）— 让上层把 exists 标为 None 而非 False。"""
 
     async def _query_arxiv(self, arxiv_id: str) -> Optional[str]:
-        """按 arXiv ID 查 arXiv，返回标题（命中则非空）。"""
-        # arXiv API 用 Atom XML，简化处理：检查响应里有没有 <title>
+        """按 arXiv ID 查 arXiv，返回标题（命中则非空，未找到返回 None）。
+
+        关键：non-200 / 网络错误 → 抛 _ArxivUnreachable，由上层 except 兜进
+        exists=None 路径，避免把 429/5xx 当 "not found" 缓存 30 天。
+        """
         params = {"id_list": arxiv_id, "max_results": 1}
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             r = await client.get(self.ARXIV_BASE, params=params)
         if r.status_code != 200:
-            return None
+            # 区分"明确未找到"和"不可达"：arXiv 对未知 id 也返回 200 + 空 feed，
+            # 所以这里 non-200 一律视为不可达
+            raise self._ArxivUnreachable(
+                f"arXiv API {r.status_code} for id={arxiv_id}"
+            )
         text = r.text
         # 简化提取：找第二个 <title>（第一个是 feed 自身的标题）
         titles = re.findall(r"<title>([^<]+)</title>", text)
         if len(titles) >= 2:
-            return titles[1].strip()
+            t = titles[1].strip()
+            # arXiv 对未知 id 也会返回 "Error" 类标题，简单过滤
+            if t and not t.lower().startswith("error"):
+                return t
         return None
 
     # ── 单条验证 ────────────────────────────────────────
@@ -319,9 +410,19 @@ class ExternalValidator:
                     self._put_cached(v)
                     return v
 
-            # 2.2 arXiv 直查
+            # 2.2 arXiv 直查（错误抛 _ArxivUnreachable，进入下面 except 兜底）
             if ref.arxiv_id:
-                title = await self._query_arxiv(ref.arxiv_id)
+                try:
+                    title = await self._query_arxiv(ref.arxiv_id)
+                except self._ArxivUnreachable as e:
+                    # 关键：arXiv 不可达 → 不写 exists=False，直接返回 None（不缓存）
+                    # 避免一次 429 把真论文冻 30 天
+                    logger.warning(f"L3 arXiv 不可达，跳过该篇并标 unverified: {e}")
+                    return ExternalValidation(
+                        cache_key=key,
+                        exists=None,
+                        reason=f"arXiv API 不可达: {e}",
+                    )
                 if title:
                     v = ExternalValidation(
                         cache_key=key,

@@ -306,12 +306,16 @@ def survey_task(self, project_id: str, user_query: str) -> dict:
                 "venue": p.get("venue", ""),
             })
 
-        report = llm.generate_report_sync(user_query, papers)
-        # generate_report is async, use sync wrapper:
+        # NOTE: generate_report_sync 在 LLMClientV2 上未定义；旧代码的 dead-write 已删。
+        # 这里直接用 asyncio event loop 跑 async generate_report，
+        # 并传 db + project_id 触发 L2 CitationVerifier 反幻觉钩子
         import asyncio
         loop = asyncio.new_event_loop()
         try:
-            report = loop.run_until_complete(llm.generate_report(user_query, papers, []))
+            report = loop.run_until_complete(llm.generate_report(
+                user_query, papers, [],
+                db=db, project_id=project_id,
+            ))
         finally:
             loop.close()
 

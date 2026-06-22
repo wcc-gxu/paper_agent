@@ -1045,7 +1045,15 @@ class LLMClientV2:
         )
 
         if "error" in result:
-            return RelevanceJudgment(score=0.5, reason="评估失败，默认保留", is_relevant=True)
+            # L4 fail-closed：评估失败 → 默认不相关（不再保留垃圾论文进入语料库）
+            logger.warning(
+                f"相关性评估失败 ({result.get('error')}), FAIL-CLOSED → is_relevant=False (剔除该篇)"
+            )
+            return RelevanceJudgment(
+                score=0.0,
+                reason=f"评估失败 ({result.get('error', 'unknown')})，按不相关处理",
+                is_relevant=False,
+            )
 
         return RelevanceJudgment(
             score=float(result.get("score", 0.5)),
@@ -1073,7 +1081,7 @@ class LLMClientV2:
                     return await self.evaluate_relevance(paper, user_query)
                 except Exception as e:
                     logger.warning(f"Evaluate failed for {getattr(paper, 'title', '?')}: {e}")
-                    return RelevanceJudgment(score=0.5, reason=f"评估失败: {str(e)[:50]}", is_relevant=True)
+                    return RelevanceJudgment(score=0.0, reason=f"评估失败 ({type(e).__name__})，按不相关处理", is_relevant=False)
 
         try:
             return await asyncio.wait_for(
@@ -1081,9 +1089,9 @@ class LLMClientV2:
                 timeout=batch_timeout,
             )
         except asyncio.TimeoutError:
-            logger.error(f"evaluate_batch timeout after {batch_timeout}s for {len(papers)} papers")
-            # 返回部分结果 + 默认值
-            return [RelevanceJudgment(score=0.5, reason="批量评估超时", is_relevant=True) for _ in papers]
+            logger.error(f"evaluate_batch timeout after {batch_timeout}s for {len(papers)} papers, FAIL-CLOSED")
+            # L4 fail-closed：整体超时 → 全部按不相关处理，避免把未评估的论文当合格品入库
+            return [RelevanceJudgment(score=0.0, reason="批量评估超时，按不相关处理", is_relevant=False) for _ in papers]
 
     async def should_continue_search(
         self,
