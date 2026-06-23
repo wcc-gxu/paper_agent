@@ -568,23 +568,239 @@ def rank_task(
 # ═══════════════════════════════════════════════════════════════
 
 
+def _get_whisper_model():
+    """惰性加载 faster-whisper 模型。
+
+    失败返回 None —— VideoAgent._transcribe_node 会把 None 视为"转录不可用"
+    并降级为基于元数据的摘要（不阻塞整个 video 流水线）。
+    """
+    try:
+        from faster_whisper import WhisperModel
+        model_size = os.getenv("WHISPER_MODEL_SIZE", "small")
+        cache_dir = Path.home() / ".paper_search" / "models" / "whisper"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return WhisperModel(model_size, download_root=str(cache_dir))
+    except Exception as e:
+        logger.warning(
+            f"Whisper model load failed (video transcription will be skipped): {e}"
+        )
+        return None
+
+
+def _run_graph_agent(agent_type: str, arguments: dict, log_id: str,
+                     user_query: str, project_id: str) -> dict:
+    """在 Celery worker 内跑非 ingest 的 graph agent（sync 入口）。
+
+    建独立 event loop → 跑 _run_graph_agent_async → 上报 lifecycle。
+    lifecycle 用真实 agent_type（不再写死 "ingest"），订阅方据此判定完成。
+    """
+    import asyncio
+
+    task_logger = _get_logger(log_id, agent_type)
+    reporter = _get_reporter()
+
+    reporter.publish_lifecycle(
+        task_id=log_id, agent_type=agent_type,
+        lifecycle="agent_started",
+        summary=f"开始 {agent_type}: {user_query[:80]}",
+    )
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(
+                _run_graph_agent_async(
+                    agent_type, arguments, log_id,
+                    reporter, task_logger, project_id,
+                )
+            )
+        finally:
+            loop.close()
+
+        task_logger.task_done(log_id, {"result": result})
+        reporter.report_done(log_id, result)
+        reporter.publish_lifecycle(
+            task_id=log_id, agent_type=agent_type,
+            lifecycle="agent_done",
+            summary=f"{agent_type} 完成",
+            result=result,
+        )
+        return {"result": result, "error": ""}
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(
+            f"sub_agent_task ({agent_type}) failed: {error_str}", exc_info=True
+        )
+        task_logger.task_error(log_id, error_str, "")
+        reporter.report_error(log_id, error_str)
+        reporter.publish_lifecycle(
+            task_id=log_id, agent_type=agent_type,
+            lifecycle="agent_failed",
+            summary=f"{agent_type} 失败: {error_str[:120]}",
+            error=error_str,
+        )
+        return {"error": error_str}
+
+
+async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
+                                 reporter, task_logger, project_id: str) -> dict:
+    """按 agent_type 构造依赖 + compile + ainvoke。
+
+    依赖按需构造（避免无谓初始化，如 video 的 whisper）。
+    进度通过 reporter.publish_report 上报（_handle_sub_agent 的订阅循环会
+    转推 sub_progress 给 iOS）。
+
+    参数映射（从 LLM 返回的 spec.arguments）:
+      - clustering:     project_id, n_clusters
+      - citation_chase: seed_title/seed_doi/seed_paper/query, max_depth/depth, direction
+      - translation:    action, text/query, direction, project_id
+      - video:          query/user_query/url (含链接), project_id
+      - rad_query:      question/query, project_id
+    """
+    from .llm_client_v2 import LLMClientV2
+
+    db = _get_db()
+    llm = LLMClientV2()
+
+    async def on_progress(stage, *args, **kwargs):
+        """统一进度回调 — 兼容各 graph 的 _notify(stage, index, total, 0, 0) 签名。"""
+        try:
+            reporter.publish_report(
+                log_id, agent_type, str(stage),
+                status="progress",
+                extra={"raw_args": [str(a)[:80] for a in args]},
+            )
+        except Exception:
+            pass
+
+    # ── clustering (S6/S8) ──
+    if agent_type == "clustering":
+        from .chroma_store import ChromaStoreV2
+        from .graphs.clustering_graph import ClusteringAgent
+        chroma = ChromaStoreV2()
+        agent = ClusteringAgent(db, chroma, llm, on_progress=on_progress)
+        graph = agent.compile()
+        state = {
+            "project_id": arguments.get("project_id") or project_id,
+            "n_clusters": arguments.get("n_clusters", 0),
+        }
+        result = await graph.ainvoke(state)
+        return result.get("result", result)
+
+    # ── citation_chase (S9) ──
+    if agent_type == "citation_chase":
+        from ..engine import PaperSearchEngine
+        from ..config import Config
+        from .graphs.citation_chase_graph import CitationChaseAgent
+        engine = PaperSearchEngine(Config())
+        agent = CitationChaseAgent(db, llm, engine, on_progress=on_progress)
+        graph = agent.compile()
+        state = {
+            "project_id": arguments.get("project_id") or project_id,
+            "seed_title": (arguments.get("seed_title")
+                           or arguments.get("seed_paper")
+                           or arguments.get("query") or ""),
+            "seed_doi": arguments.get("seed_doi", ""),
+            "max_depth": arguments.get("depth",
+                                       arguments.get("max_depth", 2)),
+            "direction": arguments.get("direction", "both"),
+        }
+        result = await graph.ainvoke(state)
+        return result.get("result", result)
+
+    # ── translation (S12) ──
+    if agent_type == "translation":
+        from .chroma_store import ChromaStoreV2
+        from .graphs.translation_graph import TranslationAgent
+        chroma = ChromaStoreV2()
+        agent = TranslationAgent(db, llm, chroma, on_progress=on_progress)
+        graph = agent.compile()
+        state = {
+            "action": arguments.get("action", "translate_query"),
+            "text": arguments.get("text") or arguments.get("query") or "",
+            "direction": arguments.get("direction", "zh2en"),
+            "project_id": arguments.get("project_id") or project_id,
+        }
+        result = await graph.ainvoke(state)
+        return result.get("result", result)
+
+    # ── video (S13) ──
+    if agent_type == "video":
+        from .video_downloader import VideoDownloader
+        from .graphs.video_graph import VideoAgent
+        from ..config import get_videos_dir
+        whisper = _get_whisper_model()
+        videos_dir = get_videos_dir()
+        downloader = VideoDownloader(output_dir=videos_dir)
+        agent = VideoAgent(downloader, whisper, llm, db,
+                           videos_dir, on_progress=on_progress)
+        graph = agent.compile()
+        state = {
+            "project_id": arguments.get("project_id") or project_id,
+            "user_query": (arguments.get("query")
+                           or arguments.get("user_query")
+                           or arguments.get("url") or ""),
+        }
+        result = await graph.ainvoke(state)
+        return result.get("result", result)
+
+    # ── rad_query (S10) ──
+    if agent_type == "rad_query":
+        from .chroma_store import ChromaStoreV2
+        from .knowledge import KnowledgeBase
+        from .graphs.rad_query_graph import RADQueryAgent
+        chroma = ChromaStoreV2()
+        kb = KnowledgeBase(db, chroma, llm)
+        agent = RADQueryAgent(kb, on_progress=on_progress)
+        graph = agent.compile()
+        state = {
+            "question": (arguments.get("question")
+                         or arguments.get("query") or ""),
+            "project_id": arguments.get("project_id") or project_id,
+        }
+        result = await graph.ainvoke(state)
+        return result.get("result", result)
+
+    # 兜底（_handle_sub_agent 已校验 agent_type，这里不应到达）
+    raise ValueError(f"Unsupported agent_type: {agent_type}")
+
+
 @app.task(bind=True, max_retries=0)
 def sub_agent_task(
     self,
-    user_query: str,
+    user_query: str = "",
     sources: list[str] = None,
     year_from: int = 2022,
     max_results: int = 20,
     project_id: str = "",
     agent_task_id: str = "",
+    agent_type: str = "ingest",
+    arguments: dict = None,
 ) -> dict:
-    """Celery 编排器: 完整 7 阶段论文入库流水线。
+    """Celery 编排器 — 按 agent_type 分发到对应 graph runner。
 
-    顺序: search → evaluate → group(download) → group(convert)
-           → group(index) → rank → survey
+    agent_type == "ingest"（默认，保留原逻辑）:
+        7 阶段论文入库流水线
+        search → evaluate → group(download) → group(convert)
+                → group(index) → rank → survey
+        通过 Celery group() 并行处理每篇论文的下载/转换/索引。
 
-    通过 Celery group() 并行处理每篇论文的下载/转换/索引。
+    其他 agent_type (clustering / citation_chase / translation / video / rad_query):
+        在 Celery worker 内 asyncio 跑对应 LangGraph agent。
+        通过 reporter 上报 lifecycle (agent_started/done/failed) + progress。
+        依赖各 graph 文件的 Agent 类（ClusteringAgent / CitationChaseAgent / ...）。
     """
+    # 非 ingest → 路由到对应 graph runner（ingest 路径完全不变）
+    if agent_type != "ingest":
+        return _run_graph_agent(
+            agent_type=agent_type,
+            arguments=arguments or {},
+            log_id=agent_task_id or self.request.id,
+            user_query=user_query,
+            project_id=project_id,
+        )
+
     from celery import group
 
     task_id = self.request.id

@@ -54,6 +54,62 @@ SUB_AGENT_TIMEOUT_SEC = 30 * 60  # 子 Agent 默认 30 分钟
 IOS_TIMEOUT_SEC = 2 * 60         # iOS 工具默认 2 分钟
 ASK_USER_TIMEOUT_SEC = 30 * 60   # 等用户回答最长 30 分钟
 
+# ── 子 Agent 类型路由 ──────────────────────────────────────
+# _handle_sub_agent 按 agent_type 分发到对应 graph runner。
+# 未知类型不 fallback 到 ingest（那是 P0 bug 的根因）—— 直接报错。
+_KNOWN_SUB_AGENT_TYPES = frozenset({
+    "ingest", "clustering", "citation_chase",
+    "translation", "video", "rad_query",
+})
+
+# 各 agent_type 的预估阶段数（sub_request 推给 iOS 的 estimatedStages）
+_SUB_AGENT_STAGES = {
+    "ingest": 7,
+    "clustering": 5,
+    "citation_chase": 7,
+    "translation": 1,
+    "video": 8,
+    "rad_query": 5,
+}
+
+
+def _check_sub_agent_args(agent_type: str, args: dict, user_query: str) -> list[str]:
+    """校验 sub_agent 必需参数。返回缺失参数名列表（空 = 通过）。
+
+    各 agent_type 的必需参数：
+      - ingest: 不强制（保留旧行为；空 query 会搜不到论文，由 sub_agent_task 自然返回）
+      - clustering: project_id（必须基于已入库项目）
+      - citation_chase: seed_title / seed_doi / seed_paper / query 至少一个
+      - translation: text / query 至少一个
+      - video: query（含链接的 user_query）
+      - rad_query: question / query 至少一个
+    """
+    if agent_type == "ingest":
+        return []
+    if agent_type == "clustering":
+        if not (args.get("project_id") or args.get("scope")):
+            return ["project_id"]
+        return []
+    if agent_type == "citation_chase":
+        if not (args.get("seed_title") or args.get("seed_doi")
+                or args.get("seed_paper") or args.get("query")):
+            return ["seed_title|seed_doi"]
+        return []
+    if agent_type == "translation":
+        if not (args.get("text") or args.get("query")):
+            return ["text"]
+        return []
+    if agent_type == "video":
+        if not user_query:
+            return ["query"]
+        return []
+    if agent_type == "rad_query":
+        if not (args.get("question") or args.get("query")):
+            return ["question"]
+        return []
+    # 未知类型由调用方先拦截，这里兜底
+    return [f"unknown_agent_type:{agent_type}"]
+
 # C3: 灰区阈值 — 当所有 scenario.confidence 都低于此值时，触发 ask_user 让用户挑选
 # 可通过环境变量 INTENT_ASK_THRESHOLD 覆盖（默认 0.6）。
 # 设计为函数而非模块级常量，确保运行时修改 env 后生效，且测试可以 patch os.environ
@@ -1015,28 +1071,71 @@ class MainAgent:
     # ── Tool handlers ─────────────────────────────────
 
     async def _handle_sub_agent(self, session_id: str, spec: ToolCallSpec) -> dict:
-        """启动 Celery 子 Agent，订阅 agent:reports:{task_id}，等 agent_done/failed。"""
+        """启动 Celery 子 Agent，订阅 agent:reports:{task_id}，等 agent_done/failed。
+
+        按 agent_type 分发到对应 graph runner：
+          - ingest         → sub_agent_task 内置 7 阶段流水线
+          - clustering     → ClusteringAgent (5 节点)
+          - citation_chase → CitationChaseAgent (7 节点)
+          - translation    → TranslationAgent
+          - video          → VideoAgent (8 节点)
+          - rad_query      → RADQueryAgent (5 节点)
+
+        未知 agent_type / 缺关键参数 → 推 error，**不 fallback 到 ingest**
+        （fallback 正是历史 P0 bug 的根因：S6/S8/S9/S12/S13 静默跑 ingest）。
+        """
         agent_type = spec.arguments.get("agent_type", spec.name)
+
+        # 校验 agent_type — 未知直接报错，不静默 fallback 到 ingest
+        if agent_type not in _KNOWN_SUB_AGENT_TYPES:
+            err = (f"unknown sub_agent type: {agent_type!r} "
+                   f"(known: {sorted(_KNOWN_SUB_AGENT_TYPES)})")
+            logger.warning("_handle_sub_agent: %s", err)
+            task_id = _new_task_id(str(agent_type))
+            await self._push(session_id, "tool", "sub_result", "system", payload={
+                "taskId": task_id, "name": agent_type, "status": "failed",
+                "summary": f"不支持的子 Agent 类型: {agent_type}",
+                "result": {"error": err},
+            }, priority_kind="high")
+            return {"error": err, "task_id": task_id}
+
         user_query = (spec.arguments.get("query")
                       or spec.arguments.get("user_query")
                       or spec.arguments.get("description") or "")
+
+        # 校验关键参数 — 缺则报错而非用默认值瞎跑
+        missing = _check_sub_agent_args(agent_type, spec.arguments, user_query)
+        if missing:
+            err = f"sub_agent {agent_type} missing required args: {missing}"
+            logger.warning("_handle_sub_agent: %s", err)
+            task_id = _new_task_id(agent_type)
+            await self._push(session_id, "tool", "sub_result", "system", payload={
+                "taskId": task_id, "name": agent_type, "status": "failed",
+                "summary": f"缺少必需参数: {', '.join(missing)}",
+                "result": {"error": err, "missing": missing},
+            }, priority_kind="high")
+            return {"error": err, "task_id": task_id, "missing": missing}
+
         task_id = _new_task_id(agent_type)
 
-        # 启动 Celery
+        # 启动 Celery — 把 agent_type + 完整 arguments 传过去，由 sub_agent_task 分发
         from .celery_tasks import sub_agent_task
         try:
             sub_agent_task.delay(
+                agent_type=agent_type,
                 user_query=user_query,
                 project_id=task_id,
                 agent_task_id=task_id,
+                arguments=spec.arguments,
             )
         except Exception as e:
             return {"error": f"Failed to dispatch celery: {e}"}
 
-        # 推送 sub_request
+        # 推送 sub_request — estimatedStages 按 agent_type
         await self._push(session_id, "tool", "sub_request", "assistant", payload={
             "taskId": task_id, "name": agent_type, "label": spec.name,
-            "query": user_query, "estimatedStages": 7,
+            "query": user_query,
+            "estimatedStages": _SUB_AGENT_STAGES.get(agent_type, 5),
         })
 
         # 订阅 reports channel

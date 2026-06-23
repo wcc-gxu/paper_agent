@@ -49,6 +49,7 @@ from .llm_client import (
     RelevanceJudgment,
     SearchIntent,
 )
+from ..config import get_model_for_node
 
 logger = logging.getLogger(__name__)
 
@@ -493,6 +494,25 @@ class LLMClientV2:
 
     # ── 核心: 非流式调用 ───────────────────────────────────
 
+    def _resolve_models(
+        self,
+        node: Optional[str],
+        model: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        """解析 (primary, fallback) 模型对。
+
+        优先级: model > node > provider 默认。
+        - model 直接指定: 返回 (model, None) — 单模型无降级
+        - node 指定: 查 MODEL_ROUTES, 返回 (primary, fallback)
+        - 都不指定: 返回 (self.provider.model, None) — 向后兼容
+        """
+        if model:
+            return model, None
+        if node:
+            primary, fallback = get_model_for_node(node)
+            return primary, fallback
+        return self.provider.model, None
+
     async def chat(
         self,
         messages: list[ChatMessage | dict],
@@ -500,6 +520,8 @@ class LLMClientV2:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         system: Optional[str] = None,
+        node: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> ChatResponse:
         """发送消息, 返回 ChatResponse.
 
@@ -509,18 +531,60 @@ class LLMClientV2:
             temperature: 采样温度 (默认 0.3)
             max_tokens: 最大 token 数
             system: system prompt (如果 messages 中没有 system 角色)
+            node: 路由节点名 — 查 MODEL_ROUTES 得 (primary, fallback),
+                主模型失败(异常/超时/限流)自动切 fallback 重试一次
+            model: 直接指定模型 ID (优先级高于 node; 单模型, 无降级)
 
         Returns:
             ChatResponse with content, tool_calls, usage
+
+        多模型降级: 传 node 时 primary 失败自动换 fallback 重试一次,
+        两种模型都失败才抛异常。不传 node/model 时用 provider 默认模型 (向后兼容)。
         """
+        primary, fallback = self._resolve_models(node, model)
+        last_exc: Optional[Exception] = None
+        for i, mdl in enumerate((primary, fallback)):
+            if mdl is None:
+                continue
+            try:
+                return await self._chat_once(
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    system=system,
+                    model=mdl,
+                )
+            except Exception as e:
+                last_exc = e
+                if fallback and i == 0:
+                    logger.warning(
+                        f"chat: primary model '{primary}' failed "
+                        f"({type(e).__name__}: {e}), trying fallback '{fallback}'"
+                    )
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
+
+    async def _chat_once(
+        self,
+        messages: list[ChatMessage | dict],
+        tools: Optional[list[ToolDef]] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        system: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> ChatResponse:
+        """单模型 chat — chat() 降级层之下的一次尝试 (含原有重试)."""
         p = self.provider
+        mdl = model if model is not None else p.model
         temp = temperature if temperature is not None else self.default_temperature
         mt = max_tokens if max_tokens is not None else self.max_tokens
 
         anthropic_msgs = self._to_anthropic_messages(messages)
 
         payload: dict[str, Any] = {
-            "model": p.model,
+            "model": mdl,
             "max_tokens": mt,
             "temperature": temp,
             "messages": anthropic_msgs,
@@ -631,8 +695,10 @@ class LLMClientV2:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         system: Optional[str] = None,
+        node: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> AsyncIterator[dict]:
-        """流式对话 — 逐块返回 delta.
+        """流式对话 — 逐块返回 delta. 支持多模型降级 (传 node 时).
 
         Yields:
             {"type": "text_delta", "text": "..."}
@@ -640,15 +706,81 @@ class LLMClientV2:
             {"type": "tool_use_delta", "id": "...", "input": {...}}
             {"type": "message_stop", "stop_reason": "..."}
             {"type": "error", "message": "..."}
+
+        多模型降级: 传 node 时, 若 primary 在产出任何有效输出前就报错
+        (网络/超时/5xx 重试耗尽), 自动切 fallback 重试一次。一旦 primary
+        已产出有效 delta, 后续错误不再切换 (避免拼接错乱)。
         """
+        primary, fallback = self._resolve_models(node, model)
+        models_to_try = [m for m in (primary, fallback) if m]
+
+        last_error_msg: Optional[str] = None
+        for i, mdl in enumerate(models_to_try):
+            is_last = i == len(models_to_try) - 1
+            produced_output = False
+            had_early_error = False
+            try:
+                async for chunk in self._chat_stream_once(
+                    messages=messages,
+                    tools=tools,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    system=system,
+                    model=mdl,
+                ):
+                    if (
+                        isinstance(chunk, dict)
+                        and chunk.get("type") == "error"
+                        and not produced_output
+                        and not is_last
+                    ):
+                        # primary 在产出输出前就报错 → 切 fallback
+                        had_early_error = True
+                        last_error_msg = chunk.get("message", "")
+                        logger.warning(
+                            f"chat_stream: model '{mdl}' errored before output "
+                            f"({last_error_msg}), trying next model"
+                        )
+                        break
+                    produced_output = True
+                    yield chunk
+            except Exception as e:
+                if not produced_output and not is_last:
+                    had_early_error = True
+                    last_error_msg = str(e)
+                    logger.warning(
+                        f"chat_stream: model '{mdl}' raised ({type(e).__name__}: {e}), "
+                        f"trying next model"
+                    )
+                else:
+                    yield {"type": "error", "message": str(e)}
+                    return
+
+            if not had_early_error:
+                return  # 成功完成 (或已把错误 yield 给上游)
+
+        # 所有模型都在产出前失败
+        yield {"type": "error", "message": last_error_msg or "all models failed"}
+
+    async def _chat_stream_once(
+        self,
+        messages: list[ChatMessage | dict],
+        tools: Optional[list[ToolDef]] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        system: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> AsyncIterator[dict]:
+        """单模型 chat_stream — chat_stream() 降级层之下的一次尝试 (含原有重试)."""
         p = self.provider
+        mdl = model if model is not None else p.model
         temp = temperature if temperature is not None else self.default_temperature
         mt = max_tokens if max_tokens is not None else self.max_tokens
 
         anthropic_msgs = self._to_anthropic_messages(messages)
 
         payload: dict[str, Any] = {
-            "model": p.model,
+            "model": mdl,
             "max_tokens": mt,
             "temperature": temp,
             "messages": anthropic_msgs,
@@ -782,6 +914,8 @@ class LLMClientV2:
         schema: Optional[type | dict] = None,
         temperature: float = 0.1,
         system: Optional[str] = None,
+        node: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> dict:
         """结构化 JSON 输出 — 通过 tool_use 强制输出符合 schema 的 JSON.
 
@@ -790,19 +924,79 @@ class LLMClientV2:
             schema: Pydantic model 或 JSON Schema dict
             temperature: 低温度确保确定性
             system: system prompt
+            node: 路由节点名 — 查 MODEL_ROUTES 得 (primary, fallback)
+            model: 直接指定模型 ID (优先级高于 node; 单模型无降级)
 
         Returns:
             解析后的 dict
+
+        多模型降级: 传 node 时, primary 失败 (异常/超时/限流/JSON 校验失败)
+        自动切 fallback 重试一次。JSON 校验失败指返回 {"error": ...} (parse
+        失败或重试耗尽)。两种模型都失败才放弃 (返回最后一个 error dict 或抛异常)。
         """
+        primary, fallback = self._resolve_models(node, model)
+        last_exc: Optional[Exception] = None
+        last_result: Optional[dict] = None
+
+        for i, mdl in enumerate((primary, fallback)):
+            if mdl is None:
+                continue
+            try:
+                result = await self._chat_json_once(
+                    messages=messages,
+                    schema=schema,
+                    temperature=temperature,
+                    system=system,
+                    model=mdl,
+                )
+                # JSON 校验失败 (parse_failed / max_retries_exceeded) → 触发降级
+                if (
+                    isinstance(result, dict)
+                    and "error" in result
+                    and fallback
+                    and i == 0
+                ):
+                    logger.warning(
+                        f"chat_json: primary model '{primary}' returned error "
+                        f"({result.get('error')}), trying fallback '{fallback}'"
+                    )
+                    last_result = result
+                    continue
+                return result
+            except Exception as e:
+                last_exc = e
+                if fallback and i == 0:
+                    logger.warning(
+                        f"chat_json: primary model '{primary}' failed "
+                        f"({type(e).__name__}: {e}), trying fallback '{fallback}'"
+                    )
+                    continue
+                raise
+
+        # fallback 也失败: 优先返回 error dict (让上游走 fail-closed), 否则抛异常
+        if last_result is not None:
+            return last_result
+        raise last_exc  # type: ignore[misc]
+
+    async def _chat_json_once(
+        self,
+        messages: list[ChatMessage | dict],
+        schema: Optional[type | dict] = None,
+        temperature: float = 0.1,
+        system: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> dict:
+        """单模型 chat_json — chat_json() 降级层之下的一次尝试 (含原有重试)."""
         # 构建 schema
         json_schema = self._resolve_schema(schema)
 
         # 如果没有显式的 schema, 使用 text 模式并提取 JSON
         if json_schema is None:
             p = self.provider
+            mdl = model if model is not None else p.model
             anthropic_msgs = self._to_anthropic_messages(messages)
             payload = {
-                "model": p.model,
+                "model": mdl,
                 "max_tokens": self.max_tokens,
                 "temperature": temperature,
                 "messages": anthropic_msgs,
@@ -857,18 +1051,19 @@ class LLMClientV2:
 
             return {"error": "max_retries_exceeded", "detail": str(last_error) if last_error else "unknown"}
 
-        # 使用 tool_use 强制结构化输出
+        # 使用 tool_use 强制结构化输出 (走 _chat_once 避免嵌套降级)
         tool = ToolDef(
             name="output",
             description="输出结构化结果",
             input_schema=json_schema,
         )
 
-        response = await self.chat(
+        response = await self._chat_once(
             messages=messages,
             tools=[tool],
             temperature=temperature,
             system=system,
+            model=model,
         )
 
         if response.tool_calls:

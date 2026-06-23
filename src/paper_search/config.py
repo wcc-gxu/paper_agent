@@ -188,3 +188,52 @@ def get_cookie_dir() -> Path:
     各平台独立文件: douyin_cookies.txt, bilibili_cookies.txt 等。
     """
     return get_data_dir() / "cookies"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Model Routing — 多模型路由表 (火山引擎多模型, 同一 VOLCANO_API_KEY)
+# ═══════════════════════════════════════════════════════════════
+#
+# 7 个模型全部走火山引擎同一个 API Key, 只是 model ID 不同。
+# 每个 Agent 节点配 (primary, fallback): 主模型失败(异常/超时/限流/JSON
+# 校验失败)时 LLMClientV2 自动切 fallback 重试一次。
+# 详见 llm_client_v2.LLMClientV2.chat / chat_json / chat_stream 的 node 参数。
+
+MODEL_ROUTES: dict[str, tuple[str, str]] = {
+    # ── 主 Agent 节点 ──────────────────────────────────────
+    "safety_filter":         ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
+    "fast_triage":           ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
+    "inline_reply":          ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
+    "lightweight_plan_ops":  ("doubao-seed-2.0-code", "glm-5.2"),
+    "lightweight_plan_meta": ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
+    "scenario_plan":         ("glm-5.2",              "deepseek-v4-pro"),
+    "evaluate_completion":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
+    "final_reply":           ("glm-5.2",              "deepseek-v4-pro"),
+    # ── 子 Agent 内部 ──────────────────────────────────────
+    "ingest_evaluate":   ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
+    "ingest_survey":     ("doubao-seed-2.0-pro",  "glm-5.2"),
+    "cluster_label":     ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
+    "gap_discovery":     ("glm-5.2",              "deepseek-v4-pro"),
+    "citation_filter":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
+    "translation":       ("glm-5.2",              "doubao-seed-2.0-pro"),
+    "video_summarize":   ("doubao-seed-2.0-pro",  "glm-5.2"),
+    "video_analyze":     ("glm-5.2",              "deepseek-v4-pro"),
+    "rad_query_route":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
+    "rad_query_answer":  ("doubao-seed-2.0-pro",  "glm-5.2"),
+}
+
+# 默认模型 (向后兼容: 未传 node 时, LLMClientV2 用 provider 自带 model)
+DEFAULT_MODEL_PRIMARY: str = "doubao-seed-2.0-lite"
+DEFAULT_MODEL_FALLBACK: str = "deepseek-v4-flash"
+
+
+def get_model_for_node(node_name: str) -> tuple[str, str]:
+    """返回 (primary, fallback) 模型 ID。
+
+    未知节点返回默认 (doubao-seed-2.0-lite, deepseek-v4-flash)。
+    所有模型均走火山引擎 (同一 VOLCANO_API_KEY), 只是 model ID 不同,
+    一个 SDK 即可切换, provider / base_url / api_key 不变。
+    """
+    return MODEL_ROUTES.get(
+        node_name, (DEFAULT_MODEL_PRIMARY, DEFAULT_MODEL_FALLBACK)
+    )
