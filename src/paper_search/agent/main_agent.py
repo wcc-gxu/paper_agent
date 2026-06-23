@@ -30,19 +30,27 @@ from typing import Any, Optional
 
 from .main_agent_prompts import (
     EVALUATE_COMPLETION_SYSTEM,
+    FAST_TRIAGE_SYSTEM,
     INLINE_REPLY_SYSTEM,
+    LIGHTWEIGHT_PLAN_META_SYSTEM,
+    LIGHTWEIGHT_PLAN_OPS_SYSTEM,
     SCENARIOS,
     EvaluateCompletionResult,
+    FastTriageResult,
     IntentClassifyResult,
+    LightweightPlanResult,
     SafetyResult,
     ScenarioMatch,
     ScenarioPlanResult,
     ToolCallSpec,
+    build_fast_triage_prompt,
     build_intent_classify_prompt,
+    build_lightweight_plan_prompt,
     build_safety_filter_prompt,
     build_scenario_plan_prompt,
 )
 from .outbox import outbox_publish
+from .plangraph import expand as plangraph_expand
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +190,83 @@ def _safety_regex_check(text: str) -> Optional[str]:
     return None
 
 
+# ═══════════════════════════════════════════════════════════════
+# v2: fast triage 规则层词典 (main-agent-v2-design.md §4.1)
+# ═══════════════════════════════════════════════════════════════
+
+# 高频 chat 词典 — 命中即短路（<10ms，不调 LLM）
+_CHAT_KEYWORDS: frozenset[str] = frozenset({
+    "你好", "您好", "哈喽", "hello", "hi", "hey",
+    "谢谢", "感谢", "thanks", "thank you", "多谢",
+    "好的", "好", "嗯", "ok", "okay", "收到", "了解", "明白",
+    "再见", "bye", "拜拜", "晚安", "早上好", "下午好",
+    "在吗", "在不在",
+})
+
+# 高频 unsupported 词典 — 命中即短路
+_UNSUPPORTED_KEYWORDS: frozenset[str] = frozenset({
+    "写代码", "写程序", "写python", "写java", "编程",
+    "做菜", "菜谱", "做饭", "烹饪",
+    "写诗", "写小说", "写故事", "创作",
+    "聊电影", "聊娱乐", "聊八卦", "陪聊", "陪我聊",
+    "玩游戏", "打游戏",
+})
+
+# ops 触发词 — 命中 route=ops（不短路，走轻量规划）
+_OPS_KEYWORDS: tuple[str, ...] = (
+    "重启", "restart", "重载", "reload",
+    "pip install", "pip3 install", "npm install",
+    "docker", "systemctl", "服务状态", "service_status",
+    "apt install", "apt-get",
+    "bash", "shell", "执行命令",
+)
+
+# meta 触发词 — 命中 route=meta（不短路，走轻量规划）
+_META_KEYWORDS: tuple[str, ...] = (
+    "我的偏好", "记不记得", "还记得", "search_memory",
+    "你记得我", "我研究啥", "我研究什么",
+    "get_user_preference", "上次对话", "历史记录",
+)
+
+# fast triage 短路阈值：仅 chat/unsupported 且 confidence >= 此值才短路
+_FAST_TRIAGE_SHORTCUT_THRESHOLD = 0.85
+
+
+# ═══════════════════════════════════════════════════════════════
+# v2: 轻量规划 risk 校验 (main-agent-v2-design.md §4.3)
+# ═══════════════════════════════════════════════════════════════
+
+# ops 命令黑名单 — 匹配则强制 risk_level=high（覆盖 LLM 判断）
+_OPS_COMMAND_BLACKLIST: list[re.Pattern] = [
+    re.compile(r"rm\s+-rf\s+/", re.IGNORECASE),
+    re.compile(r"\bsudo\b", re.IGNORECASE),
+    re.compile(r":\(\)\s*\{", re.IGNORECASE),             # fork bomb
+    re.compile(r"chmod\s+777", re.IGNORECASE),
+    re.compile(r">\s*/dev/sd", re.IGNORECASE),
+    re.compile(r"\bpip\s+install\b", re.IGNORECASE),
+    re.compile(r"\bapt(-get)?\s+install\b", re.IGNORECASE),
+    re.compile(r"\bnpm\s+install\b", re.IGNORECASE),
+    re.compile(r"\bdocker\s+(run|exec|rm|rmi)\b", re.IGNORECASE),
+    re.compile(r"\bcurl\s+.*\|\s*(bash|sh)", re.IGNORECASE),
+    re.compile(r"\bwget\s+.*\|\s*(bash|sh)", re.IGNORECASE),
+]
+
+# meta 只读白名单 tool — 任何写操作拒绝
+_META_TOOL_WHITELIST: frozenset[str] = frozenset({
+    "log_view", "health_check", "search_memory",
+    "get_user_preference", "list_sources", "read_paper",
+    "list_collections", "search_library",
+})
+
+
+def _ops_command_risk(command: str) -> Optional[str]:
+    """检查 ops 命令是否匹配黑名单。命中返回 'high'，否则 None。"""
+    for pat in _OPS_COMMAND_BLACKLIST:
+        if pat.search(command):
+            return "high"
+    return None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -307,7 +392,16 @@ class MainAgent:
     # ── 一轮对话调度 ───────────────────────────────────
 
     async def _run_turn(self, session_id: str, user_content: str):
-        """节点 0 (safety_filter) → 节点 1 (intent_classify) → 分支。"""
+        """v2 链路: safety_filter → fast_triage → 分支。
+
+        chat/unsupported (conf>=0.85) → inline_reply → END
+        ops → lightweight_plan(ops) → execute/confirm → END
+        meta → lightweight_plan(meta) → execute → END
+        business → intent_classify → scenario_plan (并行) → PlanGraph → execute → evaluate → final_reply
+        """
+        # v2: 收到消息后立即推 status{received}（协议 v10 要求 <200ms ack）
+        await self._push_status(session_id, "received", "收到，正在分析...", level="user")
+
         # 节点 0: C1 安全前置过滤（regex 兜底 + 命中时 LLM 二次确认）
         safety = await self._node_safety_filter(session_id, user_content)
         self._record_event(session_id, "safety_checked", safety.model_dump())
@@ -322,7 +416,41 @@ class MainAgent:
                         safety.risk_kind, safety.reasoning[:80])
             return
 
-        # 节点 1: 意图分类（C2: 现在 scenarios 是 list）
+        # 节点 1: v2 fast triage（规则 <10ms → 未命中 → 小模型 ~500ms）
+        await self._push_status(session_id, "analyzing", "正在判断请求类型...")
+        triage = await self._node_fast_triage(session_id, user_content)
+        self._record_event(session_id, "fast_triaged", triage.model_dump())
+        logger.info(
+            "⚡ fast_triage | route=%s conf=%.2f",
+            triage.route, triage.confidence,
+        )
+
+        # 保守短路：仅 chat/unsupported 且 confidence>=0.85 才短路到 inline_reply
+        if (triage.route in ("chat", "unsupported")
+                and triage.confidence >= _FAST_TRIAGE_SHORTCUT_THRESHOLD):
+            intent = IntentClassifyResult(
+                intent_kind=triage.route,  # type: ignore[arg-type]
+                scenarios=[],
+                overall_confidence=triage.confidence,
+                reasoning=triage.reasoning,
+            )
+            await self._node_inline_reply(session_id, user_content, intent)
+            return
+
+        # ops → 轻量规划节点
+        if triage.route == "ops":
+            await self._push_status(session_id, "planning", "正在规划运维操作...")
+            await self._node_lightweight_plan(session_id, user_content, "ops")
+            return
+
+        # meta → 轻量规划节点
+        if triage.route == "meta":
+            await self._push_status(session_id, "planning", "正在处理元操作...")
+            await self._node_lightweight_plan(session_id, user_content, "meta")
+            return
+
+        # business (或 fallback) → intent_classify → scenario_plan → PlanGraph → execute
+        # intent_classify 保留为 business 路径的 scenario matcher (向后兼容)
         intent = await self._node_intent_classify(session_id, user_content)
         self._record_event(session_id, "intent_classified", intent.model_dump())
 
@@ -334,6 +462,7 @@ class MainAgent:
 
         if intent.intent_kind == "business" and intent.scenarios:
             # 节点 2A: 业务场景规划（C2: 传入 scenarios list）
+            await self._push_status(session_id, "planning", "正在规划执行方案...")
             await self._node_scenario_plan(session_id, user_content, intent)
         else:
             # 节点 2B: 闲聊 / meta / unsupported 直接回复
@@ -385,6 +514,7 @@ class MainAgent:
                 schema=SafetyResult,
                 temperature=0.0,
                 system=build_safety_filter_prompt(),
+                node="safety_filter",
             )
             result = SafetyResult.model_validate(data)
             # LLM 没标 risk_kind 但又说 unsafe → 补 regex 命中的类型
@@ -404,7 +534,89 @@ class MainAgent:
                 user_message="抱歉，系统暂时无法处理这个请求，请稍后再试或换个表述。",
             )
 
-    # ── 节点 1: intent_classify ────────────────────────
+    # ── 节点 1: v2 fast triage ────────────────────────
+
+    async def _node_fast_triage(self, session_id: str,
+                                user_content: str) -> FastTriageResult:
+        """v2 fast triage — 规则层 (<10ms) → 未命中 → 小模型 (~500ms)。
+
+        保守短路：仅 chat/unsupported 且 confidence>=0.85 才短路到 inline_reply。
+        ops/meta 不论置信度都进正式流程（轻量规划）。
+        失败 fallback：business（走完整 17 场景评估兜底）。
+        """
+        # 1. 规则层（<10ms）
+        rule_route = self._fast_triage_rule(user_content)
+        if rule_route is not None:
+            return FastTriageResult(
+                route=rule_route,
+                confidence=1.0,
+                all={rule_route: 1.0},
+                reasoning=f"rule_hit:{rule_route}",
+            )
+
+        # 2. 小模型层
+        history = self._build_history_context(session_id, limit=10)
+        messages = history + [{"role": "user", "content": user_content}]
+        try:
+            data = await self._llm.chat_json(
+                messages=messages,
+                schema=FastTriageResult,
+                temperature=0.0,
+                system=build_fast_triage_prompt(),
+                node="fast_triage",
+            )
+            result = FastTriageResult.model_validate(data)
+            # 补全 all dict（LLM 可能漏填）
+            for k in ("chat", "meta", "unsupported", "ops", "business"):
+                result.all.setdefault(k, 0.0)
+            return result
+        except Exception as e:
+            # 失败 fallback：business（走完整 17 场景评估，最全链路兜底）
+            logger.warning(f"fast_triage LLM failed: {e}, fallback to business")
+            return FastTriageResult(
+                route="business",
+                confidence=0.5,
+                all={"business": 0.5},
+                reasoning=f"LLM_error_fallback_business: {e}",
+            )
+
+    @staticmethod
+    def _fast_triage_rule(user_content: str) -> Optional[str]:
+        """规则层：高频词典命中即返回 route，否则 None。
+
+        chat / unsupported 命中 → 短路（confidence=1.0 >= 0.85）
+        ops / meta 命中 → 返回 route 但不短路（走轻量规划）
+        """
+        text = user_content.strip().lower()
+        if not text:
+            return "chat"
+
+        # chat 词典（精确匹配短消息）
+        if text in _CHAT_KEYWORDS:
+            return "chat"
+        # 去标点后再判
+        text_clean = re.sub(r"[。.!！?？~～,\s]+", "", text)
+        if text_clean in _CHAT_KEYWORDS:
+            return "chat"
+
+        # unsupported 词典
+        for kw in _UNSUPPORTED_KEYWORDS:
+            if kw in text:
+                return "unsupported"
+
+        # ops 触发词
+        for kw in _OPS_KEYWORDS:
+            if kw in text:
+                return "ops"
+
+        # meta 触发词
+        for kw in _META_KEYWORDS:
+            if kw in text:
+                return "meta"
+
+        return None
+
+    # ── 节点 1b: intent_classify (business 路径保留) ───
 
     async def _node_intent_classify(self, session_id: str, user_content: str) -> IntentClassifyResult:
         """LLM 把用户消息分类到 business/chat/meta/unsupported。
@@ -670,11 +882,12 @@ class MainAgent:
 
     async def _node_scenario_plan(self, session_id: str, user_content: str,
                                    intent: IntentClassifyResult):
-        """业务场景：生成结构化 plan，可能含 clarify/approval，最后执行。
+        """v2 业务场景规划：并行多场景 → PlanGraph 展开 → 审批 → 执行。
 
-        C2 改造：intent.scenarios 是 list，可能含 1~N 个场景。
-          - 单场景：和原有行为一致
-          - 多场景：为每个场景生成子 plan，合并 tools[]、permissions、summary 后统一审批+执行
+        v2 改造点 (items 2+5):
+          - 串行 for → asyncio.gather 并行（省 (N-1)×LLM 延迟）
+          - LLM 不再生成 tools[]（瘦身后只给 clarity + clarify_questions）
+          - PlanGraph.expand 按 scenario_id 查路由表展开 tools[] + permissions + danger_level
         """
         scenarios = intent.scenarios
         if not scenarios:
@@ -691,19 +904,28 @@ class MainAgent:
                                  priority_kind="urgent")
                 return
 
-        # 逐个场景生成子 plan
-        # 改进点：单个场景失败不再整体 abort —— 在多场景模式下尽量保留成功的部分
-        sub_plans: list[ScenarioPlanResult] = []
-        failed_sids: list[str] = []
-        for idx, sm in enumerate(scenarios):
-            sub_plan = await self._plan_one_scenario(
+        # v2: 并行规划多场景（asyncio.gather 替代串行 for）
+        # 失败隔离：return_exceptions=True 让单个 plan 失败不影响其他
+        coros = [
+            self._plan_one_scenario(
                 session_id, user_content, sm.scenario_id,
                 scenario_idx=idx,
             )
-            if sub_plan is None:
+            for idx, sm in enumerate(scenarios)
+        ]
+        batch_results = await asyncio.gather(*coros, return_exceptions=True)
+
+        sub_plans: list[ScenarioPlanResult] = []
+        failed_sids: list[str] = []
+        for sm, res in zip(scenarios, batch_results):
+            if isinstance(res, Exception):
+                logger.warning(f"plan_one_scenario raised for {sm.scenario_id}: {res}")
                 failed_sids.append(sm.scenario_id)
                 continue
-            sub_plans.append(sub_plan)
+            if res is None:
+                failed_sids.append(sm.scenario_id)
+                continue
+            sub_plans.append(res)
 
         if not sub_plans:
             # 全部失败 → 整体放弃（_plan_one_scenario 已对每个失败 push 过 error）
@@ -723,12 +945,8 @@ class MainAgent:
                                {"failed": failed_sids,
                                 "succeeded": [p.scenario_id for p in sub_plans]})
 
-        # 合并多个子 plan → 一个 ScenarioPlanResult
+        # 合并多个子 plan → 一个 ScenarioPlanResult（v2 瘦身：此时 tools[] 为空）
         plan = self._merge_sub_plans(sub_plans)
-        logger.info(
-            "📋 scenario_plan merged | scenarios=%s tools=%d approval=%s",
-            [p.scenario_id for p in sub_plans], len(plan.tools), plan.needs_approval,
-        )
 
         # 合并后仍 needs_clarification（任一 sub-plan 3 轮 clarify 后 LLM 还在问）
         # → 显式告知用户并终止，避免在欠规约的 plan 上盲跑工具
@@ -748,6 +966,26 @@ class MainAgent:
             self._record_event(session_id, "plan_unresolved_clarification",
                                {"unresolved": unresolved})
             return
+
+        # v2: PlanGraph 硬编码路由表展开 tools[]（替代 LLM 生成）
+        # 用合并后的 scenarios list（用户确认 + LLM 确认的）查路由表
+        history = self._build_history_context(session_id, limit=20)
+        confirmed_scenarios = plan.scenarios or [
+            ScenarioMatch(scenario_id=p.scenario_id, confidence=1.0, reasoning="merged")
+            for p in sub_plans if p.scenario_id
+        ]
+        plan = plangraph_expand(confirmed_scenarios, user_content, history)
+        logger.info(
+            "📋 PlanGraph expanded | scenarios=%s tools=%d approval=%s danger=%s",
+            [s.scenario_id for s in confirmed_scenarios],
+            len(plan.tools), plan.needs_approval,
+            plan.permissions_required,
+        )
+        self._record_event(session_id, "plangraph_expanded", {
+            "scenarios": [s.scenario_id for s in confirmed_scenarios],
+            "tools_count": len(plan.tools),
+            "needs_approval": plan.needs_approval,
+        })
 
         # 需要审批 → propose_plan 卡片
         if plan.needs_approval:
@@ -801,6 +1039,7 @@ class MainAgent:
                 data = await self._llm.chat_json(
                     messages=messages, schema=ScenarioPlanResult,
                     temperature=0.2, system=system,
+                    node="scenario_plan",
                 )
                 plan = ScenarioPlanResult.model_validate(data)
             except Exception as e:
@@ -811,9 +1050,24 @@ class MainAgent:
                 return None
 
             self._record_event(session_id, "scenario_planned", plan.model_dump())
+            # v2: 确保 scenario_id / scenarios 字段被填充（瘦身后 LLM 可能不填顶层 scenario_id）
+            if not plan.scenario_id:
+                plan.scenario_id = scenario_id
+            if not plan.scenarios:
+                plan.scenarios = [ScenarioMatch(
+                    scenario_id=scenario_id,  # type: ignore[arg-type]
+                    confidence=plan.clarity,
+                    reasoning="confirmed_by_plan",
+                )]
+            # v2: 从 clarity 推导 needs_clarification（瘦身后 LLM 只给 clarity + clarify_questions）
+            threshold = _intent_ask_threshold()
+            if plan.clarity < threshold and plan.clarification_questions:
+                plan.needs_clarification = True
+            elif plan.clarity >= threshold:
+                plan.needs_clarification = False
             logger.info(
-                "📋 scenario_plan | sid=%s clarify=%s approval=%s tools=%d",
-                plan.scenario_id, plan.needs_clarification, plan.needs_approval,
+                "📋 scenario_plan | sid=%s clarity=%.2f clarify=%s tools=%d",
+                plan.scenario_id, plan.clarity, plan.needs_clarification,
                 len(plan.tools),
             )
 
@@ -921,20 +1175,23 @@ class MainAgent:
             if not tools_to_run:
                 break
             # 节点 3: 执行
+            await self._push_status(session_id, "executing",
+                                    f"正在执行 {len(tools_to_run)} 个任务...")
             results = await self._node_execute_plan(session_id, tools_to_run)
             all_results.update(results)
 
             # 节点 4: 评估
+            await self._push_status(session_id, "evaluating", "正在评估完成度...")
             eval_res = await self._node_evaluate_completion(
                 session_id, user_content, plan, all_results,
             )
             self._record_event(session_id, "completion_evaluated", eval_res.model_dump())
 
             if eval_res.satisfied:
-                # 最终文本回复
-                await self._push(session_id, "message", "text", "assistant",
-                                 payload={"content": eval_res.final_message or "已完成。"},
-                                 priority_kind="high")
+                # v2: 独立 final reply 节点（替代 v9 复用 evaluate 的 final_message）
+                await self._node_final_reply(
+                    session_id, user_content, plan, all_results, eval_res,
+                )
                 return
 
             if not eval_res.needs_more_tools:
@@ -968,6 +1225,7 @@ class MainAgent:
             if hasattr(self._llm, "chat_stream"):
                 async for chunk in self._llm.chat_stream(
                     messages=messages, system=INLINE_REPLY_SYSTEM, temperature=0.6,
+                    node="inline_reply",
                 ):
                     # chat_stream yields {"type": "text_delta", "text": "..."} 等 dict
                     if isinstance(chunk, dict):
@@ -991,6 +1249,7 @@ class MainAgent:
                 # 不支持流 → 一次性
                 resp = await self._llm.chat(
                     messages=messages, system=INLINE_REPLY_SYSTEM, temperature=0.6,
+                    node="inline_reply",
                 )
                 full_text = getattr(resp, "content", None) or str(resp)
         except Exception as e:
@@ -1003,6 +1262,189 @@ class MainAgent:
                          priority_kind="high")
         self._record_event(session_id, "inline_reply_sent",
                            {"final_text": full_text[:500]})
+
+    # ── 节点 2C: v2 lightweight_plan (ops + meta 共用) ──
+
+    async def _node_lightweight_plan(self, session_id: str, user_content: str,
+                                      route: str):
+        """v2 轻量规划节点 — ops + meta 共用，按 route 切 prompt。
+
+        ops: 命令生成用 doubao-seed-2.0-code；risk 双判（LLM + 黑名单强制升级 high）
+        meta: 规划用 doubao-seed-2.0-lite；限只读白名单 tool
+        high → ask(kind=confirm) 二次确认 → 执行；low → 直接执行
+        """
+        # ops 超管校验（MVP 默认超管，代码留 is_admin 检查点）
+        if route == "ops":
+            is_admin = self._is_admin(session_id)
+            if not is_admin:
+                await self._push(session_id, "error", "PERMISSION_DENIED", "system",
+                                 payload={"message": "运维操作需要超管权限。",
+                                          "audit": True, "route": "ops"},
+                                 priority_kind="urgent")
+                self._record_event(session_id, "ops_admin_denied",
+                                   {"user_content": user_content[:200]})
+                return
+
+        history = self._build_history_context(session_id, limit=10)
+        messages = history + [{"role": "user", "content": user_content}]
+        node_name = "lightweight_plan_ops" if route == "ops" else "lightweight_plan_meta"
+        system = build_lightweight_plan_prompt(route)
+
+        try:
+            data = await self._llm.chat_json(
+                messages=messages,
+                schema=LightweightPlanResult,
+                temperature=0.1,
+                system=system,
+                node=node_name,
+            )
+            plan = LightweightPlanResult.model_validate(data)
+        except Exception as e:
+            logger.warning(f"lightweight_plan ({route}) LLM failed: {e}")
+            await self._push(session_id, "error", "INTERNAL_ERROR", "system",
+                             payload={"message": f"规划失败: {e}"},
+                             priority_kind="urgent")
+            return
+
+        self._record_event(session_id, "lightweight_planned", {
+            "route": route, "need_tool": plan.need_tool,
+            "tool_name": plan.tool_name, "risk_level": plan.risk_level,
+        })
+        logger.info(
+            "🔧 lightweight_plan | route=%s need_tool=%s tool=%s risk=%s",
+            route, plan.need_tool, plan.tool_name, plan.risk_level,
+        )
+
+        # 不需要工具 → 直接回复
+        if not plan.need_tool:
+            await self._push(session_id, "message", "text", "assistant",
+                             payload={"content": plan.reply_if_no_tool or "已完成。"},
+                             priority_kind="high")
+            return
+
+        # meta 白名单校验
+        if route == "meta" and plan.tool_name not in _META_TOOL_WHITELIST:
+            await self._push(session_id, "error", "PERMISSION_DENIED", "system",
+                             payload={"message": f"meta 路径只允许只读工具，{plan.tool_name} 不在白名单。"},
+                             priority_kind="high")
+            self._record_event(session_id, "meta_tool_rejected",
+                               {"tool_name": plan.tool_name})
+            return
+
+        # ops risk 双判：LLM 给 risk_level + 系统黑名单强制升级 high
+        if route == "ops":
+            forced = _ops_command_risk(plan.query_or_command)
+            if forced == "high":
+                plan.risk_level = "high"
+                logger.info("ops risk upgraded to high (blacklist match): %s",
+                            plan.tool_name)
+
+        # high → ask(kind=confirm) 二次确认
+        if plan.risk_level == "high":
+            call_id = _new_call_id()
+            await self._push(session_id, "tool", "ask_user_question", "assistant",
+                             payload={
+                                 "id": call_id,
+                                 "questions": [{
+                                     "id": "confirm_exec",
+                                     "question": (
+                                         f"即将执行 {plan.tool_name}：\n"
+                                         f"{plan.query_or_command[:200]}\n"
+                                         "确认执行吗？"
+                                     ),
+                                     "type": "single_choice",
+                                     "options": ["确认执行", "取消"],
+                                 }],
+                                 "context": f"risk_level=high, route={route}",
+                             })
+            self._record_event(session_id, "lightweight_confirm_requested",
+                               {"tool_name": plan.tool_name, "risk": "high"})
+            reply = await self._wait_ws_reply(session_id, "tool", "ask_user_question",
+                                              timeout=ASK_USER_TIMEOUT_SEC)
+            if reply is None:
+                return
+            answers = reply.get("answers", [])
+            confirmed = False
+            for a in answers:
+                v = a.get("value") or a.get("answer", "")
+                if isinstance(v, str) and ("确认" in v or v == "0"):
+                    confirmed = True
+                    break
+            if not confirmed:
+                await self._push(session_id, "message", "text", "assistant",
+                                 payload={"content": "已取消执行。"},
+                                 priority_kind="high")
+                return
+            self._record_event(session_id, "lightweight_confirmed",
+                               {"tool_name": plan.tool_name})
+
+        # 执行（复用现有 _handle_cli_tool）
+        await self._push_status(session_id, "executing",
+                                f"正在执行 {plan.tool_name}...")
+        # 构造 ToolCallSpec 让 _handle_cli_tool 处理
+        spec = ToolCallSpec(
+            call_id=_new_call_id(),
+            kind="ios_tool" if plan.tool_name.startswith("ios_") else "tool",
+            name=plan.tool_name,
+            arguments=self._parse_lightweight_args(plan),
+        )
+        result = await self._dispatch_one(session_id, spec)
+
+        # 最终回复
+        result_text = self._format_lightweight_result(plan, result)
+        await self._push(session_id, "message", "text", "assistant",
+                         payload={"content": result_text},
+                         priority_kind="high")
+        self._record_event(session_id, "lightweight_executed", {
+            "tool_name": plan.tool_name, "route": route,
+            "result_brief": str(result)[:200],
+        })
+
+    def _is_admin(self, session_id: str) -> bool:
+        """ops 超管校验。MVP 阶段当前用户即超管，代码保留检查点供未来扩展。"""
+        # MVP: 默认超管。未来多用户时按 session_id → user_id → role 查 DB
+        return True
+
+    @staticmethod
+    def _parse_lightweight_args(plan: LightweightPlanResult) -> dict:
+        """从 LightweightPlanResult 解析工具参数。"""
+        args: dict[str, Any] = {}
+        cmd = plan.query_or_command.strip()
+        # 常见 ops 工具参数解析
+        if plan.tool_name == "bash_exec":
+            args["command"] = cmd
+        elif plan.tool_name in ("pip_install", "apt_install"):
+            args["packages"] = cmd.split()
+        elif plan.tool_name in ("service_start", "service_stop", "service_status"):
+            args["service"] = cmd
+        elif plan.tool_name == "log_view":
+            args["lines"] = 50
+            if cmd.isdigit():
+                args["lines"] = int(cmd)
+        elif plan.tool_name == "env_config":
+            args["key"] = cmd
+        elif plan.tool_name in ("search_memory", "search_library"):
+            args["query"] = cmd
+            args["top_k"] = 5
+        elif plan.tool_name == "get_user_preference":
+            args["key"] = cmd
+        elif plan.tool_name == "read_paper":
+            args["paper_id"] = cmd
+        else:
+            # 通用：把 query_or_command 当 keywords/query
+            if cmd:
+                args["keywords"] = cmd
+                args["query"] = cmd
+        return args
+
+    @staticmethod
+    def _format_lightweight_result(plan: LightweightPlanResult, result: Any) -> str:
+        """格式化轻量规划执行结果为用户可读文本。"""
+        if isinstance(result, dict) and result.get("error"):
+            return f"执行 {plan.tool_name} 失败：{result['error']}"
+        if isinstance(result, str):
+            return result[:2000]
+        return f"{plan.tool_name} 执行完成。\n\n{str(result)[:1000]}"
 
     # ── 节点 3: execute_plan ───────────────────────────
 
@@ -1284,6 +1726,7 @@ class MainAgent:
             data = await self._llm.chat_json(
                 messages=messages, schema=EvaluateCompletionResult,
                 temperature=0.2, system=EVALUATE_COMPLETION_SYSTEM,
+                node="evaluate_completion",
             )
             return EvaluateCompletionResult.model_validate(data)
         except Exception as e:
@@ -1298,6 +1741,53 @@ class MainAgent:
                 needs_more_tools=[],
                 final_message="抱歉，评估环节出现异常，请稍后重试或换个表述。",
             )
+
+    # ── 节点 5: v2 final reply (独立节点) ──────────────
+
+    async def _node_final_reply(self, session_id: str, user_content: str,
+                                plan: ScenarioPlanResult,
+                                results: dict[str, Any],
+                                eval_res: EvaluateCompletionResult):
+        """v2 final reply — satisfied=true 后单次 LLM 生成完整 Markdown 回复。
+
+        与 v9 区别：v9 复用 evaluate 的 final_message；v2 拆出独立节点，
+        让 evaluate 只管判断、final reply 专注生成高质量回复。
+        模型: glm-5.2 (降级 deepseek-v4-pro), node="final_reply"
+        """
+        await self._push_status(session_id, "done", "正在生成最终回复...")
+
+        history = self._build_history_context(session_id, limit=10)
+        results_brief = {cid: _truncate(r, 800) for cid, r in results.items()}
+        prompt_user = (
+            f"用户原始请求: {user_content}\n\n"
+            f"执行方案: {plan.summary}\n\n"
+            f"工具执行结果（JSON）:\n{json.dumps(results_brief, ensure_ascii=False, indent=2)}\n\n"
+            f"评估结论: {eval_res.reasoning}\n"
+            f"评估草稿: {eval_res.final_message}\n\n"
+            "请基于以上信息，生成完整的中文 Markdown 回复给用户。"
+            "回复应包含：执行了什么、找到了什么结果、关键发现。不要提及内部工具名。"
+        )
+        messages = history + [{"role": "user", "content": prompt_user}]
+
+        final_text = ""
+        try:
+            resp = await self._llm.chat(
+                messages=messages,
+                system="你是 Paper Agent v3 的最终回复生成节点。基于工具执行结果生成高质量中文 Markdown 回复。",
+                temperature=0.4,
+                node="final_reply",
+            )
+            final_text = getattr(resp, "content", None) or str(resp)
+        except Exception as e:
+            logger.warning(f"final_reply LLM failed: {e}, using eval final_message")
+            final_text = eval_res.final_message or "已完成。"
+
+        final_text = final_text.strip() or "已完成。"
+        await self._push(session_id, "message", "text", "assistant",
+                         payload={"content": final_text},
+                         priority_kind="high")
+        self._record_event(session_id, "final_reply_sent",
+                           {"final_text": final_text[:500]})
 
     # ── Helpers ────────────────────────────────────────
 
@@ -1454,6 +1944,20 @@ class MainAgent:
         except Exception as e:
             logger.warning(f"_push outbox failed: {e}")
             return ""
+
+    async def _push_status(self, session_id: str, stage: str,
+                           message: str, level: str = "info") -> None:
+        """v2: 推 status 消息（协议 v10 新增类型，给用户阶段反馈）。
+
+        stage 取值: received / analyzing / planning / searching /
+                    executing / evaluating / done / error
+        level:   info / user / warning
+        """
+        await self._push(
+            session_id, "status", stage, "system",
+            payload={"stage": stage, "message": message, "level": level},
+            priority_kind="silent",  # status 不触发 APNs
+        )
 
     async def _wait_ws_reply(self, session_id: str, msg_type: str, msg_sub: str,
                               timeout: float = ASK_USER_TIMEOUT_SEC,

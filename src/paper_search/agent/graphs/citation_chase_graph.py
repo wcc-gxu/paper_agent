@@ -259,6 +259,7 @@ class CitationChaseAgent:
                     f"是否值得继续追溯下一层？"
                 )}],
                 system="输出纯 JSON: {\"should_continue\": true/false, \"reason\": \"继续或停止的理由\"}",
+                node="citation_filter",
             )
             should_continue = result.get("should_continue", False)
         except Exception:

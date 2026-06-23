@@ -147,6 +147,7 @@ class TranslationAgent:
 - 使用准确的学术术语，不用口语化表达
 - 保留技术缩写 (CNN, LSTM, Transformer 等)
 - 优先使用领域通用译法""",
+                node="translation",
             )
             translation = result.get("translation", text)
             alternatives = result.get("alternatives", [])
@@ -214,6 +215,7 @@ class TranslationAgent:
   ]
 }
 只提取有明确中英对照的学术术语，不确定的不要加。""",
+                    node="translation",
                 )
                 for term in result.get("terms", []):
                     en = (term.get("en") or "").strip()

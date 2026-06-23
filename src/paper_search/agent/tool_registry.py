@@ -32,6 +32,89 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════
+# 共享辅助函数（供子 Agent 工具使用）
+# ═══════════════════════════════════════════════════════════════
+
+
+def _row_to_paper(row: dict):
+    """把 DB papers 行 dict 转为 Paper 模型。
+
+    LLM 的 evaluate_relevance / generate_report 走属性访问（paper.title），
+    而 DB 返回的是 dict，需要转换。authors 在 DB 中存为 JSON 字符串。
+    """
+    from ..models import Paper, SourceType
+    src_val = (row.get("source") or "arxiv").strip()
+    try:
+        src = SourceType(src_val)
+    except Exception:
+        src = SourceType.ARXIV
+    authors = row.get("authors", [])
+    if isinstance(authors, str):
+        try:
+            authors = json.loads(authors)
+        except Exception:
+            authors = [authors] if authors else []
+    if not isinstance(authors, list):
+        authors = []
+    return Paper(
+        title=row.get("title", "") or "Untitled",
+        authors=authors,
+        year=row.get("year"),
+        abstract=row.get("abstract") or "",
+        doi=row.get("doi") or None,
+        arxiv_id=row.get("arxiv_id") or None,
+        source=src,
+        source_url=row.get("source_url") or None,
+        pdf_url=row.get("pdf_url") or None,
+        citation_count=row.get("citation_count"),
+    )
+
+
+def _paper_to_bibtex(p: dict) -> str:
+    """把论文 dict 转为 BibTeX 条目（与 cli/export_cmd 同源逻辑）。"""
+    title = p.get("title", "Unknown")
+    year = p.get("year", "")
+    authors = p.get("authors", "[]")
+    if isinstance(authors, str):
+        try:
+            authors = json.loads(authors)
+        except (json.JSONDecodeError, TypeError):
+            authors = [authors] if authors else []
+    if not isinstance(authors, list):
+        authors = []
+    doi = p.get("doi", "") or ""
+    venue = p.get("venue", "") or ""
+    arxiv_id = p.get("arxiv_id", "") or ""
+    url = p.get("source_url", "") or p.get("pdf_url", "") or ""
+
+    first_author = (authors[0].split()[-1] if authors else "unknown").replace(",", "")
+    key = f"{first_author}{year}_{title[:20].replace(' ', '').replace(':', '').replace('-', '')}"
+
+    if arxiv_id:
+        entry_type = "article"
+        extra = f"  archivePrefix = {{arXiv}},\n  eprint = {{{arxiv_id}}},\n"
+    elif doi:
+        entry_type = "article"
+        extra = f"  doi = {{{doi}}},\n"
+    else:
+        entry_type = "misc"
+        extra = ""
+
+    author_str = " and ".join(a for a in authors[:8] if a)
+    if venue:
+        extra += f"  journal = {{{venue}}},\n"
+
+    return (
+        f"@{entry_type}{{{key},\n"
+        f"  title = {{{title}}},\n"
+        f"  author = {{{author_str}}},\n"
+        f"  year = {{{year}}},\n"
+        f"{extra}  url = {{{url}}}\n"
+        f"}}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
 # Metadata
 # ═══════════════════════════════════════════════════════════════
 
@@ -919,24 +1002,24 @@ class ToolRegistry:
         # Abstracts the existing CLI/MCP functions as direct tool wrappers
         sub_tools = [
             ("search_papers", "跨多源搜索学术论文", self._make_search_papers()),
-            ("download_paper", "下载单篇论文 PDF", self._make_download_paper()),
-            ("convert_paper", "PDF 转 Markdown", self._make_convert_paper()),
-            ("index_paper", "Markdown 索引入 ChromaDB", self._make_index_paper()),
-            ("evaluate_papers", "LLM 批量评估论文相关性", self._make_evaluate_papers()),
-            ("rank_papers", "期刊等级评定（CCF/SCI → A+/A/B/C）", self._make_rank_papers()),
-            ("generate_survey", "生成 AI 文献综述报告", self._make_generate_survey()),
-            ("paper_export", "导出 BibTeX/JSON", self._make_paper_export()),
+            ("download_paper", "下载单篇论文 PDF。参数: paper_id 或 title（需先 search_papers 入库）", self._make_download_paper()),
+            ("convert_paper", "PDF 转 Markdown。参数: paper_id（用已下载的 pdf_path，或显式传 pdf_path）", self._make_convert_paper()),
+            ("index_paper", "Markdown 索引入 ChromaDB。参数: paper_id 或 project_id+all（索引项目全部已转换论文）", self._make_index_paper()),
+            ("evaluate_papers", "LLM 批量评估论文相关性。参数: project_id, query(可选), all(默认true)", self._make_evaluate_papers()),
+            ("rank_papers", "期刊等级评定 CCF/SCI → A+/A/B/C。参数: project_id（可选）, all(默认true)", self._make_rank_papers()),
+            ("generate_survey", "生成 AI 文献综述报告。参数: project_id", self._make_generate_survey()),
+            ("paper_export", "导出 BibTeX/JSON 到文件。参数: project_id, format(bibtex|json)", self._make_paper_export()),
             ("paper_clean", "清理项目 DB/索引", self._make_paper_clean()),
-            ("batch_search", "从 JSON/CSV 批量搜索", self._make_batch_search()),
-            ("citation_chase", "1 层引用追踪", self._make_citation_chase()),
+            ("batch_search", "从 JSON/CSV 批量搜索并入库。参数: file_path, download(默认false)", self._make_batch_search()),
+            ("citation_chase", "引用追溯（Semantic Scholar，默认2层）。参数: paper_title 或 doi", self._make_citation_chase()),
             ("search_library", "ChromaDB 语义搜索已入库论文", self._make_search_library()),
             ("search_knowledge", "ChromaDB 搜索结构化知识", self._make_search_knowledge()),
             ("read_paper", "读取论文完整 Markdown", self._make_read_paper()),
-            ("extract_knowledge", "从论文中提取结构化知识", self._make_extract_knowledge()),
-            ("find_related", "发现相关论文", self._make_find_related()),
-            ("discover_gaps", "知识发现 — 研究空白/矛盾/趋势", self._make_discover_gaps()),
-            ("build_glossary", "构建中英学术术语表", self._make_build_glossary()),
-            ("translate_query", "中文查询翻译为学术英文关键词", self._make_translate_query()),
+            ("extract_knowledge", "从论文中提取结构化知识（贡献/方法/数据集/局限）并存长期记忆。参数: paper_id, deep(默认false)", self._make_extract_knowledge()),
+            ("find_related", "发现相关论文（语义相似+引用关系）。参数: paper_id, top_k(默认10)", self._make_find_related()),
+            ("discover_gaps", "知识发现 — 研究空白/矛盾/趋势。参数: domain(可选), project_id(可选)", self._make_discover_gaps()),
+            ("build_glossary", "构建中英学术术语表。参数: project_id（从该项目论文提取术语）", self._make_build_glossary()),
+            ("translate_query", "中文查询翻译为学术英文关键词。参数: query, target_lang(en|zh, 默认en)", self._make_translate_query()),
         ]
         for name, desc, func in sub_tools:
             self.register_direct(name, desc, func,
@@ -970,43 +1053,296 @@ class ToolRegistry:
         return search_papers
 
     def _make_download_paper(self):
-        async def download_paper(title: str, source: str = "arxiv", paper_id: str = "") -> str:
+        async def download_paper(title: str = "", source: str = "arxiv", paper_id: str = "") -> str:
+            """下载单篇论文 PDF → 落盘 + 写 DB（papers.pdf_path + project_papers.pdf_path）。"""
             from ..engine import PaperSearchEngine
             from ..config import Config
             from ..agent.db import AgentDB
-            engine = PaperSearchEngine(Config())
-            # Simplified: find paper by title and download
-            return json.dumps({"paper_id": paper_id, "title": title, "note": "PDF download dispatched to Celery worker"})
+            db = AgentDB()
+            pid = paper_id
+            row = None
+            if pid:
+                row = db.conn.execute("SELECT * FROM papers WHERE id=?", (pid,)).fetchone()
+            if not row and title:
+                row = db.conn.execute(
+                    "SELECT * FROM papers WHERE title LIKE ? ORDER BY first_seen_at DESC LIMIT 1",
+                    (f"%{title[:60]}%",),
+                ).fetchone()
+                if row:
+                    pid = row["id"]
+            if not row:
+                return json.dumps({"error": "Paper not found. Use search_papers first to ingest metadata.",
+                                   "paper_id": paper_id, "title": title}, ensure_ascii=False)
+            row = dict(row)
+            paper = _row_to_paper(row)
+            try:
+                engine = PaperSearchEngine(Config())
+                result = await engine.download(paper)
+            except Exception as e:
+                return json.dumps({"paper_id": pid, "success": False, "error": str(e)}, ensure_ascii=False)
+            if result.success and result.local_path:
+                db.update_paper_meta(pid, pdf_path=str(result.local_path))
+                # 同步 project_papers.pdf_path（论文可能关联到多个项目）
+                for r in db.conn.execute(
+                    "SELECT project_id FROM project_papers WHERE paper_id=?", (pid,)
+                ).fetchall():
+                    try:
+                        db.mark_pdf_downloaded(r["project_id"], pid, str(result.local_path))
+                    except Exception:
+                        pass
+                return json.dumps({"paper_id": pid, "success": True,
+                                   "pdf_path": str(result.local_path), "title": row["title"]},
+                                  ensure_ascii=False)
+            return json.dumps({"paper_id": pid, "success": False,
+                               "error": result.error or "Download failed",
+                               "title": row["title"]}, ensure_ascii=False)
         return download_paper
 
     def _make_convert_paper(self):
-        async def convert_paper(paper_id: str, pdf_path: str = "") -> str:
-            return json.dumps({"paper_id": paper_id, "note": "PDF→Markdown dispatched to Celery"})
+        async def convert_paper(paper_id: str = "", pdf_path: str = "") -> str:
+            """PDF → Markdown（pymupdf4llm）→ 写 papers.markdown_path。"""
+            from ..agent.db import AgentDB
+            from .pdf_converter import PDFConverter
+            db = AgentDB()
+            row = db.conn.execute(
+                "SELECT id, title, pdf_path FROM papers WHERE id=?", (paper_id,)
+            ).fetchone()
+            if not row:
+                return json.dumps({"error": f"Paper not found: {paper_id}"}, ensure_ascii=False)
+            pdf = pdf_path or row["pdf_path"]
+            if not pdf or not Path(pdf).exists():
+                return json.dumps({"paper_id": paper_id, "error":
+                    f"PDF not found: {pdf!r}. Run download_paper first."}, ensure_ascii=False)
+            try:
+                from ..config import get_markdown_dir
+                converter = PDFConverter()
+                md_path = await converter.convert(Path(pdf), get_markdown_dir())
+            except Exception as e:
+                return json.dumps({"paper_id": paper_id, "success": False, "error": str(e)},
+                                  ensure_ascii=False)
+            if md_path:
+                db.update_paper_meta(paper_id, markdown_path=str(md_path))
+                return json.dumps({"paper_id": paper_id, "success": True,
+                                   "markdown_path": str(md_path)}, ensure_ascii=False)
+            return json.dumps({"paper_id": paper_id, "success": False,
+                               "error": "Conversion failed (empty/invalid PDF?)"}, ensure_ascii=False)
         return convert_paper
 
     def _make_index_paper(self):
-        async def index_paper(paper_id: str, project_id: str = "", all: bool = True) -> str:
-            return json.dumps({"paper_id": paper_id, "all": all, "note": "Index dispatched to Celery"})
+        async def index_paper(paper_id: str = "", project_id: str = "", all: bool = True) -> str:
+            """Markdown → ChromaDB（摘要 + 章节分块）→ 写 papers.embedding_id。"""
+            from ..agent.db import AgentDB
+            from .chroma_store import ChromaStoreV2
+            from .chunker import SectionChunker
+            db = AgentDB()
+            chroma = ChromaStoreV2()
+            chunker = SectionChunker()
+
+            if all and project_id:
+                rows = db.get_project_papers(project_id)
+            elif all and not project_id and not paper_id:
+                rows = [dict(r) for r in db.conn.execute(
+                    "SELECT * FROM papers WHERE markdown_path IS NOT NULL AND markdown_path != ''"
+                ).fetchall()]
+            else:
+                rows = [dict(r) for r in db.conn.execute(
+                    "SELECT * FROM papers WHERE id=?", (paper_id,)
+                ).fetchall()]
+
+            # 跳过已索引（embedding_id 已设置）的论文
+            targets = [r for r in rows if r.get("markdown_path") and not r.get("embedding_id")]
+            if not targets:
+                return json.dumps({"indexed": 0, "total": 0, "note": "No unindexed papers with markdown found"},
+                                  ensure_ascii=False)
+
+            results = []
+            for r in targets:
+                pid = r["id"]
+                md = Path(r["markdown_path"])
+                if not md.exists():
+                    results.append({"paper_id": pid, "success": False, "error": "markdown file missing"})
+                    continue
+                try:
+                    content = md.read_text(encoding="utf-8")
+                    chroma.add_abstracts_batch([{
+                        "paper_id": pid, "title": r.get("title", ""),
+                        "abstract": r.get("abstract") or content[:500],
+                        "year": r.get("year"), "source": r.get("source"),
+                        "venue": r.get("venue"),
+                    }])
+                    chunks = chunker.chunk(content, pid)
+                    chunk_count = chroma.add_fulltext_chunks(chunks) if chunks else 0
+                    db.update_paper_meta(pid, embedding_id=f"idx:{pid}")
+                    results.append({"paper_id": pid, "success": True, "chunks": chunk_count})
+                except Exception as e:
+                    results.append({"paper_id": pid, "success": False, "error": str(e)})
+
+            indexed = sum(1 for x in results if x.get("success"))
+            return json.dumps({"indexed": indexed, "total": len(results), "results": results},
+                              ensure_ascii=False, default=str)
         return index_paper
 
     def _make_evaluate_papers(self):
-        async def evaluate_papers(project_id: str, query: str = "", all: bool = True) -> str:
-            return json.dumps({"project_id": project_id, "note": "LLM evaluation dispatched"})
+        async def evaluate_papers(project_id: str = "", query: str = "", all: bool = True) -> str:
+            """LLM 批量评估项目论文相关性 → 写 project_papers.relevance_score/reason。"""
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            db = AgentDB()
+            rows = db.get_project_papers(project_id)
+            if not rows:
+                return json.dumps({"error": "No papers in project", "project_id": project_id},
+                                  ensure_ascii=False)
+            if not all:
+                rows = [r for r in rows if r.get("relevance_score") is None]
+                if not rows:
+                    return json.dumps({"project_id": project_id, "evaluated": 0,
+                                       "note": "All papers already evaluated"}, ensure_ascii=False)
+
+            user_query = query
+            if not user_query:
+                project = db.get_project(project_id) or {}
+                user_query = project.get("user_query", "")
+
+            papers = [_row_to_paper(r) for r in rows]
+            llm = LLMClientV2()
+            try:
+                judgments = await llm.evaluate_batch(papers, user_query, max_concurrent=5)
+            except Exception as e:
+                return json.dumps({"project_id": project_id, "error": f"Evaluation failed: {e}"},
+                                  ensure_ascii=False)
+
+            evaluations = []
+            for r, j in zip(rows, judgments):
+                try:
+                    db.link_paper_to_project(project_id, r["id"],
+                                             relevance_score=j.score,
+                                             relevance_reason=j.reason)
+                except Exception:
+                    pass
+                evaluations.append({"paper_id": r["id"], "title": r.get("title", ""),
+                                    "score": j.score, "is_relevant": j.is_relevant})
+            return json.dumps({"project_id": project_id, "evaluated": len(evaluations),
+                               "evaluations": evaluations}, ensure_ascii=False, default=str)
         return evaluate_papers
 
     def _make_rank_papers(self):
         async def rank_papers(project_id: str = "", all: bool = True) -> str:
-            return json.dumps({"project_id": project_id, "note": "Journal ranking dispatched"})
+            """期刊/会议等级评定（CCF+SCI → A+/A/B/C）→ 写 papers.unified_level + journal_ranks。"""
+            from ..agent.db import AgentDB
+            from .journal_ranker import JournalRanker
+            db = AgentDB()
+            ranker = JournalRanker()
+            if project_id:
+                rows = db.get_project_papers(project_id)
+            else:
+                rows = [dict(r) for r in db.conn.execute(
+                    "SELECT * FROM papers WHERE venue IS NOT NULL AND venue != ''"
+                ).fetchall()]
+            if not all:
+                rows = [r for r in rows if not r.get("unified_level")]
+
+            results = []
+            for r in rows:
+                venue = r.get("venue", "") or ""
+                if not venue:
+                    continue
+                level = ranker.rank(venue)
+                if level:
+                    try:
+                        db.upsert_journal_rank(venue, unified=level)
+                        db.update_paper_meta(r["id"], unified_level=level)
+                    except Exception:
+                        pass
+                    results.append({"paper_id": r["id"], "venue": venue, "level": level})
+            return json.dumps({"ranked": len(results), "results": results}, ensure_ascii=False)
         return rank_papers
 
     def _make_generate_survey(self):
-        async def generate_survey(project_id: str) -> str:
-            return json.dumps({"project_id": project_id, "note": "Survey generation dispatched to Celery"})
+        async def generate_survey(project_id: str = "") -> str:
+            """生成文献综述 Markdown → 写 outputs/{project_id}/survey.md。"""
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .llm_client import RelevanceJudgment
+            from ..config import get_outputs_dir
+            db = AgentDB()
+            project = db.get_project(project_id)
+            if not project:
+                return json.dumps({"error": f"Project not found: {project_id}"}, ensure_ascii=False)
+            user_query = project.get("user_query", "")
+            relevant = db.get_relevant_papers(project_id)
+            if not relevant:
+                relevant = db.get_project_papers(project_id)
+            if not relevant:
+                return json.dumps({"error": "No papers to survey. Run search_papers first."},
+                                  ensure_ascii=False)
+
+            top = relevant[:30]
+            papers = [_row_to_paper(r) for r in top]
+            judgments = [RelevanceJudgment(
+                score=r.get("relevance_score") or 0.5,
+                reason=r.get("relevance_reason") or "",
+                is_relevant=(r.get("relevance_score") or 0.5) >= 0.5,
+            ) for r in top]
+
+            llm = LLMClientV2()
+            try:
+                report = await llm.generate_report(
+                    user_query, papers, judgments, db=db, project_id=project_id,
+                )
+            except Exception as e:
+                return json.dumps({"project_id": project_id, "error": f"Report generation failed: {e}"},
+                                  ensure_ascii=False)
+
+            out_dir = get_outputs_dir(project_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            survey_path = out_dir / "survey.md"
+            survey_path.write_text(report, encoding="utf-8")
+            try:
+                db.update_project(project_id, report_path=str(survey_path))
+            except Exception:
+                pass
+            return json.dumps({"project_id": project_id, "survey_path": str(survey_path),
+                               "papers_included": len(papers)}, ensure_ascii=False)
         return generate_survey
 
     def _make_paper_export(self):
-        async def paper_export(project_id: str, format: str = "bibtex") -> str:
-            return json.dumps({"project_id": project_id, "format": format, "note": "Export dispatched"})
+        async def paper_export(project_id: str = "", format: str = "bibtex") -> str:
+            """导出项目论文为 BibTeX/JSON → 写 outputs/{project_id}/papers.{bib|json}。"""
+            from ..agent.db import AgentDB
+            from ..config import get_outputs_dir
+            db = AgentDB()
+            papers = db.get_project_papers(project_id)
+            if not papers:
+                return json.dumps({"error": "No papers in project", "project_id": project_id},
+                                  ensure_ascii=False)
+            if format == "bibtex":
+                entries = []
+                for p in papers:
+                    try:
+                        entries.append(_paper_to_bibtex(p))
+                    except Exception as e:
+                        entries.append(f"% ERROR for {p.get('title', '?')[:50]}: {e}")
+                text = "\n\n".join(entries)
+                ext = "bib"
+            elif format == "json":
+                text = json.dumps([{
+                    "title": p.get("title"), "authors": p.get("authors"),
+                    "year": p.get("year"), "doi": p.get("doi"),
+                    "arxiv_id": p.get("arxiv_id"), "venue": p.get("venue"),
+                    "source": p.get("source"), "citation_count": p.get("citation_count"),
+                    "relevance_score": p.get("relevance_score"),
+                } for p in papers], ensure_ascii=False, indent=2)
+                ext = "json"
+            else:
+                return json.dumps({"error": f"Unsupported format: {format}"}, ensure_ascii=False)
+
+            out_dir = get_outputs_dir(project_id)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"papers.{ext}"
+            out_path.write_text(text, encoding="utf-8")
+            return json.dumps({"project_id": project_id, "format": format,
+                               "entries": len(papers), "output_path": str(out_path),
+                               "preview": text[:500]}, ensure_ascii=False)
         return paper_export
 
     def _make_paper_clean(self):
@@ -1019,13 +1355,91 @@ class ToolRegistry:
         return paper_clean
 
     def _make_batch_search(self):
-        async def batch_search(file_path: str, download: bool = False) -> str:
-            return json.dumps({"file_path": file_path, "note": "Batch search dispatched"})
+        async def batch_search(file_path: str = "", download: bool = False) -> str:
+            """从 JSON/CSV 批量搜索并入库（每个查询建一个 project）。委托 engine.batch_search_from_file。"""
+            from ..engine import PaperSearchEngine
+            from ..config import Config
+            from ..agent.db import AgentDB
+            from ..models import SourceType
+            if not Path(file_path).exists():
+                return json.dumps({"error": f"File not found: {file_path}"}, ensure_ascii=False)
+            engine = PaperSearchEngine(Config())
+            db = AgentDB()
+            try:
+                summary = await engine.batch_search_from_file(file_path, download=False)
+            except Exception as e:
+                return json.dumps({"error": f"Batch search failed: {e}"}, ensure_ascii=False)
+
+            projects = []
+            total_papers = 0
+            for result in summary.results:
+                q = result.query
+                qtext = q.keywords or q.title or q.author or q.doi or ""
+                pid = db.create_project(user_query=qtext)
+                papers_out = []
+                for p in result.papers:
+                    paper_id = db.upsert_paper(p)
+                    db.link_paper_to_project(pid, paper_id)
+                    papers_out.append({"id": paper_id, "title": p.title})
+                projects.append({"project_id": pid, "query": qtext,
+                                  "total": len(papers_out), "papers": papers_out})
+                total_papers += len(papers_out)
+
+            downloaded = 0
+            if download:
+                for proj in projects:
+                    for pout in proj["papers"]:
+                        row = db.conn.execute(
+                            "SELECT * FROM papers WHERE id=?", (pout["id"],)
+                        ).fetchone()
+                        if not row:
+                            continue
+                        try:
+                            paper = _row_to_paper(dict(row))
+                            dl = await engine.download(paper)
+                            if dl.success and dl.local_path:
+                                db.update_paper_meta(pout["id"], pdf_path=str(dl.local_path))
+                                downloaded += 1
+                        except Exception:
+                            pass
+
+            return json.dumps({"total_queries": len(projects), "total_papers": total_papers,
+                               "downloaded": downloaded, "projects": projects},
+                              ensure_ascii=False, default=str)
         return batch_search
 
     def _make_citation_chase(self):
-        async def citation_chase(paper_title: str, doi: str = "") -> str:
-            return json.dumps({"paper_title": paper_title, "note": "Citation chase dispatched"})
+        async def citation_chase(paper_title: str = "", doi: str = "") -> str:
+            """引用追溯 — 委托 CitationChaseAgent graph（resolve→fetch→filter→ingest→decide→summarize）。"""
+            from ..engine import PaperSearchEngine
+            from ..config import Config
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .graphs.citation_chase_graph import CitationChaseAgent
+            db = AgentDB()
+            llm = LLMClientV2()
+            engine = PaperSearchEngine(Config())
+
+            seed = paper_title or doi
+            if not seed:
+                return json.dumps({"error": "Provide paper_title or doi"}, ensure_ascii=False)
+
+            # citation_chase 需要一个 project_id 来 link 入库论文
+            project_id = db.create_project(user_query=f"citation_chase: {seed[:80]}")
+            agent = CitationChaseAgent(db, llm, engine)
+            try:
+                graph = agent.compile()
+                result = await graph.ainvoke({
+                    "seed_title": paper_title, "seed_doi": doi,
+                    "project_id": project_id, "max_depth": 2, "direction": "both",
+                })
+            except Exception as e:
+                return json.dumps({"paper_title": paper_title, "project_id": project_id,
+                                   "error": f"Citation chase failed: {e}"}, ensure_ascii=False)
+            out = result.get("result", result) if isinstance(result, dict) else {"result": str(result)}
+            out.setdefault("paper_title", paper_title)
+            out.setdefault("project_id", project_id)
+            return json.dumps(out, ensure_ascii=False, default=str)
         return citation_chase
 
     def _make_search_library(self):
@@ -1064,26 +1478,148 @@ class ToolRegistry:
         return read_paper
 
     def _make_extract_knowledge(self):
-        async def extract_knowledge(paper_id: str, deep: bool = False) -> str:
-            return json.dumps({"paper_id": paper_id, "deep": deep, "note": "Knowledge extraction dispatched"})
+        async def extract_knowledge(paper_id: str = "", deep: bool = False) -> str:
+            """从论文提取结构化知识（贡献/方法/数据集/局限）→ 存长期记忆 knowledge_entries。委托 KnowledgeBase。"""
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .chroma_store import ChromaStoreV2
+            from .knowledge import KnowledgeBase
+            from .memory import KnowledgeEntry, MemoryManager
+            db = AgentDB()
+            llm = LLMClientV2()
+            chroma = ChromaStoreV2()
+            kb = KnowledgeBase(db, chroma, llm)
+            try:
+                ek = await kb.extract_knowledge(paper_id, deep=deep)
+            except Exception as e:
+                return json.dumps({"paper_id": paper_id, "error": str(e)}, ensure_ascii=False)
+
+            content = json.dumps({
+                "contribution": ek.contribution, "method": ek.method,
+                "datasets": ek.datasets, "metrics": ek.metrics,
+                "limitations": ek.limitations, "future_work": ek.future_work,
+                "code_url": ek.code_url, "reading_level": ek.reading_level,
+            }, ensure_ascii=False)
+            try:
+                mem = MemoryManager(db)
+                entry = KnowledgeEntry(
+                    id="", title=f"[精读] {ek.paper_title}",
+                    content=content, category="paper_reading",
+                    source_paper_id=paper_id, source_paper_title=ek.paper_title,
+                )
+                entry_id = mem.long_term.add_knowledge(entry)
+            except Exception as e:
+                entry_id = f"persist_failed: {e}"
+
+            return json.dumps({
+                "paper_id": paper_id, "entry_id": entry_id,
+                "paper_title": ek.paper_title, "contribution": ek.contribution,
+                "method": ek.method, "datasets": ek.datasets, "metrics": ek.metrics,
+                "limitations": ek.limitations, "future_work": ek.future_work,
+                "code_url": ek.code_url, "reading_level": ek.reading_level,
+            }, ensure_ascii=False, default=str)
         return extract_knowledge
 
     def _make_find_related(self):
-        async def find_related(paper_id: str, top_k: int = 10) -> str:
-            return json.dumps({"paper_id": paper_id, "note": "Related paper search dispatched"})
+        async def find_related(paper_id: str = "", top_k: int = 10) -> str:
+            """发现相关论文（语义相似度 + 引用关系）。委托 KnowledgeBase.find_related。"""
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .chroma_store import ChromaStoreV2
+            from .knowledge import KnowledgeBase
+            db = AgentDB()
+            llm = LLMClientV2()
+            chroma = ChromaStoreV2()
+            kb = KnowledgeBase(db, chroma, llm)
+            try:
+                related = await kb.find_related(paper_id, top_k=top_k)
+            except Exception as e:
+                return json.dumps({"paper_id": paper_id, "error": str(e)}, ensure_ascii=False)
+            # 用 DB 元数据补全 title/year/venue
+            for r in related:
+                pid = r.get("paper_id", "")
+                if not pid:
+                    continue
+                row = db.conn.execute(
+                    "SELECT title, year, venue FROM papers WHERE id=?", (pid,)
+                ).fetchone()
+                if row:
+                    r["title"] = row["title"]
+                    r["year"] = row["year"]
+                    r["venue"] = row["venue"]
+            return json.dumps({"paper_id": paper_id, "related": related,
+                               "total": len(related)}, ensure_ascii=False, default=str)
         return find_related
 
     def _make_discover_gaps(self):
         async def discover_gaps(domain: str = "", project_id: str = "") -> str:
-            return json.dumps({"domain": domain, "note": "Gap discovery dispatched"})
+            """研究空白/矛盾/趋势发现。委托 KnowledgeBase.discover_gaps。
+
+            注：plangraph-routing 原计划委托 ClusteringAgent._detect_node，但
+            ChromaStoreV2 缺 get_embedding 方法（latent bug），clustering graph
+            无法在进程内运行；KnowledgeBase.discover_gaps 是完整的 LLM 分析实现，
+            直接产出 gaps/contradictions/trends/emerging_topics，故委托之。
+            """
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .chroma_store import ChromaStoreV2
+            from .knowledge import KnowledgeBase
+            db = AgentDB()
+            llm = LLMClientV2()
+            chroma = ChromaStoreV2()
+            kb = KnowledgeBase(db, chroma, llm)
+            try:
+                result = await kb.discover_gaps(domain=domain, project_id=project_id or None)
+            except Exception as e:
+                return json.dumps({"domain": domain, "project_id": project_id,
+                                   "error": str(e)}, ensure_ascii=False)
+            return json.dumps({
+                "domain": result.domain, "project_id": project_id,
+                "gaps": result.gaps, "contradictions": result.contradictions,
+                "trends": result.trends, "emerging_topics": result.emerging_topics,
+                "note": ("(需 ≥10 篇已入库论文)" if not result.gaps and not result.trends else ""),
+            }, ensure_ascii=False, default=str)
         return discover_gaps
 
     def _make_build_glossary(self):
-        async def build_glossary(terms_json: str) -> str:
-            return json.dumps({"note": "Glossary build dispatched", "input_count": len(json.loads(terms_json))})
+        async def build_glossary(project_id: str = "") -> str:
+            """构建中英学术术语表 — 委托 TranslationAgent.build_glossary。"""
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .chroma_store import ChromaStoreV2
+            from .graphs.translation_graph import TranslationAgent
+            if not project_id:
+                return json.dumps({"error": "project_id is required to build glossary"},
+                                  ensure_ascii=False)
+            db = AgentDB()
+            llm = LLMClientV2()
+            chroma = ChromaStoreV2()
+            agent = TranslationAgent(db, llm, chroma)
+            try:
+                result = await agent.build_glossary(project_id)
+            except Exception as e:
+                return json.dumps({"project_id": project_id, "error": str(e)}, ensure_ascii=False)
+            return json.dumps({"project_id": project_id, **result}, ensure_ascii=False, default=str)
         return build_glossary
 
     def _make_translate_query(self):
-        async def translate_query(query: str, target_lang: str = "en") -> str:
-            return json.dumps({"original": query, "target_lang": target_lang, "note": "Translation via LLM"})
+        async def translate_query(query: str = "", target_lang: str = "en") -> str:
+            """中文查询 → 学术英文关键词 — 委托 TranslationAgent.translate_query。"""
+            from ..agent.db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .chroma_store import ChromaStoreV2
+            from .graphs.translation_graph import TranslationAgent
+            if not query:
+                return json.dumps({"error": "query is required"}, ensure_ascii=False)
+            db = AgentDB()
+            llm = LLMClientV2()
+            chroma = ChromaStoreV2()
+            agent = TranslationAgent(db, llm, chroma)
+            direction = "zh2en" if target_lang.lower().startswith("en") else "en2zh"
+            try:
+                result = await agent.translate_query(query, direction=direction)
+            except Exception as e:
+                return json.dumps({"original": query, "error": str(e)}, ensure_ascii=False)
+            return json.dumps({"original": query, "target_lang": target_lang, **result},
+                              ensure_ascii=False, default=str)
         return translate_query

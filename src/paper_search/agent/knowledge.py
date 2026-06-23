@@ -192,6 +192,7 @@ class KnowledgeBase:
   "ranked_indices": [3, 7, 1, 5, 9],
   "reasoning": "选择理由简述"
 }""",
+                node="rad_query_route",
             )
             indices = result.get("ranked_indices", list(range(min(top_k, len(candidates)))))
         except Exception as e:
@@ -239,6 +240,7 @@ class KnowledgeBase:
   "confidence": 0.85,
   "follow_up_questions": ["后续问题1", "后续问题2"]
 }""",
+            node="rad_query_answer",
         )
 
         return (
@@ -309,6 +311,7 @@ class KnowledgeBase:
 - "skim": 粗略读即可（方法论简单或结果可预期）
 - "normal": 正常阅读（有值得关注的贡献）
 - "deep": 值得细读（重要贡献或复杂方法）""",
+                node="ingest_survey",
             )
         except Exception as e:
             logger.error(f"Knowledge extraction failed: {e}")
@@ -410,6 +413,7 @@ class KnowledgeBase:
   ],
   "emerging_topics": ["新兴话题1", "新兴话题2"]
 }""",
+                node="gap_discovery",
             )
         except Exception as e:
             logger.error(f"Discovery failed: {e}")

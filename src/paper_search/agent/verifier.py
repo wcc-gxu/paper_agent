@@ -486,6 +486,7 @@ class CitationVerifier:
 - 若提供了全文，基于全文内容判断；若仅提供了摘要，confidence 不应超过 0.6
 - 不确定时宁保守，标记为 inconsistent
 - 只判断声明是否与论文内容一致，不评价论文质量""",
+                    node="citation_filter",
                 )
                 m.claim_verified = result.get("consistent", False)
                 m.claim_score = result.get("confidence", 0.5)

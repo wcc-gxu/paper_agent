@@ -453,6 +453,7 @@ class VideoAgent:
             summary = await self._llm.chat_json(
                 messages=[{"role": "user", "content": context}],
                 system=VIDEO_SUMMARIZE_PROMPT,
+                node="video_summarize",
             )
             # chat_json returns a dict — ensure it has expected keys
             if not isinstance(summary, dict):
@@ -517,6 +518,7 @@ class VideoAgent:
             analysis = await self._llm.chat_json(
                 messages=[{"role": "user", "content": context}],
                 system=VIDEO_ANALYSIS_PROMPT,
+                node="video_analyze",
             )
             if not isinstance(analysis, dict):
                 analysis = {"overall_assessment": str(analysis)}

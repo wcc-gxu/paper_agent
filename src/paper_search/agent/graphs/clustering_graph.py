@@ -191,6 +191,7 @@ class ClusteringAgent:
                         f"以下 {len(cps)} 篇论文属于同一研究方向，请为该方向命名（2-5个词）：\n{title_str}"
                     )}],
                     system="你是一个研究方向命名器。输出纯 JSON: {\"name\": \"方向名\", \"keywords\": [\"关键词\"]}",
+                    node="cluster_label",
                 )
                 cluster_names[lbl] = result.get("name", f"方向 {lbl + 1}")
             except Exception:
@@ -297,6 +298,7 @@ class ClusteringAgent:
                             f"以下论文不属于主流研究方向聚类，请评估它们是否构成潜在的新研究方向：\n{outlier_titles}"
                         )}],
                         system="输出纯 JSON: {\"is_new_direction\": true, \"direction_name\": \"方向名\", \"confidence\": 0.7, \"rationale\": \"理由\"}",
+                        node="gap_discovery",
                     )
                     if llm_result.get("is_new_direction"):
                         new_directions.append({
