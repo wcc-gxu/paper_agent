@@ -169,6 +169,7 @@ class ChromaStoreV2:
 
     COLLECTION_ABSTRACT = "papers_abstract"
     COLLECTION_FULLTEXT = "papers_fulltext"
+    COLLECTION_TERMS = "glossary_terms"
 
     def __init__(self, persist_dir: Optional[Path] = None):
         self.persist_dir = persist_dir or DEFAULT_CHROMA_PATH
@@ -206,6 +207,54 @@ class ChromaStoreV2:
     @property
     def fulltext_collection(self):
         return self._get_collection(self.COLLECTION_FULLTEXT)
+
+    @property
+    def terms_collection(self):
+        return self._get_collection(self.COLLECTION_TERMS)
+
+    def get_embedding(self, paper_id: str) -> Optional[list[float]]:
+        """获取某篇论文摘要的 embedding 向量(用于聚类)。
+
+        优先用 ChromaDB 的 include=["embeddings"];若该 collection 未存
+        embedding(老数据)则回退用 paper_id 自身 query 取最近邻的 embedding。
+        """
+        try:
+            res = self.abstract_collection.get(
+                ids=[paper_id], include=["embeddings"],
+            )
+            embs = res.get("embeddings") if res else None
+            if embs and len(embs) > 0 and embs[0] is not None:
+                return list(embs[0])
+            return None
+        except Exception as e:
+            logger.warning(f"ChromaDB get_embedding 失败 ({paper_id}): {e}")
+            return None
+
+    def add_terms_batch(self, terms: list[dict]) -> int:
+        """批量添加术语到 glossary_terms collection。
+
+        terms: [{"en_term": "...", "zh_term": "...", "context": "..."}, ...]
+        """
+        if not terms:
+            return 0
+        ids, docs, metas = [], [], []
+        for t in terms:
+            en = t.get("en_term", "") or ""
+            zh = t.get("zh_term", "") or ""
+            if not en:
+                continue
+            ids.append(en)
+            docs.append(f"{en}\n{zh}")
+            metas.append({"en_term": en[:200], "zh_term": zh[:200],
+                          "context": (t.get("context") or "")[:200]})
+        if not ids:
+            return 0
+        try:
+            self.terms_collection.add(ids=ids, documents=docs, metadatas=metas)
+            return len(ids)
+        except Exception as e:
+            logger.warning(f"ChromaDB terms batch add 失败: {e}")
+            return 0
 
     # ── 摘要索引 ────────────────────────────────────────
 

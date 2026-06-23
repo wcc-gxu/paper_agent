@@ -456,7 +456,7 @@ class PipelineRunner:
 
                 from .chunker import SectionChunker
                 chunker = SectionChunker()
-                chunks = chunker.chunk(paper_id, content)
+                chunks = chunker.chunk(content, paper_id)
                 chunk_count = self.chroma.add_fulltext_chunks(chunks) if chunks else 0
 
                 self.db.update_paper_meta(paper_id, embedding_id=f"idx:{paper_id}")

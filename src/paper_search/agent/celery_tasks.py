@@ -239,7 +239,7 @@ def index_task(self, paper_id: str, markdown_path: str,
         # 索引全文分块
         from .chunker import SectionChunker
         chunker = SectionChunker()
-        chunks = chunker.chunk(paper_id, md_content)
+        chunks = chunker.chunk(md_content, paper_id)
         chunk_count = chroma.add_fulltext_chunks(chunks) if chunks else 0
 
         db = AgentDB()
