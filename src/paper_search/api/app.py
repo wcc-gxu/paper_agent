@@ -317,6 +317,11 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
             len(raw),
         )
 
+        # v10: 缓存信封级 capabilities（每条 inbound 都可能带）
+        caps = msg.get("capabilities")
+        if isinstance(caps, list):
+            _capabilities_cache[(agent_id, session_id)] = list(caps)
+
         # 心跳: ping → pong（兼容 type:ping 和 type:heartbeat/subType:ping）
         if msg_type == "ping" or (msg_type == "heartbeat" and sub_type == "ping"):
             try:
@@ -330,10 +335,23 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
                 pass
             continue
 
-        # Phase 1: sync_request → 回放未送达历史
-        if msg_type == "sync_request":
+        # v10: sync (新名) + v9: sync_request (旧名) → 回放未送达历史
+        if msg_type in ("sync", "sync_request"):
             await _handle_sync_request(msg)
             continue
+
+        # v10 入站类型 → 转写为 main_agent 期望的 v9 形态再 LPUSH
+        # (main_agent._wait_ws_reply 已对 v10 type 做了 alias，但保险起见
+        # 在这里把"无 subType 的 message"补成 v9 message/chat，便于 main_agent.run
+        # 的入口聚合逻辑不变。)
+        if msg_type == "message" and not sub_type:
+            # v10 用户文本 → 兼容 v9 message/chat
+            msg.setdefault("subType", "chat")
+            msg.setdefault("role", "user")
+
+        # message/chat / ask_reply / tool_result 等都原样 LPUSH —
+        # main_agent._wait_ws_reply 内部 v10 别名匹配会处理；
+        # 入口 BRPOP 只看 type+subType 不强制限制。
 
         # 所有其他消息 → LPUSH Redis
         await _push_to_redis(msg)

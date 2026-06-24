@@ -80,7 +80,9 @@ async def _dispatch_envelope(envelope: dict, ws_manager: Any, db: Any,
     msg_id = envelope.get("msg_id", "")
     msg_type = envelope.get("type", "?")
     sub_type = envelope.get("subType", "")
-    priority_kind = envelope.get("priorityKind", "normal")
+    # v10: 字段名 priority；fallback priorityKind 兼容旧路径
+    priority_kind = (envelope.get("priority")
+                     or envelope.get("priorityKind") or "normal")
 
     online_sessions = ws_manager.get_online_sessions(agent_id) if hasattr(ws_manager, "get_online_sessions") else []
 
@@ -123,8 +125,13 @@ async def _dispatch_envelope(envelope: dict, ws_manager: Any, db: Any,
     else:
         # 离线 → 看是否触发 APNs
         if priority_kind in ("high", "urgent") and pusher and agent_id:
-            silent = (priority_kind == "high" and msg_type == "tool"
-                      and sub_type == "sub_progress")
+            # 静默 APNs（content-available 后台唤醒）的判定：
+            #   - v10 tool/progress       — 进度更新，无须打扰
+            #   - v9  tool/sub_progress   — 兼容
+            silent = (
+                msg_type == "tool"
+                and sub_type in ("progress", "sub_progress")
+            )
             try:
                 await pusher.push(agent_id, envelope, silent=silent)
             except Exception as e:

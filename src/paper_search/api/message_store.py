@@ -61,6 +61,7 @@ class MessageStore:
                 "role": r["role"],
                 "payload": payload,
                 "timestamp": r["created_at"],
+                "priority": r["priority_kind"] or "normal",
                 "priorityKind": r["priority_kind"] or "normal",
             })
         return out
@@ -85,7 +86,8 @@ class MessageStore:
         rows = self._db.conn.execute(
             """SELECT * FROM ws_messages
                WHERE agent_id=? AND session_id=?
-                 AND type='tool' AND subtype IN ('ask_user_question', 'propose_plan')
+                 AND ((type='tool' AND subtype IN ('ask_user_question', 'propose_plan'))
+                      OR (type='ask'))
                  AND role='assistant'
                  AND created_at >= ?
                ORDER BY id ASC""",
@@ -105,6 +107,7 @@ class MessageStore:
                 "agentId": r["agent_id"],
                 "sessionId": r["session_id"],
                 "timestamp": r["created_at"],
+                "priority": r["priority_kind"] or "high",
                 "priorityKind": r["priority_kind"] or "high",
                 "payload": payload,
             })

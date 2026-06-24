@@ -284,6 +284,242 @@ def _new_task_id(agent_type: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# v9 → v10 协议映射
+# ═══════════════════════════════════════════════════════════════
+#
+# _push 调用方继续传 v9 类型名（"message"/"text" 等），本映射函数把它们
+# 在 envelope 落地前翻译成 v10 类型名 + payload 字段名。这样不用改 N 个
+# 调用点，回滚也只动这一处。
+#
+# 删除类（map 到 None,None,None）：("message", "thinking")
+# 保持类（透传）：status / pong / sync_complete / 已是 v10 名的
+
+# v9 (type, subType) → v10 (type, subType) 简单映射
+_V9_TO_V10_TYPE: dict[tuple[str, str], tuple[str, str]] = {
+    ("message", "text"):              ("message", "reply"),
+    ("tool",    "ios_request"):       ("tool",    "call"),
+    ("tool",    "sub_request"):       ("tool",    "start"),
+    ("tool",    "sub_progress"):      ("tool",    "progress"),
+    ("tool",    "sub_result"):        ("tool",    "result"),
+    # ask_user_question / propose_plan 走单独 payload 重构分支，不在这里
+}
+
+# 按 permissions_required 硬映射 danger_level（LLM 不参与；与协议 §4.4 对齐）
+_HIGH_DANGER_PERMS = frozenset({"shell_exec", "package_install", "video_download"})
+_MEDIUM_DANGER_PERMS = frozenset({"search", "download", "citation_chase", "subscription"})
+
+
+def _hard_map_danger_level(permissions: list[str], summary: str = "") -> str:
+    """按权限+summary 硬映射 danger_level。"""
+    perms = set(permissions or [])
+    text = (summary or "").lower()
+    if perms & _HIGH_DANGER_PERMS or "delete" in text or "删除" in text or "rm " in text:
+        return "high"
+    if perms & _MEDIUM_DANGER_PERMS:
+        return "medium"
+    return "low"
+
+
+def _ask_kind_from_question_type(qtype: str) -> str:
+    """ClarificationQuestion.type → v10 ask kind。"""
+    return {
+        "single_choice": "choice",
+        "multi_choice":  "multi_choice",
+        "open":          "text",
+    }.get(qtype, "choice")
+
+
+def _build_ask_options(question: dict) -> list[dict]:
+    """把 v9 question 的 options/values 转成 v10 [{value,label,hint?}]。"""
+    raw_options = question.get("options") or []
+    raw_values = question.get("values") or []
+    out: list[dict] = []
+    for i, opt in enumerate(raw_options):
+        v = raw_values[i] if i < len(raw_values) else opt
+        out.append({"value": v, "label": opt})
+    return out
+
+
+def _convert_ask_user_question_payload(payload: dict) -> dict:
+    """v9 tool/ask_user_question payload → v10 ask payload。
+
+    v9: {id, questions:[{id,question,type,options,values?,...}], context}
+    v10: {ask_id, kind, prompt, options?, context, questions?, danger_level}
+
+    多题模式：kind 取首题 type，options 由首题 options 转换，
+    questions[] 完整保留（v10 文档示例支持 prompt+questions 多题模式）。
+    """
+    ask_id = payload.get("id") or payload.get("ask_id") or _new_call_id()
+    questions = payload.get("questions") or []
+    context = payload.get("context", "")
+
+    if not questions:
+        return {
+            "ask_id": ask_id,
+            "kind": "text",
+            "prompt": payload.get("question", "请补充信息"),
+            "context": context,
+            "danger_level": "low",
+        }
+
+    first = questions[0]
+    kind = _ask_kind_from_question_type(first.get("type", "single_choice"))
+    new_payload: dict = {
+        "ask_id": ask_id,
+        "kind": kind,
+        "prompt": first.get("question", "请确认"),
+        "context": context,
+        "danger_level": "low",
+    }
+    if kind in ("choice", "multi_choice"):
+        new_payload["options"] = _build_ask_options(first)
+    elif kind == "text":
+        new_payload["placeholder"] = first.get("placeholder", "")
+    # 多题模式：保留完整 questions 数组
+    if len(questions) > 1:
+        new_payload["questions"] = questions
+    return new_payload
+
+
+def _convert_propose_plan_payload(payload: dict) -> dict:
+    """v9 tool/propose_plan payload → v10 ask(kind=plan) payload。
+
+    v9: {id, scenario_id, summary, permissions, estimated_time_seconds, tools}
+    v10: {ask_id, kind:"plan", prompt, danger_level, plan:{scenario_id,summary,
+          permissions, estimated_seconds, steps:[{label,detail},...]}}
+
+    steps 由 tools[] 转换：每个 tool 一个 step；label=tool.name，
+    detail=参数摘要前 80 字。
+    """
+    ask_id = payload.get("id") or payload.get("ask_id") or _new_call_id()
+    summary = payload.get("summary", "")
+    permissions = list(payload.get("permissions") or [])
+    estimated = int(payload.get("estimated_time_seconds") or 0)
+    scenario_id = payload.get("scenario_id", "")
+    tools = payload.get("tools") or []
+
+    steps: list[dict] = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name") or t.get("kind") or "step"
+        args = t.get("arguments") or {}
+        try:
+            detail = json.dumps(args, ensure_ascii=False, default=str)[:80]
+        except Exception:
+            detail = str(args)[:80]
+        steps.append({"label": name, "detail": detail})
+
+    danger = _hard_map_danger_level(permissions, summary)
+    return {
+        "ask_id": ask_id,
+        "kind": "plan",
+        "prompt": summary,
+        "danger_level": danger,
+        "plan": {
+            "scenario_id": scenario_id,
+            "summary": summary,
+            "permissions": permissions,
+            "estimated_seconds": estimated,
+            "steps": steps,
+        },
+    }
+
+
+def _convert_tool_call_payload(payload: dict) -> dict:
+    """v9 tool/ios_request payload → v10 tool/call payload。
+
+    v9: {id, name, input}
+    v10: {tool_call_id, name, input}
+    """
+    new = dict(payload)
+    if "id" in new and "tool_call_id" not in new:
+        new["tool_call_id"] = new.pop("id")
+    return new
+
+
+def _convert_tool_start_payload(payload: dict) -> dict:
+    """v9 tool/sub_request payload → v10 tool/start payload。
+
+    v9: {taskId, name, label, query, estimatedStages}
+    v10: {tool_call_id, name, label, total_steps?, can_cancel?}
+    """
+    new = dict(payload)
+    if "taskId" in new and "tool_call_id" not in new:
+        new["tool_call_id"] = new.pop("taskId")
+    if "estimatedStages" in new and "total_steps" not in new:
+        new["total_steps"] = new.pop("estimatedStages")
+    new.setdefault("can_cancel", False)
+    return new
+
+
+def _convert_tool_progress_payload(payload: dict) -> dict:
+    """v9 tool/sub_progress payload → v10 tool/progress payload。
+
+    v9: {taskId, name, stage, current, total, message}
+    v10: {tool_call_id, step, total, stage, message}
+    """
+    new = dict(payload)
+    if "taskId" in new and "tool_call_id" not in new:
+        new["tool_call_id"] = new.pop("taskId")
+    if "current" in new and "step" not in new:
+        new["step"] = new.pop("current")
+    return new
+
+
+def _convert_tool_result_payload(payload: dict) -> dict:
+    """v9 tool/sub_result payload → v10 tool/result payload。
+
+    v9: {taskId, name, status, summary, result}
+    v10: {tool_call_id, status, summary, data?}
+    """
+    new = dict(payload)
+    if "taskId" in new and "tool_call_id" not in new:
+        new["tool_call_id"] = new.pop("taskId")
+    if "result" in new and "data" not in new:
+        new["data"] = new.pop("result")
+    return new
+
+
+def _v9_to_v10_envelope(
+    msg_type: str, sub_type: str, payload: dict,
+) -> tuple[Optional[str], str, dict]:
+    """v9 (type, subType, payload) → v10 (type, subType, payload)。
+
+    返回 (None, "", {}) 表示该消息在 v10 被删除，应静默丢弃（如 message/thinking）。
+    """
+    # ── 协议删除类 ──
+    if (msg_type, sub_type) == ("message", "thinking"):
+        return (None, "", {})
+
+    # ── ask 系列（合并 ask_user_question + propose_plan）──
+    if (msg_type, sub_type) == ("tool", "ask_user_question"):
+        return ("ask", "", _convert_ask_user_question_payload(payload or {}))
+    if (msg_type, sub_type) == ("tool", "propose_plan"):
+        return ("ask", "", _convert_propose_plan_payload(payload or {}))
+
+    # ── tool 系列（payload 字段重命名）──
+    if (msg_type, sub_type) == ("tool", "ios_request"):
+        return ("tool", "call", _convert_tool_call_payload(payload or {}))
+    if (msg_type, sub_type) == ("tool", "sub_request"):
+        return ("tool", "start", _convert_tool_start_payload(payload or {}))
+    if (msg_type, sub_type) == ("tool", "sub_progress"):
+        return ("tool", "progress", _convert_tool_progress_payload(payload or {}))
+    if (msg_type, sub_type) == ("tool", "sub_result"):
+        return ("tool", "result", _convert_tool_result_payload(payload or {}))
+
+    # ── message/text → message/reply（payload 不变）──
+    if (msg_type, sub_type) == ("message", "text"):
+        return ("message", "reply", payload or {})
+
+    # ── 其他类型透传（status / error / pong / sync_complete / 已 v10 命名的）──
+    return (msg_type, sub_type, payload or {})
+
+
+# ═══════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════
 # MainAgent
 # ═══════════════════════════════════════════════════════════════
 
@@ -1925,15 +2161,28 @@ class MainAgent:
 
     async def _push(self, session_id: str, msg_type: str, sub_type: str,
                     role: str, payload: dict, priority_kind: str = "normal") -> str:
-        """统一出口 — 通过 outbox 发送（持久化 + 队列 + APNs 联动）。"""
+        """统一出口 — 通过 outbox 发送（持久化 + 队列 + APNs 联动）。
+
+        v10 迁移：本函数在内部做 v9→v10 类型映射，调用方继续传旧名（"message"/"text",
+        "tool"/"sub_request" 等），envelope 写出去的是 v10。映射规则见
+        _v9_to_v10_envelope()。
+        """
+        new_type, new_sub, new_payload = _v9_to_v10_envelope(msg_type, sub_type, payload)
+        if new_type is None:
+            # 协议明确要求删除的类型（如 message/thinking）→ 静默丢弃
+            return ""
+
         envelope = {
-            "type": msg_type,
-            "subType": sub_type,
-            "role": role,
+            "type": new_type,
+            # v10: subType 仅 tool/error 用；其余去除
+            "subType": new_sub,
+            "role": role,                         # v10 删除 role，但过渡期保留为可选向后兼容
             "agentId": self._agent_id,
             "sessionId": session_id,
             "timestamp": _now(),
-            "payload": payload,
+            "payload": new_payload,
+            # v10: 字段名 priority；同时保留 priorityKind 兼容旧客户端 / 旧库逻辑
+            "priority": priority_kind,
             "priorityKind": priority_kind,
         }
         try:
@@ -1964,11 +2213,27 @@ class MainAgent:
                               match_fn=None) -> Optional[dict]:
         """阻塞等用户/iOS 回复指定 type+subType 的消息。
 
-        与 v2 不同：不匹配的消息 LPUSH 到 parked sideband，主循环下轮再合并。
+        v10 兼容：调用方继续传 v9 (msg_type, msg_sub)，本函数同时接受 v10 入站类型：
+          - ("tool", "ask_user_question") → 也匹配 v10 type=="ask_reply"
+          - ("tool", "propose_plan")      → 也匹配 v10 type=="ask_reply"
+          - ("tool", "ios_result")        → 也匹配 v10 type=="tool_result"
+        v10 payload 会被归一化成 v9 形态返回（answers / approved / content 等），
+        让调用方解析逻辑无需改动。
+
+        不匹配的消息 LPUSH 到 parked sideband，主循环下轮再合并。
         """
         ws_queue = f"agent:ws:{self._agent_id}"
         parked_queue = f"agent:ws:{self._agent_id}:parked"
         deadline = asyncio.get_event_loop().time() + timeout
+
+        # v10 ↔ v9 入站类型别名
+        # v10 type → v9 (type, subType) 期望值集合
+        v10_aliases: dict[str, tuple[str, str]] = {}
+        if (msg_type, msg_sub) in (("tool", "ask_user_question"),
+                                    ("tool", "propose_plan")):
+            v10_aliases["ask_reply"] = (msg_type, msg_sub)
+        if (msg_type, msg_sub) == ("tool", "ios_result"):
+            v10_aliases["tool_result"] = (msg_type, msg_sub)
 
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -1994,18 +2259,66 @@ class MainAgent:
             got_session = msg.get("_session_id", "main")
             got_type = msg.get("type", "")
             got_sub = msg.get("subType", "")
-            payload = msg.get("payload", {})
+            payload = msg.get("payload", {}) or {}
 
-            matched = (got_session == session_id
-                       and got_type == msg_type and got_sub == msg_sub)
-            if matched and (match_fn is None or match_fn(payload)):
+            # v9 直接匹配
+            matched_v9 = (got_session == session_id
+                          and got_type == msg_type and got_sub == msg_sub)
+            if matched_v9 and (match_fn is None or match_fn(payload)):
                 return payload
+
+            # v10 入站匹配（归一化为 v9 形态再返回）
+            if got_session == session_id and got_type in v10_aliases:
+                normalized = self._normalize_v10_inbound_payload(
+                    got_type, msg_type, msg_sub, payload,
+                )
+                if match_fn is None or match_fn(normalized):
+                    return normalized
 
             # 不匹配 → parked
             try:
                 await self.redis.lpush(parked_queue, raw[1])
             except Exception:
                 pass
+
+    @staticmethod
+    def _normalize_v10_inbound_payload(
+        v10_type: str, expected_v9_type: str, expected_v9_sub: str,
+        payload: dict,
+    ) -> dict:
+        """把 v10 入站 payload 归一化成 v9 调用方期望的形态。
+
+        - ask_reply  + 期望 propose_plan       → {approved: bool, reason}
+        - ask_reply  + 期望 ask_user_question  → {answers: [...]}
+        - tool_result + 期望 ios_result        → {tool_call_id, content, status}
+        """
+        if v10_type == "ask_reply":
+            ask_id = payload.get("ask_id", "")
+            value = payload.get("value")
+            reason = payload.get("reason", "")
+            if (expected_v9_type, expected_v9_sub) == ("tool", "propose_plan"):
+                return {
+                    "id": ask_id,
+                    "tool_call_id": ask_id,
+                    "approved": bool(value) if not isinstance(value, str) else value.lower() in ("true", "yes", "approve", "approved", "1"),
+                    "reason": reason,
+                }
+            # ask_user_question: wrap value into answers[]
+            return {
+                "id": ask_id,
+                "tool_call_id": ask_id,
+                "answers": [{"id": ask_id, "value": value, "answer": value}],
+                "reason": reason,
+            }
+
+        if v10_type == "tool_result":
+            return {
+                "tool_call_id": payload.get("tool_call_id", ""),
+                "status": payload.get("status", "done"),
+                "content": payload.get("content"),
+            }
+
+        return payload
 
     def _record_event(self, session_id: str, event_type: str, payload: dict):
         """Phase 4: 写入 agent_events 表用于 crash recovery。"""

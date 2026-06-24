@@ -218,21 +218,38 @@ async def start_notification_listener(
             new_papers = data.get("new_papers", [])
 
             from datetime import datetime, timezone
+            import uuid
+
+            # v10: 订阅推送统一走 message/reply（priority=high → APNs 触发）
+            total = len(new_papers)
+            head_lines = []
+            for i, p in enumerate(new_papers[:5], 1):
+                title = (p.get("title") or "").strip() or "(无标题)"
+                head_lines.append(f"{i}. {title}")
+            preview_text = "\n".join(head_lines)
+            content = (
+                f"📡 订阅《{subscription_name or subscription_id}》"
+                f"今日新增 {total} 篇:\n\n{preview_text}"
+            )
 
             envelope = {
-                "role": "system",
-                "type": "subscription",
-                "subType": "new_papers",
+                "type": "message",
+                "subType": "reply",
+                "msg_id": str(uuid.uuid4()),
                 "agentId": agent_id,
                 "sessionId": "main",
-                "seq": 0,
-                "priority": 2,
+                "priority": "high",
+                "priorityKind": "high",
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                # 过渡期保留 role（v10 删除，可选向后兼容）
+                "role": "assistant",
                 "payload": {
+                    "content": content,
+                    # 结构化数据放 payload，便于 iOS 升级后展开
                     "subscription_id": subscription_id,
                     "subscription_name": subscription_name,
                     "new_papers": new_papers,
-                    "total_new": len(new_papers),
+                    "total_new": total,
                 },
             }
 

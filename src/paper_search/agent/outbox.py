@@ -35,35 +35,42 @@ logger = logging.getLogger(__name__)
 # ── 重要性默认值 (type/subType → priority_kind) ───────────────
 
 PRIORITY_DEFAULTS: dict[tuple[str, str], str] = {
-    # 流式 thinking → 不持久化
-    ("message", "thinking"): "silent",
-    # 最终文本回复
-    ("message", "text"): "high",
-    ("message", "reply"): "high",
-    # 工具调用
-    ("tool", "sub_request"): "high",
-    ("tool", "sub_progress"): "normal",
-    ("tool", "sub_result"): "high",
+    # ── v10 主表 ──
+    ("status", ""):                "silent",   # 协议 §1.5: silent = 不持久化（仅 pong/status 走 silent）
+    ("message", "reply"):          "high",
+    ("tool", "start"):             "high",
+    ("tool", "progress"):          "normal",
+    ("tool", "result"):            "high",
+    ("tool", "call"):              "high",
+    ("ask", ""):                   "high",
+    ("error", "TASK_FAILED"):      "urgent",
+    ("error", "INTERNAL_ERROR"):   "urgent",
+    ("error", "ASK_TIMEOUT"):      "urgent",
+    ("error", "MAX_ROUNDS"):       "high",
+    ("error", "PERMISSION_DENIED"): "high",
+    ("pong", ""):                  "silent",
+    ("sync_complete", ""):         "silent",
+    # ── v9 兼容（少数仍走 v9 路径的调用方）──
+    ("message", "thinking"):       "silent",
+    ("message", "text"):           "high",
+    ("tool", "sub_request"):       "high",
+    ("tool", "sub_progress"):      "normal",
+    ("tool", "sub_result"):        "high",
     ("tool", "ask_user_question"): "high",
-    ("tool", "propose_plan"): "high",
-    ("tool", "ios_request"): "high",
-    ("tool", "ios_result"): "normal",
-    # 错误
-    ("error", "TASK_FAILED"): "urgent",
-    ("error", "INTERNAL_ERROR"): "urgent",
-    ("error", "MAX_ROUNDS"): "high",
+    ("tool", "propose_plan"):      "high",
+    ("tool", "ios_request"):       "high",
+    ("tool", "ios_result"):        "normal",
     # 心跳类 (理论上不应走 outbox)
-    ("ping", ""): "silent",
-    ("pong", ""): "silent",
+    ("ping", ""):                  "silent",
 }
 
 
 def infer_priority(envelope: dict) -> str:
-    """根据 envelope 的 type/subType 推断 priority_kind。
+    """根据 envelope 的 type/subType 推断 priority。
 
-    envelope 已含 priorityKind 字段则尊重它。
+    envelope 已含 priority / priorityKind 字段则尊重它（priority 优先）。
     """
-    explicit = envelope.get("priorityKind")
+    explicit = envelope.get("priority") or envelope.get("priorityKind")
     if explicit in ("silent", "normal", "high", "urgent"):
         return explicit
 
@@ -106,6 +113,8 @@ async def outbox_publish(
         envelope["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     priority_kind = infer_priority(envelope)
+    # v10: 字段名 priority；同时写 priorityKind 兼容旧客户端/旧库逻辑
+    envelope["priority"] = priority_kind
     envelope["priorityKind"] = priority_kind
     msg_id = envelope["msg_id"]
     agent_id = envelope.get("agentId", "")
@@ -146,6 +155,7 @@ def outbox_publish_sync(
         envelope["timestamp"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     priority_kind = infer_priority(envelope)
+    envelope["priority"] = priority_kind
     envelope["priorityKind"] = priority_kind
     msg_id = envelope["msg_id"]
     agent_id = envelope.get("agentId", "")

@@ -29,11 +29,13 @@ def make_preview(envelope: dict) -> tuple[str, str]:
     sub_type = envelope.get("subType", "")
     payload = envelope.get("payload", {})
 
-    if msg_type == "message" and sub_type == "text":
+    # v10: message/reply（v9 message/text 也兼容）
+    if msg_type == "message" and sub_type in ("reply", "text"):
         content = (payload.get("content") or "")[:120]
         return ("Paper Agent", content or "新消息")
 
-    if msg_type == "tool" and sub_type == "sub_result":
+    # v10: tool/result（v9 tool/sub_result 也兼容）
+    if msg_type == "tool" and sub_type in ("result", "sub_result"):
         name = payload.get("name", "任务")
         status = payload.get("status", "")
         summary = (payload.get("summary") or "")[:100]
@@ -43,9 +45,17 @@ def make_preview(envelope: dict) -> tuple[str, str]:
             return (f"❌ {name} 失败", summary or "任务失败")
         return (f"{name}", summary)
 
+    # v10: ask（合并 ask_user_question + propose_plan）
+    if msg_type == "ask":
+        kind = payload.get("kind", "")
+        prompt = (payload.get("prompt") or "")[:100]
+        if kind == "plan":
+            return ("📋 待审批方案", prompt or "请回到 App 中查看方案")
+        return ("Paper Agent 需要您的回答", prompt or "请回到 App 中查看问题")
+
+    # v9 兼容
     if msg_type == "tool" and sub_type == "ask_user_question":
         return ("Paper Agent 需要您的回答", "请回到 App 中查看问题")
-
     if msg_type == "tool" and sub_type == "propose_plan":
         plan_summary = (payload.get("summary") or "")[:100]
         return ("📋 待审批方案", plan_summary or "请回到 App 中查看方案")
