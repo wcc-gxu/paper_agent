@@ -306,6 +306,13 @@ class ToolRegistry:
         self._register_list_sources()
         self._register_get_paper_abstract()
 
+        # ── 订阅 (S3) 5 ──
+        self._register_create_subscription()
+        self._register_list_subscriptions()
+        self._register_delete_subscription()
+        self._register_pause_subscription()
+        self._register_resume_subscription()
+
         # ── 子 Agent 工具 19（执行阶段直接调用）──
         self._register_sub_agent_tools()
 
@@ -992,6 +999,172 @@ class ToolRegistry:
             return json.dumps({"error": f"Paper not found: {paper_id}"})
         self.register(name="get_paper_abstract", description="获取论文摘要。参数: paper_id", func=get_paper_abstract,
                       metadata=ToolMetadata(category="export", is_idempotent=True))
+
+    # ══════════════════════════════════════════════════════════
+    # S3 — 订阅 (前沿追踪) — 5 个工具
+    # subscription_check_task (Celery Beat) 已周期读取 subscriptions 表，
+    # 工具只负责增删改，不需要触发 Beat。
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _normalize_sources(sources) -> list[str]:
+        """统一 sources 入参（list / "a,b" / None → list[str]）。"""
+        if sources is None or sources == "":
+            return ["arxiv", "semantic_scholar"]
+        if isinstance(sources, str):
+            return [s.strip() for s in sources.split(",") if s.strip()]
+        if isinstance(sources, list):
+            return [str(s).strip() for s in sources if str(s).strip()]
+        return ["arxiv", "semantic_scholar"]
+
+    def _register_create_subscription(self):
+        def create_subscription(query: str, name: str = "",
+                                interval_hours: int = 24,
+                                sources: str = "",
+                                max_papers_per_check: int = 5) -> str:
+            """创建一个前沿追踪订阅。Beat 周期任务会读取此表逐条检查新论文。"""
+            from ..agent.db import AgentDB
+
+            query = (query or "").strip()
+            if not query:
+                return json.dumps({"error": "query 不能为空"}, ensure_ascii=False)
+
+            display_name = (name or "").strip() or (query[:30] + ("…" if len(query) > 30 else ""))
+            sources_list = ToolRegistry._normalize_sources(sources)
+            try:
+                interval_hours = max(1, int(interval_hours))
+            except (TypeError, ValueError):
+                interval_hours = 24
+            try:
+                max_papers_per_check = max(1, int(max_papers_per_check))
+            except (TypeError, ValueError):
+                max_papers_per_check = 5
+
+            db = AgentDB()
+            sub_id = db.create_subscription(
+                name=display_name,
+                keywords=query,
+                sources=sources_list,
+                interval_hours=interval_hours,
+                max_papers_per_check=max_papers_per_check,
+            )
+            return json.dumps({
+                "subscription_id": sub_id,
+                "name": display_name,
+                "query": query,
+                "interval_hours": interval_hours,
+                "sources": sources_list,
+                "max_papers_per_check": max_papers_per_check,
+                "message": f"订阅 '{display_name}' 已创建，Beat 任务将每 {interval_hours}h 检查一次。",
+            }, ensure_ascii=False)
+
+        self.register(
+            name="create_subscription",
+            description=(
+                "创建前沿追踪订阅（S3）。参数: query (必需,研究方向关键词), "
+                "name (可选,显示名), interval_hours (默认24), "
+                "sources (默认 arxiv,semantic_scholar; 逗号分隔), "
+                "max_papers_per_check (默认5)。Celery Beat 已周期检查 subscriptions 表，无需手动触发。"
+            ),
+            func=create_subscription,
+            metadata=ToolMetadata(category="subscription"),
+        )
+
+    def _register_list_subscriptions(self):
+        def list_subscriptions(enabled_only: bool = False) -> str:
+            from ..agent.db import AgentDB
+            db = AgentDB()
+            subs = db.list_subscriptions(enabled_only=bool(enabled_only))
+            out = [{
+                "subscription_id": s["id"],
+                "name": s.get("name", ""),
+                "query": s.get("keywords", ""),
+                "interval_hours": s.get("interval_hours", 24),
+                "sources": s.get("sources", []),
+                "max_papers_per_check": s.get("max_papers_per_check", 5),
+                "active": bool(s.get("enabled", 0)),
+                "last_checked_at": s.get("last_checked_at"),
+                "created_at": s.get("created_at"),
+            } for s in subs]
+            return json.dumps({"total": len(out), "subscriptions": out},
+                              ensure_ascii=False, default=str)
+
+        self.register(
+            name="list_subscriptions",
+            description="列出全部订阅。参数: enabled_only (默认 false，true 时仅返回未暂停)。",
+            func=list_subscriptions,
+            metadata=ToolMetadata(category="subscription", is_idempotent=True),
+        )
+
+    def _register_delete_subscription(self):
+        def delete_subscription(subscription_id: str) -> str:
+            from ..agent.db import AgentDB
+            sub_id = (subscription_id or "").strip()
+            if not sub_id:
+                return json.dumps({"error": "subscription_id 不能为空"}, ensure_ascii=False)
+            db = AgentDB()
+            existing = db.get_subscription(sub_id)
+            if not existing:
+                return json.dumps({"error": f"订阅不存在: {sub_id}"}, ensure_ascii=False)
+            db.delete_subscription(sub_id)
+            return json.dumps({
+                "subscription_id": sub_id,
+                "deleted": True,
+                "message": f"订阅 '{existing.get('name', sub_id)}' 已删除。",
+            }, ensure_ascii=False)
+
+        self.register(
+            name="delete_subscription",
+            description="删除订阅及其全部推送历史。参数: subscription_id (必需)。",
+            func=delete_subscription,
+            metadata=ToolMetadata(category="subscription"),
+        )
+
+    def _register_pause_subscription(self):
+        def pause_subscription(subscription_id: str) -> str:
+            from ..agent.db import AgentDB
+            sub_id = (subscription_id or "").strip()
+            if not sub_id:
+                return json.dumps({"error": "subscription_id 不能为空"}, ensure_ascii=False)
+            db = AgentDB()
+            if not db.get_subscription(sub_id):
+                return json.dumps({"error": f"订阅不存在: {sub_id}"}, ensure_ascii=False)
+            db.set_subscription_active(sub_id, False)
+            return json.dumps({
+                "subscription_id": sub_id,
+                "active": False,
+                "message": "订阅已暂停（Beat 检查时会跳过）。",
+            }, ensure_ascii=False)
+
+        self.register(
+            name="pause_subscription",
+            description="暂停订阅（保留历史，仅停止 Beat 检查）。参数: subscription_id (必需)。",
+            func=pause_subscription,
+            metadata=ToolMetadata(category="subscription"),
+        )
+
+    def _register_resume_subscription(self):
+        def resume_subscription(subscription_id: str) -> str:
+            from ..agent.db import AgentDB
+            sub_id = (subscription_id or "").strip()
+            if not sub_id:
+                return json.dumps({"error": "subscription_id 不能为空"}, ensure_ascii=False)
+            db = AgentDB()
+            if not db.get_subscription(sub_id):
+                return json.dumps({"error": f"订阅不存在: {sub_id}"}, ensure_ascii=False)
+            db.set_subscription_active(sub_id, True)
+            return json.dumps({
+                "subscription_id": sub_id,
+                "active": True,
+                "message": "订阅已恢复（下次 Beat 周期将参与检查）。",
+            }, ensure_ascii=False)
+
+        self.register(
+            name="resume_subscription",
+            description="恢复已暂停的订阅。参数: subscription_id (必需)。",
+            func=resume_subscription,
+            metadata=ToolMetadata(category="subscription"),
+        )
 
     # ══════════════════════════════════════════════════════════
     # 子 Agent 工具

@@ -220,6 +220,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     keywords TEXT NOT NULL,
     sources TEXT NOT NULL DEFAULT '["arxiv","semantic_scholar"]',
     interval_hours INTEGER NOT NULL DEFAULT 24,
+    max_papers_per_check INTEGER NOT NULL DEFAULT 5,
     last_checked_at TEXT,
     last_paper_ids TEXT DEFAULT '[]',
     enabled INTEGER NOT NULL DEFAULT 1,
@@ -246,32 +247,47 @@ CREATE INDEX IF NOT EXISTS idx_sub_results_sub ON subscription_results(subscript
 CREATE INDEX IF NOT EXISTS idx_sub_results_pushed ON subscription_results(pushed_at);
 """
 
-# 运行时迁移：为旧表添加新列（多表支持）
-_MIGRATIONS = [
-    # papers 表迁移
-    ("papers", "ALTER TABLE papers ADD COLUMN unified_level TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN reading_level TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN digest TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN method_tags TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN dataset_info TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN code_url TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN markdown_path TEXT"),
-    ("papers", "ALTER TABLE papers ADD COLUMN pdf_path TEXT"),
-    # agent_tasks 表迁移（v7.0: task 类型 + 后台任务支持）
-    ("agent_tasks", "ALTER TABLE agent_tasks ADD COLUMN mode TEXT DEFAULT 'foreground'"),
-    ("agent_tasks", "ALTER TABLE agent_tasks ADD COLUMN name TEXT"),
-    # Phase 1 ws_messages 扩展（消息送达 + APNs + 关联追踪）
-    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN msg_id TEXT DEFAULT ''"),
-    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN correlation_id TEXT DEFAULT ''"),
-    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN priority_kind TEXT DEFAULT 'normal'"),
-    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN delivered_at TEXT DEFAULT ''"),
-    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN delivered_sessions TEXT DEFAULT '[]'"),
-    ("ws_messages", "ALTER TABLE ws_messages ADD COLUMN apns_sent_at TEXT DEFAULT ''"),
-    # 索引
-    ("papers", "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)"),
-    ("ws_messages", "CREATE INDEX IF NOT EXISTS idx_ws_messages_msg_id ON ws_messages(msg_id)"),
-    ("ws_messages", "CREATE INDEX IF NOT EXISTS idx_ws_messages_undelivered ON ws_messages(agent_id, session_id, delivered_at, priority_kind)"),
-    ("ws_messages", "CREATE INDEX IF NOT EXISTS idx_ws_messages_correlation ON ws_messages(correlation_id)"),
+# 运行时迁移：声明式表 (table, column, sqlite_def)。
+# `_migrate_schema()` 启动时遍历，缺则 ALTER ADD COLUMN（幂等）。
+# 任何老 schema 的 db 文件首次实例化时都会自动补齐。
+_COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    # papers 表 — v3.x 增强元数据
+    ("papers", "unified_level", "TEXT"),
+    ("papers", "reading_level", "TEXT"),
+    ("papers", "digest", "TEXT"),
+    ("papers", "method_tags", "TEXT"),
+    ("papers", "dataset_info", "TEXT"),
+    ("papers", "code_url", "TEXT"),
+    ("papers", "markdown_path", "TEXT"),
+    ("papers", "pdf_path", "TEXT"),
+    # agent_tasks 表 — v7.0 task 类型 + 后台任务支持
+    ("agent_tasks", "mode", "TEXT DEFAULT 'foreground'"),
+    ("agent_tasks", "name", "TEXT"),
+    # ws_messages — Phase 1 出站消息扩展 (协议 v10 必需的 msg_id 等列)
+    ("ws_messages", "seq", "INTEGER DEFAULT 0"),
+    ("ws_messages", "subtype", "TEXT DEFAULT ''"),
+    ("ws_messages", "priority", "INTEGER DEFAULT 0"),
+    ("ws_messages", "is_replay", "INTEGER DEFAULT 0"),
+    ("ws_messages", "msg_id", "TEXT DEFAULT ''"),
+    ("ws_messages", "correlation_id", "TEXT DEFAULT ''"),
+    ("ws_messages", "priority_kind", "TEXT DEFAULT 'normal'"),
+    ("ws_messages", "delivered_at", "TEXT DEFAULT ''"),
+    ("ws_messages", "delivered_sessions", "TEXT DEFAULT '[]'"),
+    ("ws_messages", "apns_sent_at", "TEXT DEFAULT ''"),
+    # subscriptions 表 — S3 工具新增最大推送数
+    ("subscriptions", "max_papers_per_check", "INTEGER NOT NULL DEFAULT 5"),
+]
+
+# 索引迁移：CREATE INDEX IF NOT EXISTS 本身幂等，列表化方便统一管理。
+# 也涵盖 SCHEMA 里那些可能在 legacy 表上首次失败的索引——
+# _migrate_schema 补齐列后会重跑这些索引。
+_INDEX_MIGRATIONS: list[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_papers_unified_level ON papers(unified_level)",
+    "CREATE INDEX IF NOT EXISTS idx_ws_messages_lookup ON ws_messages(agent_id, session_id, seq)",
+    "CREATE INDEX IF NOT EXISTS idx_ws_messages_msg_id ON ws_messages(msg_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ws_messages_undelivered "
+    "ON ws_messages(agent_id, session_id, delivered_at, priority_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_ws_messages_correlation ON ws_messages(correlation_id)",
 ]
 
 
@@ -290,32 +306,66 @@ class AgentDB:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
-            self._conn.executescript(SCHEMA)
-            self._run_migrations()
+            self._apply_schema(SCHEMA)
+            self._migrate_schema()
             self._conn.commit()
         return self._conn
 
-    def _run_migrations(self):
-        """运行缺失列的迁移和索引创建（多表支持）。"""
-        for item in _MIGRATIONS:
-            table, sql = item[0], item[1]
-            if "ADD COLUMN" in sql:
-                col = sql.split("ADD COLUMN ")[1].split(" ")[0]
-                # 检查目标表的现有列
+    def _apply_schema(self, schema_sql: str):
+        """逐条执行 SCHEMA — 单条失败仅 debug 日志，让后续 ALTER TABLE 修补。
+
+        对老库友好：旧 ws_messages 缺 `seq` 时，`CREATE INDEX … (seq)` 会失败，
+        但 CREATE TABLE 已经先执行过；_migrate_schema 随后补列，
+        _INDEX_MIGRATIONS 再把索引补上。
+        """
+        # 简单按分号 + 换行切分（SCHEMA 内无字符串/嵌套语义会污染）
+        for stmt in schema_sql.split(";"):
+            s = stmt.strip()
+            if not s:
+                continue
+            try:
+                self._conn.execute(s)
+            except Exception as e:
+                logger.debug(f"Schema apply skipped ({s[:80]}…): {e}")
+
+    def _migrate_schema(self):
+        """启动时检查并应用所有缺失的列 + 索引（idempotent）。
+
+        - 对每个 `_COLUMN_MIGRATIONS` 条目，用 PRAGMA table_info 检查目标表，
+          缺则 ALTER TABLE ADD COLUMN；同一个 db 实例多次调用也安全。
+        - 索引语句本身用 `IF NOT EXISTS`。
+        - 单条迁移失败仅 debug 日志，不阻断启动（如表本身不存在的情况）。
+        """
+        # 1) 列迁移：按表分组，每个表只查询一次 PRAGMA
+        by_table: dict[str, list[tuple[str, str]]] = {}
+        for table, col, col_def in _COLUMN_MIGRATIONS:
+            by_table.setdefault(table, []).append((col, col_def))
+
+        for table, cols in by_table.items():
+            try:
                 existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
-                if col not in existing:
-                    try:
-                        self._conn.execute(sql)
-                        logger.info(f"DB migration: {sql}")
-                    except Exception as e:
-                        logger.debug(f"Migration skipped: {e}")
-            else:
-                # 其他迁移语句（如 CREATE INDEX）——直接尝试执行
+            except sqlite3.OperationalError:
+                # 表不存在（如更早版本完全没建过），交由 SCHEMA 的 CREATE IF NOT EXISTS 处理
+                logger.debug(f"PRAGMA table_info({table}) failed; skip migrations for this table")
+                continue
+            if not existing:
+                continue
+            for col, col_def in cols:
+                if col in existing:
+                    continue
+                sql = f"ALTER TABLE {table} ADD COLUMN {col} {col_def}"
                 try:
                     self._conn.execute(sql)
-                    logger.info(f"DB migration (ddl): {sql}")
+                    logger.info(f"DB migration applied: {sql}")
                 except Exception as e:
-                    logger.debug(f"Migration skipped: {e}")
+                    logger.debug(f"DB migration skipped ({sql}): {e}")
+
+        # 2) 索引迁移
+        for sql in _INDEX_MIGRATIONS:
+            try:
+                self._conn.execute(sql)
+            except Exception as e:
+                logger.debug(f"DB index migration skipped ({sql}): {e}")
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -701,7 +751,9 @@ class AgentDB:
         msg_type = envelope.get("type", "")
         subtype = envelope.get("subType", "") or ""
         payload = envelope.get("payload", {})
-        priority_kind = envelope.get("priorityKind", "normal")
+        # v10: 字段名 priority；fallback priorityKind 兼容旧调用
+        priority_kind = (envelope.get("priority")
+                         or envelope.get("priorityKind") or "normal")
         created_at = envelope.get("timestamp", self._now())
 
         payload_str = (_json.dumps(payload, ensure_ascii=False, default=str)
@@ -817,16 +869,20 @@ class AgentDB:
                 "agentId": r["agent_id"],
                 "sessionId": r["session_id"],
                 "timestamp": r["created_at"],
+                # v10: 字段名 priority；同时保留 priorityKind 兼容旧 iOS
+                "priority": r["priority_kind"] or "normal",
                 "priorityKind": r["priority_kind"] or "normal",
                 "correlation_id": r["correlation_id"] or "",
                 "payload": payload,
             }
 
-            # normal sub_progress 同 taskId 去重保最后一条
+            # 同 task/tool_call_id 的 normal 进度消息去重保最后一条
+            # (v10 tool/progress + v9 tool/sub_progress 都覆盖)
             if (r["priority_kind"] == "normal"
                     and r["type"] == "tool"
-                    and r["subtype"] == "sub_progress"):
-                task_id = payload.get("taskId", "")
+                    and r["subtype"] in ("progress", "sub_progress")):
+                task_id = (payload.get("tool_call_id")
+                           or payload.get("taskId") or "")
                 if task_id:
                     if task_id in progress_by_task:
                         out[progress_by_task[task_id]] = entry
@@ -1112,7 +1168,8 @@ class AgentDB:
 
     def create_subscription(self, name: str, keywords: str,
                             sources: list[str] = None,
-                            interval_hours: int = 24) -> str:
+                            interval_hours: int = 24,
+                            max_papers_per_check: int = 5) -> str:
         """创建订阅，返回 subscription_id。"""
         import uuid as _uuid
         sub_id = str(_uuid.uuid4())[:8]
@@ -1120,10 +1177,11 @@ class AgentDB:
         sources_json = json.dumps(sources or ["arxiv", "semantic_scholar"])
         self.conn.execute(
             """INSERT INTO subscriptions
-               (id, name, keywords, sources, interval_hours,
+               (id, name, keywords, sources, interval_hours, max_papers_per_check,
                 enabled, created_at, updated_at)
-               VALUES (?,?,?,?,?,1,?,?)""",
-            (sub_id, name, keywords, sources_json, interval_hours, now, now),
+               VALUES (?,?,?,?,?,?,1,?,?)""",
+            (sub_id, name, keywords, sources_json, interval_hours,
+             max_papers_per_check, now, now),
         )
         self.conn.commit()
         return sub_id
@@ -1189,6 +1247,23 @@ class AgentDB:
         )
         self.conn.commit()
         return True
+
+    def set_subscription_active(self, subscription_id: str, active: bool) -> bool:
+        """切换订阅 enabled 状态（pause/resume 用）。返回是否实际更新到行。"""
+        cursor = self.conn.execute(
+            "UPDATE subscriptions SET enabled=?, updated_at=? WHERE id=?",
+            (1 if active else 0, self._now(), subscription_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_subscription_checked(self, subscription_id: str,
+                                  last_paper_ids: list[str] = None) -> bool:
+        """标记订阅检查完成（供 subscription_check_task 单独调用，避免传整列表的二段写）。"""
+        kwargs: dict = {"last_checked_at": self._now()}
+        if last_paper_ids is not None:
+            kwargs["last_paper_ids"] = last_paper_ids
+        return self.update_subscription(subscription_id, **kwargs)
 
     def save_subscription_result(self, subscription_id: str,
                                   paper: dict) -> int:
