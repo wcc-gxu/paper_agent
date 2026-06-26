@@ -1973,6 +1973,8 @@ class MainAgent:
             )
             return EvaluateCompletionResult(
                 satisfied=False,
+                next_action="fail",  # v2: 显式 fail 出口
+                truth_confidence=0.0,
                 reasoning=f"评估器异常 ({e})，无法确认任务是否完成",
                 needs_more_tools=[],
                 final_message="抱歉，评估环节出现异常，请稍后重试或换个表述。",
