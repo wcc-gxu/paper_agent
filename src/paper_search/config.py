@@ -202,6 +202,7 @@ def get_cookie_dir() -> Path:
 MODEL_ROUTES: dict[str, tuple[str, str]] = {
     # ── 主 Agent 节点 ──────────────────────────────────────
     "safety_filter":         ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
+    "safety_llm_confirm":    ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),  # v2: 安全异步并行二次确认
     "fast_triage":           ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
     "inline_reply":          ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
     "lightweight_plan_ops":  ("doubao-seed-2.0-code", "glm-5.2"),
@@ -209,6 +210,10 @@ MODEL_ROUTES: dict[str, tuple[str, str]] = {
     "scenario_plan":         ("glm-5.2",              "deepseek-v4-pro"),
     "evaluate_completion":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
     "final_reply":           ("glm-5.2",              "deepseek-v4-pro"),
+    # ── 记忆系统（Phase 2 三件套）─────────────────────────
+    "summary":               ("doubao-seed-2.0-lite", "deepseek-v4-flash"),  # 档 2 滚动摘要
+    "extract_long_term":     ("glm-5.2",              "deepseek-v4-pro"),    # 档 3 长期抽取
+    "topic_consolidate":     ("doubao-seed-2.0-lite", "deepseek-v4-flash"),  # topic 粗粒度合并
     # ── 子 Agent 内部 ──────────────────────────────────────
     "ingest_evaluate":   ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
     "ingest_survey":     ("doubao-seed-2.0-pro",  "glm-5.2"),
