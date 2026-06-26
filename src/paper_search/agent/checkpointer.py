@@ -44,15 +44,15 @@ async def build_checkpointer(
     if db is None and db_path is None:
         raise ValueError("build_checkpointer 需要 db 或 db_path 之一")
     target_path = str(db.db_path) if db is not None else str(db_path)
-    # aiosqlite.connect 是 awaitable, 不需要 async with — 我们要长期持有这个 conn
-    conn = await aiosqlite.connect(target_path)
+    # 关键: langgraph 内部用 explicit BEGIN/COMMIT, 必须 manual 模式
+    # 由 connect 时传 isolation_level=None
+    conn = await aiosqlite.connect(target_path, isolation_level=None)
     # WAL 模式（AgentDB 已设置, 这里幂等再确认）
     await conn.execute("PRAGMA journal_mode=WAL")
     await conn.execute("PRAGMA busy_timeout=30000")
-    await conn.commit()
 
     saver = AsyncSqliteSaver(conn=conn)
-    # setup() 创建 langgraph 标准 3 表: checkpoints / checkpoint_blobs / checkpoint_writes
+    # setup() 创建 langgraph 标准 checkpoint 表
     await saver.setup()
     logger.info(f"Checkpointer ready (db={target_path})")
     return saver
