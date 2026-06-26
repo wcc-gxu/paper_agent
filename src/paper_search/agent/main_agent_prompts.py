@@ -174,10 +174,28 @@ class ScenarioMatch(BaseModel):
 
 
 class IntentClassifyResult(BaseModel):
-    """节点 1: 意图分类结果（C2 改造：scenarios 支持 list）。"""
-    intent_kind: Literal["business", "chat", "meta", "unsupported"] = Field(
+    """节点 1: 意图分类结果 (v2: 合并 fast_triage / lightweight_plan).
+
+    v2 改造:
+    - intent_kind 加 "ops" (运维操作), 与 fast_triage 的 5 类对齐
+    - quick_tools 字段: ops/meta 类直接返回轻量 tools, 不再走 scenario_plan
+      (替代 v1 的独立 _node_lightweight_plan 节点, 省 1 次 LLM 调用)
+
+    路由:
+    - business + scenarios → maybe_clarify → scenario_plan → execute_plan
+    - ops / meta           → execute_plan (用 quick_tools)
+    - chat / unsupported   → inline_reply
+    """
+    intent_kind: Literal["business", "chat", "meta", "unsupported", "ops"] = Field(
         ...,
-        description="意图大类：business=匹配业务场景；chat=闲聊/问候；meta=Agent 自我认知/偏好；unsupported=能力外请求",
+        description=(
+            "意图大类:"
+            " business=匹配业务场景 (走 scenario_plan);"
+            " ops=运维操作 (查日志/重启服务/查 status, 走 quick_tools);"
+            " meta=Agent 自我认知/偏好查询 (走 quick_tools);"
+            " chat=闲聊问候;"
+            " unsupported=能力外请求"
+        ),
     )
     scenarios: list[ScenarioMatch] = Field(
         default_factory=list,
@@ -185,6 +203,15 @@ class IntentClassifyResult(BaseModel):
             "当 intent_kind=business 时填写命中的场景列表，可有 1~N 个（**支持复合意图**）；"
             "其他类型留空 list。**只列出可能命中的场景，不命中的不要列**。"
             "每个场景独立判断 confidence。"
+        ),
+    )
+    quick_tools: list["ToolCallSpec"] = Field(
+        default_factory=list,
+        description=(
+            "intent_kind ∈ {ops, meta} 时直接返回的轻量工具调用 (替代 v1 lightweight_plan_*)."
+            " 通常只需 1~2 个 tool, 不走 scenario_plan 节点."
+            " 例: ops 'docker ps' → tool/service_status; meta '我的偏好' → search_memory."
+            " 其他 intent_kind 留空."
         ),
     )
     overall_confidence: float = Field(
@@ -296,6 +323,15 @@ class ScenarioPlanResult(BaseModel):
     tools: list[ToolCallSpec] = Field(
         default_factory=list,
         description="PlanGraph 按 scenario_id 查路由表展开的工具列表（LLM 不再生成）",
+    )
+    requires_verification: bool = Field(
+        False,
+        description=(
+            "v2: 本场景产物是否需进 output_verify (反幻觉) 节点."
+            " 综述/RAG 答案/wiki/extract 等生成性输出必须 true,"
+            " 纯工具操作 (paper_status / paper_export / ios_*) false."
+            " 详见 docs/development/anti-hallucination.md L1.5."
+        ),
     )
 
 
