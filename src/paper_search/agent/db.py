@@ -245,6 +245,21 @@ CREATE TABLE IF NOT EXISTS subscription_results (
 );
 CREATE INDEX IF NOT EXISTS idx_sub_results_sub ON subscription_results(subscription_id);
 CREATE INDEX IF NOT EXISTS idx_sub_results_pushed ON subscription_results(pushed_at);
+
+-- conversation_archive: 档 2 滚动摘要后归档的原始 messages（供回溯，不再入上下文）
+CREATE TABLE IF NOT EXISTS conversation_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    thread_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    archived_at TEXT NOT NULL,
+    summary_msg_id TEXT,
+    original_messages_json TEXT NOT NULL,
+    original_count INTEGER NOT NULL,
+    token_count INTEGER,
+    reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_archive_thread ON conversation_archive(thread_id);
+CREATE INDEX IF NOT EXISTS idx_archive_time ON conversation_archive(archived_at);
 """
 
 # 运行时迁移：声明式表 (table, column, sqlite_def)。
@@ -288,6 +303,17 @@ _INDEX_MIGRATIONS: list[str] = [
     "CREATE INDEX IF NOT EXISTS idx_ws_messages_undelivered "
     "ON ws_messages(agent_id, session_id, delivered_at, priority_kind)",
     "CREATE INDEX IF NOT EXISTS idx_ws_messages_correlation ON ws_messages(correlation_id)",
+]
+
+# 表删除迁移：启动时执行 DROP TABLE IF EXISTS，用于 v1→v2 废弃表清理。
+# 操作不可逆——确保数据已迁移到目标位置（如 Store namespace）后才加入此列表。
+# Phase 2A 仅安装机制，列表保持为空；Phase 2G 收尾时才填充 agent_events 等老表。
+_TABLE_DROP_MIGRATIONS: list[str] = [
+    # Phase 2G 填入：
+    # "agent_events",
+    # "user_preferences", "user_profile", "user_notes",
+    # "strategy_log", "error_patterns",
+    # "task_history",
 ]
 
 
@@ -366,6 +392,15 @@ class AgentDB:
                 self._conn.execute(sql)
             except Exception as e:
                 logger.debug(f"DB index migration skipped ({sql}): {e}")
+
+        # 3) 表删除迁移（v1→v2 废弃表清理；不可逆，保证数据已迁出后才执行）
+        for table in _TABLE_DROP_MIGRATIONS:
+            sql = f"DROP TABLE IF EXISTS {table}"
+            try:
+                self._conn.execute(sql)
+                logger.info(f"DB drop migration applied: {sql}")
+            except Exception as e:
+                logger.warning(f"DB drop migration failed ({sql}): {e}")
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
