@@ -1,57 +1,83 @@
-# Agent Manifest — 智能体身份证与启动协议
+# Agent Manifest — 身份证与启动协议
 
-> 定义 Agent 的身份、记忆位置、启动方式、迁移能力 | 2026-06-16
+> v2.0 | 2026-06-25 | 对齐 LangGraph 三件套
+>
+> 替代 v1.0（MemGPT 4 层记忆位置描述）。本文与 [memory-system.md](memory-system.md) v2.0 配套发布。
 
 ---
 
-## 1. 设计目的
+## §1 设计目的
 
-`agent_manifest.json` 是 Agent 的**身份证 + 启动说明书**。它不是记忆——记忆在 MemGPT 4 层系统中。Manifest 回答三个问题：
+`agent_manifest.json` 是 Agent 的**身份证 + 启动说明书**。它不是记忆——记忆在 LangGraph Checkpointer/Store 双系统中。Manifest 回答三个问题：
 
-1. **我是谁？** — agent_id, 创建时间, 绑定的用户
-2. **如何启动我？** — 入口点, Plan Graph 路径, checkpoint 后端
-3. **我的记忆在哪？** — ShortTerm/MidTerm/LongTerm/MetaMemory 的存储位置
+1. **我是谁？** — `agent_id`, 创建时间, 绑定的用户
+2. **如何启动我？** — 入口点, StateGraph 模块, Checkpointer/Store 后端
+3. **我的记忆在哪？** — Checkpointer / Store / conversation_archive 的存储位置
 
 ### 使用场景
 
 | 场景 | 行为 |
-|------|------|
+|---|---|
 | **首次启动** | manifest 不存在 → 创建主 Agent → 写入 manifest |
-| **正常重启** | 读取 manifest → 从 checkpoint 恢复 Plan Graph → 加载 MemGPT |
-| **服务器迁移** | 复制数据目录 → manifest 中的路径指向新位置 → 启动 |
+| **正常重启** | 读 manifest → `graph.compile(checkpointer=, store=)` → 按 thread_id 自动 resume |
+| **服务器迁移** | 复制 SQLite + ChromaDB 数据目录 + manifest → 启动 |
 | **多 Agent 扩展** | manifest 目录下新增 agent-002.json, agent-003.json |
 
 ---
 
-## 2. Manifest 结构
+## §2 Manifest 结构
 
-### 完整 Schema
+### §2.1 完整 Schema（v2.0）
 
 ```json
 {
-  "manifest_version": "1.0",
+  "manifest_version": "2.0",
   "agent": {
     "agent_id": "agent-001",
     "type": "main",
     "display_name": "我的科研助理",
-    "created_at": "2026-06-16T08:00:00Z",
-    "updated_at": "2026-06-16T15:30:00Z",
+    "created_at": "2026-06-25T08:00:00Z",
+    "updated_at": "2026-06-25T15:30:00Z",
     "status": "active"
   },
   "owner": {
     "user_id": "user-default",
-    "bound_since": "2026-06-16T08:00:00Z"
+    "bound_since": "2026-06-25T08:00:00Z"
   },
   "runtime": {
     "main_agent": {
-      "module": "paper_search.agent.main_agent",
-      "class": "MainAgent",
-      "nodes": ["safety_filter", "intent_classify", "scenario_plan", "inline_reply", "execute_plan", "evaluate_completion"]
+      "module": "paper_search.agent.graphs.main_graph",
+      "build_func": "build_main_graph",
+      "nodes": [
+        "safety_regex_guard",
+        "intent_classify",
+        "inline_reply",
+        "maybe_clarify",
+        "scenario_plan",
+        "execute_plan",
+        "evaluate_completion"
+      ],
+      "iteration_limit": 8,
+      "ask_user_limit": 2
     },
-    "event_source": {
-      "backend": "sqlite",
-      "path": "~/.paper_search/agent.db",
-      "table": "agent_events"
+    "checkpointer": {
+      "backend": "async_sqlite",
+      "conn_path": "~/.paper_search/agent.db",
+      "tables": ["checkpoints", "checkpoint_blobs", "checkpoint_writes"]
+    },
+    "store": {
+      "backend": "dual",
+      "sqlite_path": "~/.paper_search/agent.db",
+      "chroma_path": "~/.paper_search/chroma",
+      "namespace_routes": {
+        "preferences":  "sqlite",
+        "profile":      "sqlite",
+        "strategies":   "sqlite",
+        "errors":       "sqlite",
+        "episodes":     "chromadb",
+        "topics":       "chromadb",
+        "knowledge":    "chromadb"
+      }
     },
     "outbox": {
       "backend": "redis",
@@ -61,35 +87,37 @@
     "llm": {
       "provider": "volcano",
       "model": "deepseek-v4-pro",
-      "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3"
+      "base_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+      "force_tool_choice": true,
+      "enable_prompt_caching": true
     }
   },
   "memory": {
-    "short_term": {
-      "max_tokens": 16000
-    },
-    "mid_term": {
-      "db_path": "~/.paper_search/agent.db",
-      "tables": {
-        "checkpoints": "task_checkpoints",
-        "tasks": "agent_tasks",
-        "steps": "task_steps"
-      }
+    "message_window": {
+      "trim_max_tokens": 8000,
+      "trim_keep_last": 10,
+      "summary_trigger_count": 30,
+      "summary_trigger_tokens": 16000,
+      "summary_keep_recent": 10,
+      "summary_batch_max": 100
     },
     "long_term": {
-      "chroma_path": "~/.paper_search/chroma",
-      "collections": [
-        "papers_abstract",
-        "papers_fulltext",
-        "agent_conversations",
-        "agent_knowledge",
-        "agent_expressions",
-        "agent_learnings"
-      ],
-      "sqlite_tables": ["knowledge_entries", "user_profile", "daily_expressions"]
+      "lookback_days": 7,
+      "consolidate_beat_cron": "0 3 * * *",
+      "namespaces": [
+        "(agent_id, 'preferences')",
+        "(agent_id, 'profile')",
+        "(agent_id, 'episodes', session_id)",
+        "(agent_id, 'topics', topic_slug)",
+        "(agent_id, 'strategies')",
+        "(agent_id, 'errors')",
+        "(agent_id, 'knowledge', 'papers')",
+        "(agent_id, 'knowledge', 'chunks')"
+      ]
     },
-    "meta_memory": {
-      "sqlite_tables": ["strategy_log", "error_patterns", "user_preferences"]
+    "archive": {
+      "table": "conversation_archive",
+      "retention_days": null
     }
   },
   "sessions": {
@@ -100,7 +128,13 @@
   "sub_agents": {
     "registry_table": "agent_registry",
     "active": [
-      {"type": "IngestAgent", "task_id": "task-20260616-001", "stage": "download", "progress": "12/22"}
+      {
+        "type": "IngestAgent",
+        "task_id": "task-20260625-001",
+        "stage": "download",
+        "progress": "12/22",
+        "ingest_params": {"task_kind": "screening", "keywords": ["transformer"]}
+      }
     ]
   },
   "data": {
@@ -119,81 +153,97 @@
 }
 ```
 
-### 字段说明
+### §2.2 字段说明
 
-| 路径 | 类型 | 说明 |
-|------|------|------|
-### 默认值（MVP 写死）
+**runtime.checkpointer** — 短期记忆持久化后端
 
-| 字段 | 默认值 | 说明 |
-|------|--------|------|
-| `agent.agent_id` | `"agent-001"` | MVP 单 Agent |
-| `agent.display_name` | `"我的科研助理"` | iOS 对话列表展示 |
-| `owner.user_id` | `"user-default"` | MVP 单用户 |
-| `sessions.default` | `"main"` | 默认会话 |
-| `sessions.active[0]` | `"main"` | 首次创建 |
-| main session 标题 | `"新对话"` | 第一条消息后 LLM 自动更新 |
+| 字段 | 说明 |
+|---|---|
+| `backend` | `async_sqlite` 单一支持；未来可扩展 `postgres` |
+| `conn_path` | SQLite 文件路径，与业务表同库 |
+| `tables` | LangGraph 标准 3 张表（自动创建） |
 
-| 路径 | 类型 | 说明 |
-|------|------|------|
-| `manifest_version` | string | Manifest 格式版本，用于向前兼容 |
-| `agent.agent_id` | string | 全局唯一。格式: `agent-{序号}`。MVP = `agent-001` |
-| `agent.type` | string | `main` = 主 Agent（用户对话入口）。MVP = `main` |
-| `agent.status` | string | `active` / `paused` / `archived` |
-| `owner.user_id` | string | 绑定用户。MVP = `user-default` |
-| `runtime.plan_graph.thread_id` | string | LangGraph checkpoint 的 thread_id，重启恢复用 |
-| `runtime.checkpoint.backend` | string | 当前仅 `sqlite`。未来可扩展 `postgres` |
-| `runtime.llm` | object | 该 Agent 绑定的 LLM 配置（可不同于系统默认） |
-| `memory.*` | object | 4 层记忆的存储位置。启动时 MemoryManager 据此加载 |
-| `sessions` | object | 该 Agent 的所有 session。`default` = 新建对话时的默认 session |
-| `sub_agents` | object | 活跃的子 Agent 列表。从 `agent_registry` 表同步 |
-| `migration.compatible_agent_versions` | array | 哪些代码版本兼容此 manifest |
+**runtime.store** — 长期记忆双后端
 
+| 字段 | 说明 |
+|---|---|
+| `backend` | `dual` 表示 SQLite + ChromaDB 路由；`sqlite` / `chroma` 单后端调试用 |
+| `namespace_routes` | namespace 第二层 kind → 后端的映射表（详见 [memory-system.md 附录 C](memory-system.md)） |
+
+**runtime.llm**
+
+| 字段 | 新增于 v2.0 | 说明 |
+|---|:---:|---|
+| `force_tool_choice` | ✓ | 是否强制 Anthropic `tool_choice` 硬约束（修复缺失） |
+| `enable_prompt_caching` | ✓ | 是否启用 `cache_control: ephemeral`（user profile + prefs + summary） |
+
+**memory.message_window** — 三档压缩参数（详见 [memory-system.md §3](memory-system.md)）
+
+**memory.long_term** — 长期抽取调度
+
+**memory.archive** — 摘要后归档表
+
+### §2.3 默认值（MVP 写死）
+
+| 字段 | 默认值 |
+|---|---|
+| `agent.agent_id` | `"agent-001"` |
+| `agent.display_name` | `"我的科研助理"` |
+| `owner.user_id` | `"user-default"` |
+| `sessions.default` | `"main"` |
+| main session 标题 | `"新对话"` |
 
 ---
 
-## 3. 启动协议
+## §3 启动协议
 
-### 3.1 启动流程
+### §3.1 启动流程（v2.0）
 
 ```
 系统启动 (daemon.py)
   │
   ├── 1. 扫描 data_dir / agent_manifest.json
-  │     ├── 存在 → 进入恢复流程
-  │     └── 不存在 → 进入创建流程
+  │     ├── 存在 → 恢复流程
+  │     └── 不存在 → 创建流程
   │
   ├── 2. 恢复流程:
   │     ① 读取 manifest → 验证 manifest_version 兼容
   │     ② 初始化 runtime 组件:
-  │        ├── AgentDB (manifest.memory.mid_term.db_path)
-  │        ├── ChromaStoreV2 (manifest.memory.long_term.chroma_path)
+  │        ├── AgentDB (manifest.runtime.checkpointer.conn_path)
+  │        ├── AsyncSqliteSaver checkpointer (同库)
+  │        ├── DualBackendStore (sqlite_store + chroma_store)
   │        ├── LLM 客户端 (manifest.runtime.llm)
-  │        ├── Redis outbox + 入站队列 (manifest.runtime.outbox)
+  │        ├── Redis outbox + 入站队列
   │        └── Celery (复用 Redis broker)
-  │     ③ 创建 MemoryManager → 加载 4 层记忆
-  │     ④ 创建 MainAgent → 6 节点显式状态机（含 safety 前置）
-  │        ├── 调 _recover_pending_turns 扫 agent_events 表
-  │        ├── 对未完成的 correlation_id 做 _replay → _resume_from_state
-  │        └── waiting_for=clarification/approval 的轮次推 high 提醒
-  │     ⑤ 启动 outbox_poller (每个 agent_id 一个协程)
-  │     ⑥ 启动 FastAPI + WebSocket
-  │     ⑦ 标记 agent.status = "active"
+  │     ③ build_main_graph().compile(checkpointer=, store=)
+  │        ├── 注入 force_tool_choice / enable_prompt_caching
+  │        ├── iteration_limit / ask_user_limit 校验
+  │        └── interrupt_before 配置（如启用审批断点）
+  │     ④ 启动 outbox_poller (每个 agent_id 一个协程)
+  │     ⑤ 启动 FastAPI + WebSocket
+  │     ⑥ 标记 agent.status = "active"
+  │     ⑦ 已有 thread 的 resume：
+  │        for session_id in active_sessions:
+  │            config = {"configurable": {"thread_id": session_id}}
+  │            state = await graph.aget_state(config)
+  │            if state.next:
+  │                # 自动从 Checkpointer 续上，无需自研 _replay
+  │                ...
   │
   └── 3. 创建流程 (首次启动):
         ① 生成 agent_id = "agent-001"
         ② 选择 LLM 配置 (从环境变量)
-        ③ 初始化空白数据库 (AgentDB schema)
-        ④ 初始化空白 ChromaDB (创建 collections)
-        ⑤ 初始化空白 MemoryManager
-        ⑥ 编译 LangGraph Plan Graph (无 checkpoint，冷启动)
-        ⑦ 注册 Celery tasks
+        ③ 初始化 AgentDB schema (含 langgraph 标准 3 表 + conversation_archive)
+        ④ 初始化 ChromaDB collections (knowledge/episodes/topics)
+        ⑤ 初始化 Store 8 个 namespace
+        ⑥ build_main_graph().compile()
+        ⑦ 注册 Celery tasks（含 consolidate_long_term Beat）
         ⑧ 写入 agent_manifest.json
         ⑨ 启动 FastAPI + WebSocket
-        ⑩ Agent 发送欢迎消息: "你好，我是你的科研助理。我可以帮你搜索论文、管理文献、生成综述。"
+        ⑩ Agent 发送欢迎消息
 ```
 
-### 3.2 伪代码
+### §3.2 伪代码
 
 ```python
 async def bootstrap(data_dir: Path) -> AgentManifest:
@@ -211,66 +261,56 @@ async def bootstrap(data_dir: Path) -> AgentManifest:
 
 
 async def resume_agent(m: AgentManifest):
-    # Step 1: 加载数据库
-    db = AgentDB(m.data.db_path)
+    # Step 1: 加载数据库 + Checkpointer
+    db = AgentDB(m.runtime.checkpointer.conn_path)
+    checkpointer = AsyncSqliteSaver(conn=db.conn)
     
-    # Step 2: 加载 ChromaDB
-    chroma = ChromaStoreV2(m.data.chroma_path)
+    # Step 2: 加载 Store 双后端
+    sqlite_store = SqliteStore(db.conn)
+    chroma_store = ChromaStore(m.runtime.store.chroma_path)
+    store = DualBackendStore(sqlite_store, chroma_store)
     
     # Step 3: 加载 LLM
     llm = VolcanoChatModel(
         model=m.runtime.llm.model,
-        base_url=m.runtime.llm.base_url
+        base_url=m.runtime.llm.base_url,
+        force_tool_choice=m.runtime.llm.force_tool_choice,
+        enable_prompt_caching=m.runtime.llm.enable_prompt_caching,
     )
     
-    # Step 4: 加载记忆
-    memory = MemoryManager(db, chroma)
-    memory.short_term.max_tokens = m.memory.short_term.max_tokens
+    # Step 4: 编译 main graph
+    from paper_search.agent.graphs.main_graph import build_main_graph
+    builder = build_main_graph(llm, store)
+    graph = builder.compile(checkpointer=checkpointer, store=store)
     
-    # Step 5: 编译 Plan Graph
-    plan_graph = PlanGraph(llm, memory, db, chroma)
-    checkpointer = SqliteSaver.from_conn_string(m.runtime.checkpoint.path)
-    graph = plan_graph.compile(checkpointer=checkpointer)
+    # Step 5: 启动外围
+    await start_outbox_poller(m.agent.agent_id)
     
-    # Step 6: 从 checkpoint 恢复
-    state = await graph.aget_state(config={
-        "configurable": {"thread_id": m.runtime.plan_graph.thread_id}
-    })
-    
-    # Step 7: 恢复子 Agent
-    active_subs = db.list_active_agents()
-    for sub in active_subs:
-        await restore_sub_agent(sub, db, llm, chroma)
-    
-    # Step 8: 标记活跃
+    # Step 6: 标记活跃
     m.agent.status = "active"
     m.agent.updated_at = datetime.utcnow().isoformat()
     m.save()
     
-    return m, graph, state
+    return m, graph
 
 
 async def create_main_agent(data_dir: Path):
-    agent_id = "agent-001"          # MVP 写死
+    agent_id = "agent-001"
     
     m = AgentManifest(
-        manifest_version="1.0",
+        manifest_version="2.0",
         agent=AgentInfo(
             agent_id=agent_id,
             type="main",
             display_name="我的科研助理",
             created_at=datetime.utcnow().isoformat(),
-            status="active"
+            status="active",
         ),
-        sessions=SessionsInfo(
-            default="main",
-            active=["main"],
-            archived=[]
-        ),
-        ...
+        sessions=SessionsInfo(default="main", active=["main"], archived=[]),
+        # ... 其余字段按 §2.1 schema 填默认值
     )
     
-    # 初始化所有数据库表
+    # 初始化 AgentDB（含 langgraph 标准表 + conversation_archive）
     db = AgentDB(data_dir / "agent.db")
     db.initialize_schema()
     
@@ -278,14 +318,14 @@ async def create_main_agent(data_dir: Path):
     db.create_session(
         session_id="main",
         agent_id="main",
-        title="新对话",         # ← 第一条消息后 LLM 更新
-        created_at=datetime.utcnow().isoformat()
+        title="新对话",
+        created_at=datetime.utcnow().isoformat(),
     )
     
     # 初始化 ChromaDB collections
-    chroma = ChromaStoreV2(data_dir / "chroma")
-    for col in m.memory.long_term.collections:
-        chroma.get_or_create_collection(col)
+    chroma_path = data_dir / "chroma"
+    for col in ["knowledge_papers", "knowledge_chunks", "episodes", "topics"]:
+        ChromaStore(chroma_path).get_or_create_collection(col)
     
     m.save(data_dir / "agent_manifest.json")
     return m
@@ -293,7 +333,7 @@ async def create_main_agent(data_dir: Path):
 
 ---
 
-## 4. 迁移协议
+## §4 迁移协议
 
 ```
 源服务器                        目标服务器
@@ -303,8 +343,8 @@ async def create_main_agent(data_dir: Path):
    
 2. 打包数据目录:
    tar -czf agent-001.tar.gz \
-     ~/.paper_search/          \   # agent.db + chroma/ + logs/ + manifest
-     ~/papers/                    # PDF + Markdown
+     ~/.paper_search/          \   # agent.db (含 Checkpointer 标准表) + chroma/ + logs/ + manifest
+     ~/papers/                     # PDF + Markdown
 
 3. 传输: scp agent-001.tar.gz target:~
 
@@ -315,22 +355,23 @@ async def create_main_agent(data_dir: Path):
    python -m paper_search.agent.daemon
    
 6. Agent 读取 manifest →
-   验证 data.base_dir 是否存在 →
-   初始化组件 →
-   从 checkpoint 恢复 →
+   验证 manifest_version=2.0 →
+   build_main_graph().compile(checkpointer=, store=) →
+   按 sessions.active 中的 thread_id 调 graph.aget_state →
+   有 state.next 的自动续上 →
    标记 status = "active" →
    就绪
 
 注意:
-  - manifest 中的路径如有变化，需手动修改或通过环境变量覆盖
-  - Redis 事件队列中的消息不迁移（接受丢失）
+  - manifest 中的路径如有变化，需手动改或通过环境变量覆盖
+  - Redis 事件队列中的消息不迁移（接受丢失，由 outbox 持久化兜底）
   - ChromaDB 的 embedding function 需一致（或重建索引）
-  - 迁移后第一次查询时验证 ChromaDB 集合完整性
+  - Checkpointer 标准表迁移后立即可用，无需重建
 ```
 
 ---
 
-## 5. 文件位置
+## §5 文件位置
 
 ```
 ~/.paper_search/
@@ -338,8 +379,8 @@ async def create_main_agent(data_dir: Path):
 ├── manifests/                # 未来多 Agent 扩展
 │   ├── agent-001.json
 │   └── agent-002.json
-├── agent.db                 # SQLite
-├── chroma/                  # ChromaDB
+├── agent.db                  # SQLite (业务表 + Checkpointer 标准 3 表 + conversation_archive)
+├── chroma/                   # ChromaDB (knowledge/episodes/topics 集合)
 └── logs/
     ├── agent.log
     └── tasks/
@@ -347,4 +388,18 @@ async def create_main_agent(data_dir: Path):
 
 ---
 
-> 版本: v1.0 | 2026-06-16
+## §6 v1 → v2 字段迁移对照
+
+| v1 字段 | v2 字段 | 说明 |
+|---|---|---|
+| `runtime.event_source` | `runtime.checkpointer` | 事件源 → Checkpointer history |
+| `runtime.plan_graph.thread_id` | `sessions.active[*]` | thread_id 由 session_id 直接对应 |
+| `memory.short_term.max_tokens` | `memory.message_window.summary_trigger_tokens` | 改为档 2 触发阈值 |
+| `memory.mid_term.tables` | （废弃） | task_checkpoints 不再是记忆层 |
+| `memory.long_term.collections` | `memory.long_term.namespaces` | 改用 Store namespace 表示 |
+| `memory.long_term.sqlite_tables` | （并入 namespace_routes） | knowledge_entries 等并入 Store SQLite 后端 |
+| `memory.meta_memory.sqlite_tables` | `memory.long_term.namespaces` 中 preferences/strategies/errors | 全归 Store |
+
+---
+
+> 版本: v2.0 | 2026-06-25 | 配套 [memory-system.md](memory-system.md) + [main-agent.md](main-agent.md) v2.0

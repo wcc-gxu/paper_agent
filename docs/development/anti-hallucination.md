@@ -169,9 +169,10 @@ LLM 调用 + 检索 + 生成 markdown 草稿
 | L1.1 | 全部决策走 JSON Schema | ✅ | 保持 |
 | L1.2 | 低温度 (intent=0.1, plan=0.2, eval=0.2) | ✅ | 保持 |
 | L1.3 | 置信度门控 + ask_user（C3） | ✅ | 保持 |
-| L1.4 | **新增**：在 `EvaluateCompletionResult` 加 `truth_confidence: float` 字段 | ❌ | 评估器除了判 `satisfied` 还要判"输出的事实可信度"，<0.6 时强制走 verify 节点 |
+| L1.4 | **新增**：`EvaluateCompletionResult` 扩展为 5 出口 `next_action` + `truth_confidence: float` 字段（见 [memory-system.md 附录 B](memory-system.md) / [main-agent.md §4.7](main-agent.md)） | ❌ | 评估器除了判 `satisfied` 还要判"输出的事实可信度"，<0.6 时强制走 verify 节点；`next_action ∈ {done, retry_tools, ask_user, replan, fail}` |
 | L1.5 | **新增**：`ScenarioPlanResult.requires_verification: bool` 字段 | ❌ | LLM 自报"本场景产物需进 verify 节点"（综述/RAG 答案/wiki/extract 必须 true） |
-| L1.6 | **fail-closed 修复**：[_node_evaluate_completion](src/paper_search/agent/main_agent.py#L1015) 异常时返回 `satisfied=False, reasoning="评估失败需重试"` 而非当前的 "按已完成处理" | ❌ | 改 1 行 except 分支 |
+| L1.6 | **fail-closed 修复**：[_node_evaluate_completion](src/paper_search/agent/main_agent.py#L1015) 异常时返回 `satisfied=False, next_action="fail", reasoning="评估失败需重试"` 而非当前的 "按已完成处理" | ❌ | 改 1 行 except 分支 |
+| L1.7 | **新增**：`llm_client_v2._chat_once` 加 `tool_choice` 强制（Anthropic 协议 JSON Schema 硬约束） | ❌ | 当前缺失，结构化输出可靠性 ~90-95%；修复后 ≥99%（见 [memory-system.md §6.3](memory-system.md)） |
 
 ### 4.3 Layer 2 — 检索层
 
@@ -227,7 +228,7 @@ LLM 调用 + 检索 + 生成 markdown 草稿
 |---|---|:---:|---|
 | L6.1 | 所有 LLM judge **fail-closed** | ❌ 三处 fail-open | 改 3 个 except 分支 |
 | L6.2 | `"unknown"` 是合法返回，不应规避 | ❌ | schema 允许 `Optional` 或专门 enum |
-| L6.3 | 反幻觉 telemetry 表 `hallucination_events` | ❌ | 见 §8 |
+| L6.3 | 反幻觉 telemetry 表 `hallucination_events` | ❌ | 见 §8。**与 LangGraph Checkpointer history 互补**：前者是反幻觉专用事件（citation_verify / external_validate / groundedness / hallucination_review 的 verdict），后者是 graph state 快照（见 [memory-system.md §8 + 附录 E](memory-system.md)） |
 | L6.4 | 每条 user-facing 输出有 `truthfulness_metadata` | ❌ | 见 §7 |
 | L6.5 | KPI dashboard（见 §10） | ❌ | 引用准确率 / 拒答率 / 校验失败率 |
 
@@ -288,16 +289,18 @@ REFUSAL_TEMPLATES = {
 
 ## 六、编排扩展（MainAgent 节点）
 
+> **配套阅读**：MainAgent v2.0 已重写为 LangGraph StateGraph 6 节点（见 [main-agent.md](main-agent.md)），`evaluate_completion` 扩展为 5 出口 `next_action`。本节描述的 `[5] output_verify` 节点作为 StateGraph 中 `evaluate_completion → publish` 之间的额外验证节点接入。
+
 ### 6.1 新增节点 `[5] output_verify`
 
 在 `evaluate_completion` **之后**、user-facing publish **之前**插入验证节点：
 
 ```
-... existing 6 nodes ...
+... existing StateGraph nodes ...
    ↓
-[4] evaluate_completion
+[4] evaluate_completion (next_action ∈ {done, retry_tools, ask_user, replan, fail})
    ↓
-   plan.requires_verification?
+   next_action == "done" AND plan.requires_verification?
    ├─ no  → 直接 publish (chat/简单工具结果)
    └─ yes → [5] output_verify (新增)
                 ↓
