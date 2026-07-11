@@ -1,4 +1,7 @@
-"""REST API 路由 — Paper Agent 全部端点."""
+"""REST API 路由 — Paper Agent 全部端点.
+
+v3 Phase 1: 所有端点增加 user_id 注入（多用户支持）。
+"""
 
 from __future__ import annotations
 
@@ -8,13 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..config import get_papers_dir, get_markdown_dir, get_outputs_dir
+from .auth import verify_api_key
 
 router = APIRouter(prefix="/api", tags=["paper-agent"])
+_DEFAULT_USER = "anonymous"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -125,7 +130,7 @@ async def list_sources():
 # ═══════════════════════════════════════════════════════════════
 
 @router.post("/search")
-async def search_papers(req: SearchRequest):
+async def search_papers(req: SearchRequest, user_id: str = Depends(verify_api_key)):
     """跨多源搜索学术论文."""
     from ..models import SearchQuery, SourceType
 
@@ -183,6 +188,7 @@ async def list_papers(
     project_id: Optional[str] = None,
     relevant_only: bool = False,
     limit: int = 50,
+    user_id: str = Depends(verify_api_key),
 ):
     """列出论文."""
     db = _get_db()
@@ -197,7 +203,7 @@ async def list_papers(
 
 
 @router.get("/papers/{paper_id}")
-async def get_paper(paper_id: str):
+async def get_paper(paper_id: str, user_id: str = Depends(verify_api_key)):
     """获取单篇论文详情."""
     db = _get_db()
     row = db.conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
@@ -207,7 +213,7 @@ async def get_paper(paper_id: str):
 
 
 @router.post("/papers/upload")
-async def upload_paper(file: UploadFile = File(...), project_id: Optional[str] = None):
+async def upload_paper(file: UploadFile = File(...), project_id: Optional[str] = None, user_id: str = Depends(verify_api_key)):
     """上传本地 PDF 论文."""
     if not file.filename or not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -255,7 +261,7 @@ async def upload_paper(file: UploadFile = File(...), project_id: Optional[str] =
 # ═══════════════════════════════════════════════════════════════
 
 @router.post("/knowledge/ask")
-async def knowledge_ask(req: KnowledgeQuestion):
+async def knowledge_ask(req: KnowledgeQuestion, user_id: str = Depends(verify_api_key)):
     """知识库 RAG 问答."""
     kb = _get_kb()
     result = await kb.ask(
@@ -278,6 +284,7 @@ async def knowledge_search(
     q: str = Query(..., description="搜索查询"),
     top_k: int = 5,
     project_id: Optional[str] = None,
+    user_id: str = Depends(verify_api_key),
 ):
     """知识库语义搜索."""
     kb = _get_kb()
@@ -286,7 +293,7 @@ async def knowledge_search(
 
 
 @router.post("/knowledge/extract/{paper_id}")
-async def knowledge_extract(paper_id: str, deep: bool = False):
+async def knowledge_extract(paper_id: str, deep: bool = False, user_id: str = Depends(verify_api_key)):
     """提取论文结构化知识."""
     kb = _get_kb()
     result = await kb.extract_knowledge(paper_id, deep=deep)
@@ -297,6 +304,7 @@ async def knowledge_extract(paper_id: str, deep: bool = False):
 async def knowledge_discover(
     domain: str = "",
     project_id: Optional[str] = None,
+    user_id: str = Depends(verify_api_key),
 ):
     """知识发现 — 研究空白、矛盾、趋势."""
     kb = _get_kb()
@@ -305,7 +313,7 @@ async def knowledge_discover(
 
 
 @router.get("/knowledge/related/{paper_id}")
-async def knowledge_related(paper_id: str, top_k: int = 10):
+async def knowledge_related(paper_id: str, top_k: int = 10, user_id: str = Depends(verify_api_key)):
     """发现相关论文."""
     kb = _get_kb()
     result = await kb.find_related(paper_id, top_k=top_k)
@@ -317,7 +325,7 @@ async def knowledge_related(paper_id: str, top_k: int = 10):
 # ═══════════════════════════════════════════════════════════════
 
 @router.post("/tasks")
-async def create_task(query: str = Query(..., description="研究需求")):
+async def create_task(query: str = Query(..., description="研究需求"), user_id: str = Depends(verify_api_key)):
     """创建 Agent 任务。返回 task_id，可通过 WS 或 REST 触发执行。"""
     import uuid as _uuid
     db = _get_db()
@@ -327,7 +335,7 @@ async def create_task(query: str = Query(..., description="研究需求")):
 
 
 @router.post("/tasks/{task_id}/confirm")
-async def confirm_task(task_id: str, req: PlanConfirmRequest):
+async def confirm_task(task_id: str, req: PlanConfirmRequest, user_id: str = Depends(verify_api_key)):
     """确认任务方案 — 更新 plan 状态，触发执行。"""
     db = _get_db()
     task = db.get_agent_task(task_id)
@@ -342,7 +350,7 @@ async def confirm_task(task_id: str, req: PlanConfirmRequest):
 
 
 @router.post("/tasks/{task_id}/pause")
-async def pause_task(task_id: str):
+async def pause_task(task_id: str, user_id: str = Depends(verify_api_key)):
     """暂停任务 — 当前阶段完成后暂停。"""
     db = _get_db()
     task = db.get_agent_task(task_id)
@@ -353,7 +361,7 @@ async def pause_task(task_id: str):
 
 
 @router.post("/tasks/{task_id}/resume")
-async def resume_task(task_id: str):
+async def resume_task(task_id: str, user_id: str = Depends(verify_api_key)):
     """恢复已暂停的任务。"""
     db = _get_db()
     task = db.get_agent_task(task_id)
@@ -364,7 +372,7 @@ async def resume_task(task_id: str):
 
 
 @router.delete("/tasks/{task_id}")
-async def cancel_task(task_id: str):
+async def cancel_task(task_id: str, user_id: str = Depends(verify_api_key)):
     """取消任务。"""
     db = _get_db()
     task = db.get_agent_task(task_id)
@@ -388,7 +396,7 @@ class IngestRequest(BaseModel):
 
 
 @router.post("/ingest/start")
-async def start_ingest(req: IngestRequest):
+async def start_ingest(req: IngestRequest, user_id: str = Depends(verify_api_key)):
     """触发 IngestAgent.ExecuteGraph() → 后台执行，返回 task_id 用于查询进度。"""
     import uuid as _uuid
     db = _get_db()
@@ -464,7 +472,7 @@ async def _run_ingest(task_id: str, project_id: str, user_query: str,
 
 
 @router.get("/ingest/progress/{task_id}")
-async def ingest_progress(task_id: str):
+async def ingest_progress(task_id: str, user_id: str = Depends(verify_api_key)):
     """查询入库进度（读取 task.jsonl 日志）。"""
     from pathlib import Path
     from ..agent.task_logger import TaskLogger
@@ -487,14 +495,14 @@ async def ingest_progress(task_id: str):
 # ═══════════════════════════════════════════════════════════════
 
 @router.get("/projects")
-async def list_projects(limit: int = 20):
+async def list_projects(limit: int = 20, user_id: str = Depends(verify_api_key)):
     db = _get_db()
     projects = db.list_projects(limit=limit)
     return {"total": len(projects), "projects": projects}
 
 
 @router.get("/projects/{project_id}")
-async def get_project(project_id: str):
+async def get_project(project_id: str, user_id: str = Depends(verify_api_key)):
     db = _get_db()
     project = db.get_project(project_id)
     if project is None:
@@ -504,7 +512,7 @@ async def get_project(project_id: str):
 
 
 @router.delete("/projects/{project_id}")
-async def delete_project(project_id: str, keep_pdfs: bool = True):
+async def delete_project(project_id: str, keep_pdfs: bool = True, user_id: str = Depends(verify_api_key)):
     db = _get_db()
     if keep_pdfs:
         db.conn.execute("DELETE FROM project_papers WHERE project_id = ?", (project_id,))
@@ -525,7 +533,7 @@ async def delete_project(project_id: str, keep_pdfs: bool = True):
 
 
 @router.get("/projects/{project_id}/export")
-async def export_project(project_id: str, format: str = "bibtex"):
+async def export_project(project_id: str, format: str = "bibtex", user_id: str = Depends(verify_api_key)):
     """导出项目论文."""
     db = _get_db()
     papers = db.get_project_papers(project_id)
@@ -565,7 +573,7 @@ async def export_project(project_id: str, format: str = "bibtex"):
 
 
 @router.get("/subscriptions")
-async def list_subscriptions():
+async def list_subscriptions(user_id: str = Depends(verify_api_key)):
     """列出所有订阅。"""
     db = _get_db()
     subs = db.list_subscriptions()
@@ -573,7 +581,7 @@ async def list_subscriptions():
 
 
 @router.post("/subscriptions")
-async def create_subscription(req: SubscriptionRequest):
+async def create_subscription(req: SubscriptionRequest, user_id: str = Depends(verify_api_key)):
     """创建研究方向订阅。"""
     db = _get_db()
     sub_id = db.create_subscription(
@@ -587,7 +595,7 @@ async def create_subscription(req: SubscriptionRequest):
 
 
 @router.delete("/subscriptions/{subscription_id}")
-async def delete_subscription(subscription_id: str):
+async def delete_subscription(subscription_id: str, user_id: str = Depends(verify_api_key)):
     """删除订阅及其所有推送结果。"""
     db = _get_db()
     sub = db.get_subscription(subscription_id)
@@ -602,6 +610,7 @@ async def list_subscription_results(
     subscription_id: str,
     since: Optional[str] = Query(None, description="起始时间 (ISO format)"),
     limit: int = Query(50, le=200),
+    user_id: str = Depends(verify_api_key),
 ):
     """获取订阅的推送历史。"""
     db = _get_db()
@@ -618,7 +627,7 @@ async def list_subscription_results(
 
 
 @router.post("/subscriptions/{subscription_id}/check")
-async def trigger_subscription_check(subscription_id: str):
+async def trigger_subscription_check(subscription_id: str, user_id: str = Depends(verify_api_key)):
     """手动触发一次订阅检查（通过 Celery 异步执行）。"""
     from ..agent.celery_tasks import subscription_check_task
 
@@ -642,7 +651,7 @@ async def trigger_subscription_check(subscription_id: str):
 
 
 @router.post("/devices/register")
-async def register_device(req: DeviceRegisterRequest):
+async def register_device(req: DeviceRegisterRequest, user_id: str = Depends(verify_api_key)):
     """注册 iOS 设备 token 用于 APNs 推送 (Phase 1 骨架)。
 
     iOS 启动时获得 device_token 后调用此端点。
@@ -669,7 +678,7 @@ async def register_device(req: DeviceRegisterRequest):
 
 
 @router.get("/devices/{agent_id}")
-async def list_devices(agent_id: str):
+async def list_devices(agent_id: str, user_id: str = Depends(verify_api_key)):
     """列出某 agent 的活跃设备 token (调试用)。"""
     db = _get_db()
     tokens = db.get_active_device_tokens(agent_id)

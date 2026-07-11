@@ -37,7 +37,7 @@
 | 数据库 | PostgreSQL + pgvector | 16+ / 0.8+ |
 | 缓存/队列 | Redis | 7+ |
 | 异步任务 | Celery + Redis broker | 5.4+ |
-| Agent 框架 | LangGraph | 0.2+ |
+| Agent 框架 | LangGraph | >=0.6 |
 | WebSocket | FastAPI + websockets | 0.115+ |
 | LLM | doubao / 火山引擎 API | — |
 

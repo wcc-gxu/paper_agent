@@ -218,19 +218,26 @@ graph.aget_state(config={"configurable": {"thread_id": session_id}})
 
 **v1 → v2 变化**：废弃 `agent_events` 表 + `_replay` + `_resume_from_state`，改用 Checkpointer 标准 history（3 张 langgraph 表 `checkpoints` / `checkpoint_blobs` / `checkpoint_writes`，与业务表同库）。反幻觉专用 telemetry 表 `hallucination_events` 保留作为项目级审计（[anti-hallucination.md §8.1](docs/development/anti-hallucination.md)），与 Checkpointer history 互补。
 
-### 7 个子 Agent（被 MainAgent 通过 `kind=sub_agent` 调度）
+### 7 个子 Agent（v3 目标架构，Phase 2 实现）
+
+当前代码层实际为 5 个 graph（见下方项目结构），v3 重构后目标为 7 个 Agent：
 
 ```
-IngestAgent (graphs/ingest_graph.py)         search→evaluate→download→convert→index→rank→[verify]→survey
-RADQueryAgent (graphs/rad_query_graph.py)    parse→route→search→evaluate(refine)→format
-ClusteringAgent (graphs/clustering_graph.py)  load→cluster→label→visualize→detect
-CitationChaseAgent (graphs/citation_chase_graph.py) resolve→check→fetch→filter→ingest→decide(loop)→summarize
-HistoryAgent (graphs/history_graph.py)        analyze→generate_plan→archive→merge→skip→notify
-TranslationAgent (graphs/translation_graph.py) route→translate|build|enrich
-VideoAgent (graphs/video_graph.py)            parse_link→fetch_metadata→download→extract_audio→transcribe→summarize→analyze→notify
+Literature Agent (graphs/literature_graph.py)   search→evaluate→download→convert→extract_metadata  [v3 新建，从 ingest_graph 拆分]
+Knowledge Agent (graphs/knowledge_graph.py)     chunk→embed→dedup→rag_query                        [v3 新建，从 ingest_graph 拆分 + 整合 rad_query_graph]
+Research Agent  (graphs/clustering_graph.py + citation_chase_graph.py)  cluster→label→detect + resolve→fetch→filter→summarize
+Writing Agent   (graphs/writing_graph.py)       survey→template→citation_check→ai_flavor_check      [v3 新建]
+Capture Agent   (graphs/video_graph.py 为其 tool) parse_link→download→transcribe→summarize           [v3 改名，原 Memory Agent]
+Translation Agent (graphs/translation_graph.py) route→translate|build|enrich                        [保留]
+Glossary Sub-Agent (graphs/glossary_graph.py)   collect→search→verify→evolve                         [v3 新增]
 ```
 
-每个子 Agent 在收尾时调 `reporter.publish_lifecycle(task_id, "agent_done"|"agent_failed", ...)`，主 Agent 据此判定真正完成（解决了 v2 误把 per-paper status=done 当作 agent 完成的 P0 Bug）。
+**v3 废弃/合并**：
+- `ingest_graph.py` → 拆分为 Literature Agent + Knowledge Agent（Phase 2）
+- `rad_query_graph.py` → 并入 Knowledge Agent 的 rag_query 节点（Phase 2）
+- `history_graph.py` → 并入 Store episodes namespace（Phase 2）
+- `video_graph.py` → 降级为 Capture Agent 的内部 tool（Phase 2）
+- Memory Agent → 改名为 Capture Agent（v3 §3.4）
 
 ---
 
@@ -279,13 +286,17 @@ src/paper_search/
 │   │
 │   └── graphs/                     # LangGraph StateGraph
 │       ├── main_graph.py           # [Phase 2 新增] MainAgent StateGraph build + compile
-│       ├── ingest_graph.py         # IngestAgent ([Phase 2] 入参升级为 IngestParams v2 21 字段)
-│       ├── rad_query_graph.py
-│       ├── clustering_graph.py
-│       ├── citation_chase_graph.py
-│       ├── history_graph.py
-│       ├── translation_graph.py
-│       └── video_graph.py
+│       ├── ingest_graph.py         # [v3 废弃] 拆分为 literature_graph + knowledge_graph（Phase 2）
+│       ├── literature_graph.py     # [v3 新建] Literature Agent（Phase 2）
+│       ├── knowledge_graph.py      # [v3 新建] Knowledge Agent（Phase 2）
+│       ├── writing_graph.py        # [v3 新建] Writing Agent（Phase 2）
+│       ├── glossary_graph.py       # [v3 新建] Glossary Sub-Agent（Phase 2）
+│       ├── clustering_graph.py     # Research Agent 子 graph
+│       ├── citation_chase_graph.py # Research Agent 子 graph
+│       ├── translation_graph.py    # Translation Agent
+│       ├── video_graph.py          # [v3] Capture Agent 的内部 tool
+│       ├── rad_query_graph.py      # [v3 废弃] 并入 Knowledge Agent rag_query（Phase 2）
+│       └── history_graph.py        # [v3 废弃] 并入 Store episodes（Phase 2）
 │
 ├── api/                            # FastAPI 层
 │   ├── app.py                      # 应用入口 + WebSocket /ws/chat/{agent}/{session}
@@ -410,7 +421,8 @@ Python >= 3.11
 | Checkpointer v2 (LangGraph 原生 resume) | 📐 | 文档定型，Phase 2 代码 |
 | WebSocket 协议 v10.0 | ✅ | 5 卡片 / 12 消息 / 内部编排不可见 |
 | API Server (中继化) | ✅ | LPUSH→Agent + outbox_poller→WS |
-| 7 子 Agent (LangGraph StateGraph) | ✅ | Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video |
+| 7 子 Agent (LangGraph StateGraph) v2 | ✅ | 当前：Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video |
+| 7 子 Agent v3 重构 | 📐 | 目标：Literature/Knowledge/Research/Writing/Capture/Translation/Glossary（[v3 方案](docs/product/智驭研_重构方案_v3.md)） |
 | 子 Agent lifecycle 上报 | ✅ | sub_agent_task 收尾发 agent_done/agent_failed |
 | IngestParams v2 (21 字段) | 📐 | 文档定型（[memory-system.md 附录 A](docs/development/memory-system.md)），Phase 2 代码 |
 | 7 子 Agent v2 重写 (吃 IngestParams) | 📐 | 文档定型，Phase 2 代码 |
@@ -424,11 +436,15 @@ Python >= 3.11
 
 ### 待办
 
-| # | 功能 | 工作量 |
-|---|---|:---:|
-| 1 | **Phase 2 LangGraph 三件套重构**（MainAgent StateGraph + Checkpointer + Store + 三档压缩 + IngestParams v2 + 7 子 Agent 重写）| 20-30 天，分多 PR |
-| 2 | aioapns 真实集成 + iOS 端注册流程 | 3-5 天 |
-| 3 | 可视化 (t-SNE/UMAP 研究方向图前端) | 3-5 天 |
-| 4 | Docker 部署 | 2-3 天 |
-| 5 | 反幻觉 Phase B/C（external_validator + output_verify 节点） | 5-7 天 |
-| 6 | 测试覆盖率提升 | 持续 |
+| # | 功能 | 工作量 | 备注 |
+|---|------|:---:|------|
+| 1 | **v3 Phase 1：基础设施重构**（PostgreSQL+pgvector + 多用户 + 冷启动 + 数据迁移）| 2 周 | 当前优先，详见 [backend-dev-plan](docs/development/backend-development-plan.md) |
+| 2 | v3 Phase 2：Agent 架构重构（ingest 拆分 + Writing/Glossary 新建 + Celery）| 2 周 | |
+| 3 | v3 Phase 3：引用标记与验证（内外双通道 + 并行调度）| 2 周 | |
+| 4 | v3 Phase 4：评估体系与收尾（检索质量 + 反幻觉 + Zotero）| 2 周 | |
+| 5 | aioapns 真实集成 + iOS 端注册流程 | 3-5 天 | 后端保留 WebSocket 协议兼容 |
+| 6 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5 天 | |
+| 7 | Docker 部署 | 2-3 天 | |
+| 8 | 测试覆盖率提升 | 持续 | |
+
+> **注意**：Vue 前端迁移不在本项目范围内，由独立前端项目负责。后端保持 WebSocket 协议兼容，同时支持现有 iOS 客户端和未来 Vue 前端。

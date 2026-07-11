@@ -164,14 +164,24 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
       从 outbox:{agent_id} BRPOP → 这里 send_text
     - sync_request: iOS 发 sync_request → 拉取未送达的历史消息回放
     - 永不主动断开连接
+
+    v3 Phase 1: 从 agent_id 提取 user_id（格式: agent-{user_id}）。
     """
     import json as _json
     import os
     import asyncio as _asyncio
 
+    # 从 agent_id 提取 user_id
+    # 格式: "agent-{user_id}" → user_id,  "agent-001" → "default"
+    _user_id = "default"
+    if agent_id.startswith("agent-"):
+        extracted = agent_id[6:]  # 去掉 "agent-" 前缀
+        if extracted and extracted != "001":
+            _user_id = extracted
+
     await websocket.accept()
     await ws_manager.connect(agent_id, session_id, websocket)
-    logger.info(f"WS connected: agent={agent_id}, session={session_id}")
+    logger.info(f"WS connected: agent={agent_id}, session={session_id}, user={_user_id}")
 
     # ── Redis 连接 (带重试) ────────────────────────────
     _redis = None

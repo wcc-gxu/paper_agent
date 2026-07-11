@@ -1,4 +1,7 @@
-"""IngestAgent — 论文入库子 Agent。
+"""IngestAgent — 论文入库子 Agent (DEPRECATED v3 Phase 2).
+
+已拆分为 LiteratureAgent + KnowledgeAgent，此文件保留为兼容层。
+新代码请直接使用 graphs/literature_graph.py 和 graphs/knowledge_graph.py。
 
 LangGraph 7 节点线性 Execute Graph:
   search → evaluate → download → convert → index → rank → survey

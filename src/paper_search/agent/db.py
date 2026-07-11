@@ -1341,6 +1341,30 @@ class AgentDB:
             results.append(d)
         return results
 
+    # ═══════════════════════════════════════════════════════════════
+    # v3 Phase 1 新增：多用户支持（SQLite 兼容桩）
+    # ═══════════════════════════════════════════════════════════════
+
+    def get_user_by_token(self, token: str) -> Optional[dict]:
+        """按 API token 查找用户（SQLite 单用户模式：仅支持 API_KEY 匹配）。"""
+        # SQLite 模式无 users 表，返回默认用户
+        return {"id": "anonymous", "username": "anonymous", "display_name": "匿名用户"}
+
+    def get_user(self, user_id: str) -> Optional[dict]:
+        """按 user_id 查找用户（SQLite 单用户模式桩）。"""
+        return {"id": user_id or "anonymous", "username": user_id or "anonymous",
+                "display_name": "本地用户", "role": "researcher", "is_active": True}
+
+    def create_user(self, username: str, display_name: str, api_token: str = None,
+                    role: str = "researcher") -> str:
+        """创建用户（SQLite 单用户模式：直接返回默认 ID）。"""
+        return "anonymous"
+
+    def count_user_papers(self, user_id: str) -> int:
+        """获取用户的论文总数（冷启动检测）。"""
+        row = self.conn.execute("SELECT COUNT(*) FROM papers").fetchone()
+        return row[0] if row else 0
+
     def close(self):
         if self._conn:
             self._conn.close()

@@ -42,16 +42,33 @@ def _now() -> str:
 
 
 class AgentManifest:
-    """Agent 身份证 — JSON 序列化数据结构。"""
+    """Agent 身份证 — JSON 序列化数据结构。
 
-    def __init__(self, data_dir: Path):
-        self.path = data_dir / "agent_manifest.json"
+    v3 Phase 1: 支持多用户，每个 user_id 独立 manifest 文件。
+    """
+
+    def __init__(self, data_dir: Path, user_id: str = "default"):
+        self.user_id = user_id
+        manifests_dir = data_dir / "manifests"
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        self.path = manifests_dir / f"{user_id}.json"
         self.data: dict = {}
+        self._legacy_path = data_dir / "agent_manifest.json"
 
     def exists(self) -> bool:
         return self.path.exists()
 
     def load(self) -> dict:
+        # 向后兼容：从旧 manifest 路径迁移
+        if not self.path.exists() and self._legacy_path.exists():
+            logger.info(f"Migrating legacy manifest from {self._legacy_path} to {self.path}")
+            old_data = json.loads(self._legacy_path.read_text(encoding="utf-8"))
+            old_data.setdefault("agent", {})["agent_id"] = f"agent-{self.user_id}"
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(old_data, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            # 保留旧文件作为备份，不删除
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
         return self.data
@@ -66,7 +83,7 @@ class AgentManifest:
 
     @property
     def agent_id(self) -> str:
-        return (self.data.get("agent") or {}).get("agent_id", DEFAULT_AGENT_ID)
+        return (self.data.get("agent") or {}).get("agent_id", f"agent-{self.user_id}")
 
     @property
     def llm_provider(self) -> str:
@@ -81,19 +98,22 @@ class AgentManifest:
 class AgentBootstrap:
     """Agent 引导程序 — 启动时调用的唯一入口。
 
-    Phase 5 重构后只构建 4 个核心组件，不再有 PlanGraph / AsyncSqliteSaver：
-      - AgentDB
+    v3 Phase 1 重构：支持多用户（user_id 参数）。
+
+    构建 4 个核心组件:
+      - AgentDB / PostgresAgentDB
       - LLMClientV2
       - ToolRegistry
-      - MemoryManager (含 ChromaStore 可选)
+      - MemoryManager (含 ChromaStore/PgVectorStore 可选)
     """
 
-    def __init__(self, data_dir: Optional[Path] = None):
+    def __init__(self, data_dir: Optional[Path] = None, user_id: str = "default"):
         if data_dir is None:
             from ..config import get_data_dir
             data_dir = get_data_dir()
         self.data_dir = Path(data_dir)
-        self.manifest = AgentManifest(self.data_dir)
+        self.user_id = user_id
+        self.manifest = AgentManifest(self.data_dir, user_id=user_id)
 
         # 惰性初始化的组件
         self._db = None
@@ -118,13 +138,20 @@ class AgentBootstrap:
 
     async def _build_core(self, manifest_data: dict, llm_provider: str = "volcano"):
         """统一构建 db / llm / tools / memory，避免 _create/_resume 重复代码。"""
-        # 1. AgentDB
-        from ..agent.db import AgentDB
-        db_path = self.data_dir / "agent.db"
-        self._db = AgentDB(db_path)
-        # 触发 schema + migrations
-        _ = self._db.conn
-        logger.info(f"Database initialized: {db_path}")
+        from ..config import use_postgresql
+
+        # 1. DB: PostgreSQL 或 SQLite
+        if use_postgresql():
+            from ..agent.pgdb import PostgresAgentDB
+            self._db = PostgresAgentDB()
+            logger.info("Database: PostgreSQL")
+        else:
+            from ..agent.db import AgentDB
+            db_path = self.data_dir / "agent.db"
+            self._db = AgentDB(db_path)
+            # 触发 schema + migrations
+            _ = self._db.conn
+            logger.info(f"Database: SQLite ({db_path})")
 
         # 2. LLMClientV2
         from ..agent.llm_client_v2 import LLMClientV2
@@ -136,15 +163,20 @@ class AgentBootstrap:
         self._tools = ToolRegistry.get_instance()
         logger.info(f"ToolRegistry: {len(self._tools.tool_names)} tools")
 
-        # 4. MemoryManager (含 ChromaDB, 可选)
+        # 4. MemoryManager (含向量存储, 可选)
         from ..agent.memory import MemoryManager
         chroma = None
         try:
-            from ..agent.chroma_store import ChromaStoreV2
-            chroma = ChromaStoreV2()
-            logger.info("ChromaDB initialized")
+            if use_postgresql():
+                from ..agent.pgvector_store import PgVectorStore
+                chroma = PgVectorStore(user_id=self.user_id)
+                logger.info("PgVectorStore initialized")
+            else:
+                from ..agent.chroma_store import ChromaStoreV2
+                chroma = ChromaStoreV2()
+                logger.info("ChromaDB initialized")
         except Exception as e:
-            logger.warning(f"ChromaDB unavailable (knowledge tools degrade): {e}")
+            logger.warning(f"Vector store unavailable (knowledge tools degrade): {e}")
         self._memory = MemoryManager(self._db, chroma)
 
     async def _resume(self) -> dict:
@@ -165,7 +197,7 @@ class AgentBootstrap:
     async def _create(self) -> dict:
         """首次启动 — 从头创建 Agent。"""
         now = _now()
-        agent_id = DEFAULT_AGENT_ID
+        agent_id = f"agent-{self.user_id}" if self.user_id != "default" else DEFAULT_AGENT_ID
 
         manifest_data = {
             "manifest_version": MANIFEST_VERSION,
@@ -173,6 +205,7 @@ class AgentBootstrap:
                 "agent_id": agent_id,
                 "type": "main",
                 "display_name": DEFAULT_DISPLAY_NAME,
+                "user_id": self.user_id,
                 "created_at": now,
                 "updated_at": now,
                 "status": "active",
@@ -182,7 +215,7 @@ class AgentBootstrap:
             },
         }
         await self._build_core(manifest_data, llm_provider="volcano")
-        self._db.create_session(agent_id, "main", title="新对话")
+        self._db.create_session(agent_id, "main", title="新对话", user_id=self.user_id)
         self.manifest.save(manifest_data)
         return {
             "manifest": manifest_data,
@@ -196,8 +229,15 @@ class AgentBootstrap:
 # ═══════════════════════════════════════════════════════════════
 
 
-async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
-    """daemon 主入口 — bootstrap + MainAgent。"""
+async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
+               user_id: str = "default"):
+    """daemon 主入口 — bootstrap + MainAgent。
+
+    Args:
+        data_dir: 数据目录路径。
+        redis_url: Redis 连接 URL。
+        user_id: 用户 ID（v3 多用户支持）。
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -206,13 +246,16 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None):
     path = Path(data_dir) if data_dir else None
     redis = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
+    # 从环境变量读取 user_id（可选覆盖）
+    user_id = os.getenv("PAPER_USER_ID", user_id)
+
     # Bootstrap
-    bs = AgentBootstrap(data_dir=path)
+    bs = AgentBootstrap(data_dir=path, user_id=user_id)
     result = await bs.bootstrap()
 
     manifest = result["manifest"]
     agent_id = manifest["agent"]["agent_id"]
-    logger.info(f"Agent {agent_id} ready, starting MainAgent...")
+    logger.info(f"Agent {agent_id} (user={user_id}) ready, starting MainAgent...")
 
     # MainAgent (Phase 3+4)
     from .main_agent import MainAgent

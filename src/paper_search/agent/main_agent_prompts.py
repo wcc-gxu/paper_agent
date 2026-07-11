@@ -142,6 +142,13 @@ SCENARIOS: dict[str, dict[str, str]] = {
         "permissions": "—",
         "example": "你还记得我研究啥",
     },
+    "S18": {
+        "name": "冷启动引导",
+        "description": "新用户知识库为空时，自动引导进入首次文献调研",
+        "agent": "builtin",
+        "permissions": "search",
+        "example": "（新用户发送任意研究相关消息自动触发）",
+    },
 }
 
 
@@ -165,7 +172,7 @@ class ScenarioMatch(BaseModel):
     """C2: 单个匹配场景（支持复合意图：一条消息可命中多个场景）。"""
     scenario_id: Literal[
         "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
-        "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17",
+        "S10", "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18",
     ] = Field(..., description="命中的业务场景 ID")
     confidence: float = Field(..., ge=0.0, le=1.0,
                               description="该场景的置信度 0-1")
@@ -330,7 +337,25 @@ class ScenarioPlanResult(BaseModel):
             "v2: 本场景产物是否需进 output_verify (反幻觉) 节点."
             " 综述/RAG 答案/wiki/extract 等生成性输出必须 true,"
             " 纯工具操作 (paper_status / paper_export / ios_*) false."
-            " 详见 docs/development/anti-hallucination.md L1.5."
+        ),
+    )
+    # ── v3 Phase 3 新字段 ──
+    output_format: str = Field(
+        "auto",
+        description=(
+            "v3: LLM 输出的引用标记格式。"
+            " 'structured'=使用 [local:xxx]/[ext:doi] 标记;"
+            " 'numbered'=传统 [N] 编号;"
+            " 'auto'=由 LLM 自动选择"
+        ),
+    )
+    verification_mode: Literal["none", "internal_only", "dual_channel"] = Field(
+        "internal_only",
+        description=(
+            "v3: 验证模式。"
+            " 'none': 不验证 (纯工具操作);"
+            " 'internal_only': 仅库内 DB+chunk 验证;"
+            " 'dual_channel': 库内+外部 Crossref/arXiv/S2 双通道验证"
         ),
     )
 

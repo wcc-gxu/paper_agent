@@ -102,6 +102,14 @@ class CitationParser:
     - Author (Year) 内联引用
     """
 
+    # v3 Phase 3: 结构化引用标记
+    # [local:paper_id] — 库内引用
+    LOCAL_CITATION = re.compile(r'\[local:([^\]]+)\]')
+    # [ext:doi_or_id] — 外部验证引用
+    EXT_CITATION = re.compile(r'\[ext:([^\]]+)\]')
+    # [Agent 综合] — 综合引用（多源验证）
+    AGENT_CITATION = re.compile(r'\[Agent\s+([^\]]+)\]')
+
     # 匹配 [Author, Year] / [Author et al., Year]
     BRACKET_CITATION = re.compile(
         r'\[([^\]]+?,\s*\d{4}[a-z]?)\]'
@@ -199,6 +207,48 @@ class CitationParser:
                 "year": None,
                 "span": (m.start(), m.end()),
                 "context": context,
+            })
+
+        # v3 Phase 3: [local:paper_id]
+        for m in self.LOCAL_CITATION.finditer(text):
+            ctx_start = max(0, m.start() - 80)
+            ctx_end = min(len(text), m.end() + 80)
+            citations.append({
+                "type": "local",
+                "match": m.group(0),
+                "paper_id": m.group(1).strip(),
+                "author_part": "",
+                "year": None,
+                "span": (m.start(), m.end()),
+                "context": text[ctx_start:ctx_end],
+            })
+
+        # v3 Phase 3: [ext:doi]
+        for m in self.EXT_CITATION.finditer(text):
+            ctx_start = max(0, m.start() - 80)
+            ctx_end = min(len(text), m.end() + 80)
+            citations.append({
+                "type": "external",
+                "match": m.group(0),
+                "doi_or_id": m.group(1).strip(),
+                "author_part": "",
+                "year": None,
+                "span": (m.start(), m.end()),
+                "context": text[ctx_start:ctx_end],
+            })
+
+        # v3 Phase 3: [Agent ...]
+        for m in self.AGENT_CITATION.finditer(text):
+            ctx_start = max(0, m.start() - 80)
+            ctx_end = min(len(text), m.end() + 80)
+            citations.append({
+                "type": "agent_composite",
+                "match": m.group(0),
+                "content": m.group(1).strip(),
+                "author_part": "",
+                "year": None,
+                "span": (m.start(), m.end()),
+                "context": text[ctx_start:ctx_end],
             })
 
         return citations

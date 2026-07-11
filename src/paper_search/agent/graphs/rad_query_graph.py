@@ -1,4 +1,7 @@
-"""RADQueryAgent — 知识库 RAG 问答子 Agent。
+"""RADQueryAgent — 知识库 RAG 问答子 Agent (DEPRECATED v3 Phase 2).
+
+已合并到 KnowledgeAgent (graphs/knowledge_graph.py) 的 query 子图。
+新代码请使用 KnowledgeAgent.ask() 方法。
 
 5 节点动态 Execute Graph:
   parse → route → search → evaluate(refine loop) → format

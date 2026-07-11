@@ -148,7 +148,7 @@
 | **2.4.5** | P0 | Knowledge Agent 入库完成后 → Celery `glossary_collect` 异步执行 | 自动化测试 | 检查 Celery 任务状态 |
 | **2.4.6** | P0 | 术语收集完成后 → Chat 中收到一条普通文本消息："术语词表已更新：提取 X 个专业术语" | 自动化测试 | 监听 outbox 消息队列 |
 | **2.4.7** | P0 | 同一术语在第二次文献调研中出现 → `frequency` 自增、`last_seen_at` 更新 | 自动化测试 | `pytest tests/test_glossary_agent.py::test_frequency_accumulation` |
-| **2.4.8** | P1 | 术语超过 180 天未出现 → `llm_confidence *= 0.5` | 自动化测试 | `pytest tests/test_glossary_agent.py::test_confidence_decay` |
+| **2.4.8** | P1 | 术语超过 90 天未出现 → `llm_confidence *= 0.5`；超过 180 天 → 标记为"可能过时"供用户确认 | 自动化测试 | `pytest tests/test_glossary_agent.py::test_confidence_decay` |
 
 ### 3.5 架构一致性
 

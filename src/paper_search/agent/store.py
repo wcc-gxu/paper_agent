@@ -161,3 +161,144 @@ async def close_store(store: DualBackendStore) -> None:
             logger.info("Store SQLite connection closed")
     except Exception as e:
         logger.warning(f"close_store failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Episode Manager — 会话历史管理 (v3 Phase 2: 吸收 history_graph)
+# ═══════════════════════════════════════════════════════════════
+
+
+class EpisodeManager:
+    """会话 Episodes 管理器 — 替代原 HistoryAgent。
+
+    功能:
+      - 会话摘要归档至 Store episodes namespace
+      - 重复消息合并
+      - 过期消息清理
+      - 待办项生成与通知
+
+    用法:
+        mgr = EpisodeManager(store, db)
+        await mgr.archive_session(agent_id, session_id)
+        summary = await mgr.get_session_summary(agent_id, session_id)
+    """
+
+    def __init__(self, store: DualBackendStore, db=None):
+        self.store = store
+        self.db = db
+        # 默认保留: 7 天内的 episodes
+        self.max_age_days = 7
+        self.max_episodes_per_session = 50
+
+    async def archive_session(self, agent_id: str, session_id: str) -> dict:
+        """归档会话 — 将当前 session 的 episodes 写入 Store。
+
+        流程 (替代原 HistoryAgent.archive 节点):
+          1. 读取 session 的消息列表
+          2. 合并重复/相似消息
+          3. 生成会话摘要
+          4. 写入 Store (agent_id, "episodes", session_id)
+          5. 清理过期 episodes
+        """
+        messages = []
+        if self.db:
+            try:
+                raw = self.db.get_session_messages(agent_id, session_id)
+                messages = raw if raw else []
+            except Exception as e:
+                logger.warning(f"Failed to load session messages: {e}")
+
+        if not messages:
+            return {"archived": 0, "session_id": session_id}
+
+        # 合并重复消息
+        merged = self._merge_duplicates(messages)
+
+        # 生成摘要
+        summary = self._summarize_messages(merged)
+
+        # 写入 Store
+        import time
+        episode_data = {
+            "session_id": session_id,
+            "message_count": len(messages),
+            "merged_count": len(merged),
+            "summary": summary,
+            "last_message_at": messages[-1].get("created_at", ""),
+            "archived_at": time.time(),
+        }
+
+        await self.store.aput(
+            (agent_id, "episodes", session_id),
+            f"episode_{session_id}",
+            episode_data,
+        )
+
+        logger.info(f"Archived session {session_id}: {len(messages)} msgs → {len(merged)} merged")
+        return {"archived": len(merged), "session_id": session_id}
+
+    async def get_session_summary(self, agent_id: str, session_id: str) -> dict:
+        """获取会话摘要。"""
+        items = await self.store.asearch(
+            (agent_id, "episodes", session_id),
+            limit=1,
+        )
+        if items:
+            return items[0].value if hasattr(items[0], "value") else items[0]
+        return {}
+
+    async def cleanup_old_episodes(self, agent_id: str):
+        """清理超过 max_age_days 的旧 episodes。"""
+        import time
+        cutoff = time.time() - (self.max_age_days * 86400)
+        # 搜索旧 episodes
+        items = await self.store.asearch(
+            (agent_id, "episodes"),
+            limit=self.max_episodes_per_session,
+        )
+        deleted = 0
+        for item in items:
+            val = item.value if hasattr(item, "value") else item
+            if isinstance(val, dict) and val.get("archived_at", 0) < cutoff:
+                await self.store.adelete(
+                    (agent_id, "episodes", val.get("session_id", "")),
+                    item.key if hasattr(item, "key") else "",
+                )
+                deleted += 1
+
+        if deleted:
+            logger.info(f"Cleaned up {deleted} old episodes for agent={agent_id}")
+        return deleted
+
+    def _merge_duplicates(self, messages: list[dict]) -> list[dict]:
+        """合并重复/相似消息（替代原 HistoryAgent.merge 节点）。"""
+        seen = set()
+        merged = []
+        for msg in messages:
+            key = (
+                msg.get("role", ""),
+                msg.get("type", ""),
+                str(msg.get("payload", ""))[:200],
+            )
+            if key not in seen:
+                seen.add(key)
+                merged.append(msg)
+        return merged
+
+    def _summarize_messages(self, messages: list[dict]) -> dict:
+        """简单汇总消息统计（摘要由 LLM 在档 2 完成，这里只统计）。"""
+        roles = {}
+        types = {}
+        for m in messages:
+            role = m.get("role", "unknown")
+            roles[role] = roles.get(role, 0) + 1
+            t = m.get("type", "unknown")
+            types[t] = types.get(t, 0) + 1
+        return {
+            "total": len(messages),
+            "roles": roles,
+            "types": types,
+            "first_at": messages[0].get("created_at", "") if messages else "",
+            "last_at": messages[-1].get("created_at", "") if messages else "",
+        }
+

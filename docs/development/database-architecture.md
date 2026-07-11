@@ -427,7 +427,7 @@ CREATE TABLE journal_ranks (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 视频解析结果（由 Capture Agent 管理，逐步迁移到 captures 表）
+-- 视频解析结果（由 Capture Agent 管理，将一次性迁移到 captures 表）
 CREATE TABLE videos (
     id              TEXT PRIMARY KEY,           -- vid-xxx
     user_id         TEXT NOT NULL REFERENCES users(id),
@@ -939,4 +939,4 @@ CREATE POLICY paper_chunks_isolation ON paper_chunks
 
 ---
 
-> 本文档定义了 v3 的完整数据库架构。业务表 22 张（含 captures），向量表 4 张，Redis 数据结构 18 组。迁移从 SQLite+ChromaDB 到 PostgreSQL+pgvector。
+> 本文档定义了 v3 的完整数据库架构。业务表 22 张（含 captures），向量表 4 张，Redis 数据结构 18 组。迁移从 SQLite+ChromaDB 到 PostgreSQL+pgvector。videos 表数据将在 Phase 1 一次性迁移到 captures 表后废弃。

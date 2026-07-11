@@ -151,6 +151,31 @@ def get_db_path() -> Path:
     return get_data_dir() / "agent.db"
 
 
+# ═══════════════════════════════════════════════════════════════
+# PostgreSQL 连接 (v3 Phase 1)
+# ═══════════════════════════════════════════════════════════════
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+"""PostgreSQL 连接字符串。设置后自动切换到 PostgreSQL 后端。
+
+格式: postgresql://user:password@host:5432/database
+未设置或为空时使用 SQLite 后端（向后兼容）。
+"""
+
+PGVECTOR_URL = os.environ.get("PGVECTOR_URL", "") or DATABASE_URL
+"""pgvector 专用连接字符串。默认与 DATABASE_URL 相同。"""
+
+
+def use_postgresql() -> bool:
+    """判断是否启用 PostgreSQL 后端。"""
+    return bool(DATABASE_URL)
+
+
+def get_database_url() -> str:
+    """获取当前数据库连接字符串。"""
+    return DATABASE_URL
+
+
 def get_chroma_path() -> Path:
     """获取 ChromaDB 向量存储路径。"""
     return get_data_dir() / "chroma"

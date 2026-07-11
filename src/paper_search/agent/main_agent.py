@@ -66,18 +66,28 @@ ASK_USER_TIMEOUT_SEC = 30 * 60   # 等用户回答最长 30 分钟
 # _handle_sub_agent 按 agent_type 分发到对应 graph runner。
 # 未知类型不 fallback 到 ingest（那是 P0 bug 的根因）—— 直接报错。
 _KNOWN_SUB_AGENT_TYPES = frozenset({
+    # v2 agents (保留)
     "ingest", "clustering", "citation_chase",
     "translation", "video", "rad_query",
+    # v3 Phase 2 agents (新增)
+    "literature", "knowledge", "writing", "glossary", "capture",
 })
 
 # 各 agent_type 的预估阶段数（sub_request 推给 iOS 的 estimatedStages）
 _SUB_AGENT_STAGES = {
+    # v2
     "ingest": 7,
     "clustering": 5,
     "citation_chase": 7,
     "translation": 1,
     "video": 8,
     "rad_query": 5,
+    # v3 Phase 2
+    "literature": 5,   # search→evaluate→download→convert→extract_metadata
+    "knowledge": 4,    # chunk→embed→dedup→rank
+    "writing": 4,      # survey→template→citation→ai_flavor
+    "glossary": 4,     # collect→search→verify→evolve
+    "capture": 8,      # video download + transcribe + summarize
 }
 
 
@@ -114,6 +124,27 @@ def _check_sub_agent_args(agent_type: str, args: dict, user_query: str) -> list[
     if agent_type == "rad_query":
         if not (args.get("question") or args.get("query")):
             return ["question"]
+        return []
+    # v3 Phase 2 agents
+    if agent_type == "literature":
+        if not user_query:
+            return ["query"]
+        return []
+    if agent_type == "knowledge":
+        if not (args.get("project_id") or args.get("paper_ids")):
+            return ["project_id"]
+        return []
+    if agent_type == "writing":
+        if not (args.get("project_id") or user_query):
+            return ["project_id"]
+        return []
+    if agent_type == "glossary":
+        if not (args.get("project_id") or args.get("paper_ids")):
+            return ["project_id"]
+        return []
+    if agent_type == "capture":
+        if not (user_query or args.get("url")):
+            return ["url"]
         return []
     # 未知类型由调用方先拦截，这里兜底
     return [f"unknown_agent_type:{agent_type}"]
@@ -545,6 +576,10 @@ class MainAgent:
         self._redis = None
         # 当前正在处理的 correlation_id（每轮 BRPOP 重置）
         self._correlation_id: str = ""
+        # v3 Phase 1: 从 agent_id 提取 user_id（格式: agent-{user_id}）
+        self._user_id = "default"
+        if agent_id.startswith("agent-") and agent_id != "agent-001":
+            self._user_id = agent_id[6:]
 
     # ── Redis (惰性) ─────────────────────────────────────
 
@@ -689,6 +724,19 @@ class MainAgent:
         # intent_classify 保留为 business 路径的 scenario matcher (向后兼容)
         intent = await self._node_intent_classify(session_id, user_content)
         self._record_event(session_id, "intent_classified", intent.model_dump())
+
+        # v3 Phase 1: 冷启动检测 — 知识库为空且非纯闲聊时引导文献调研
+        if triage.route == "business" and await self._check_cold_start(session_id, user_content):
+            intent = IntentClassifyResult(
+                intent_kind="business",
+                scenarios=[ScenarioMatch(
+                    scenario_id="S1", confidence=1.0,
+                    reasoning="冷启动引导：知识库为空，引导用户做首次文献调研",
+                )],
+                overall_confidence=1.0,
+                reasoning="cold_start_onboarding",
+            )
+            logger.info("🧊 Cold start: guiding user to literature survey")
 
         # C3: business 但全部 scenario 都低于阈值 → 询问用户挑选
         if intent.intent_kind == "business":
@@ -851,6 +899,34 @@ class MainAgent:
                 return "meta"
 
         return None
+
+    # ── v3 Phase 1: 冷启动检测 ──────────────────────────
+
+    async def _check_cold_start(self, session_id: str, user_content: str) -> bool:
+        """检测是否为冷启动用户（知识库为空）。
+
+        返回 True 表示需要引导到文献调研流程。
+        仅当用户消息不是纯闲聊/问候语时才触发。
+        """
+        try:
+            paper_count = self._db.count_user_papers(self._user_id)
+        except Exception as e:
+            logger.warning(f"count_user_papers failed: {e}")
+            return False
+
+        if paper_count > 0:
+            return False
+
+        # 简单的闲聊关键词检测：避免对"你好"/"谢谢"触发冷启动
+        chat_keywords = {"你好", "hello", "hi", "谢谢", "thanks", "你是谁", "who are you",
+                         "帮助", "help", "再见", "bye", "好的", "ok", "嗯", "哦"}
+        lower = user_content.strip().lower()
+        if any(kw in lower for kw in chat_keywords) and len(lower) < 20:
+            logger.info(f"Cold start suppressed: chat-like message '{user_content[:50]}'")
+            return False
+
+        logger.info(f"Cold start triggered: {paper_count} papers for user={self._user_id}")
+        return True
 
     # ── 节点 1b: intent_classify (business 路径保留) ───
 
@@ -1351,6 +1427,49 @@ class MainAgent:
 
         return plan
 
+    # ── v3 Phase 3: 并行调度 ───────────────────────────
+
+    def _build_parallel_groups(self, tools: list[ToolCallSpec]) -> list[list[ToolCallSpec]]:
+        """构建并行执行组 — 分析 tools[] 的 depends_on 图。
+
+        规则:
+          - depends_on=[] 或未指定的工具 → 可并行
+          - 依赖其他工具结果的 → 等依赖完成后再执行
+          - 同组内工具并发执行（asyncio.gather）
+
+        返回分好组的列表，每组内工具可安全并行。
+        """
+        if len(tools) <= 1:
+            return [tools] if tools else []
+
+        groups: list[list[ToolCallSpec]] = []
+        current_group: list[ToolCallSpec] = []
+        prev_names: set[str] = set()
+
+        for tool in tools:
+            deps = getattr(tool, 'depends_on', []) or []
+            if not deps or all(d in prev_names for d in deps):
+                current_group.append(tool)
+            else:
+                if current_group:
+                    groups.append(current_group)
+                current_group = [tool]
+            prev_names.add(tool.name)
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
+    async def _execute_single_tool(self, session_id: str, spec: ToolCallSpec) -> dict:
+        """执行单个工具 — 抽取出来供并行调度使用。"""
+        if spec.kind == "sub_agent":
+            return await self._handle_sub_agent(session_id, spec)
+        elif spec.kind == "ios_tool":
+            return await self._handle_ios_tool(session_id, spec)
+        else:
+            return await self._handle_normal_tool(session_id, spec)
+
     def _merge_sub_plans(self, sub_plans: list[ScenarioPlanResult]) -> ScenarioPlanResult:
         """把多个 sub-plan 合并成一个 ScenarioPlanResult。
 
@@ -1407,10 +1526,29 @@ class MainAgent:
         tools_to_run = list(plan.tools)
         all_results: dict[str, Any] = {}
 
+        # v3 Phase 3: 并行调度 — 将可并行工具分组执行
+        parallel_groups = self._build_parallel_groups(tools_to_run)
+
         for iteration in range(MAX_PLAN_ITERATIONS):
             if not tools_to_run:
                 break
-            # 节点 3: 执行
+
+            # v3: 并行执行同组工具
+            if len(parallel_groups) > 0:
+                group = parallel_groups.pop(0)
+                if len(group) > 1:
+                    logger.info(f"Parallel execution: {len(group)} tools in group")
+                    tasks = [self._execute_single_tool(session_id, t) for t in group]
+                    group_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    for t, res in zip(group, group_results):
+                        if isinstance(res, Exception):
+                            all_results[t.name] = {"error": str(res)}
+                        else:
+                            all_results[t.name] = res
+                    tools_to_run = [t for t in tools_to_run if t not in group]
+                    continue
+
+            # 节点 3: 执行 (单工具路径)
             await self._push_status(session_id, "executing",
                                     f"正在执行 {len(tools_to_run)} 个任务...")
             results = await self._node_execute_plan(session_id, tools_to_run)
@@ -1752,12 +1890,17 @@ class MainAgent:
         """启动 Celery 子 Agent，订阅 agent:reports:{task_id}，等 agent_done/failed。
 
         按 agent_type 分发到对应 graph runner：
-          - ingest         → sub_agent_task 内置 7 阶段流水线
-          - clustering     → ClusteringAgent (5 节点)
-          - citation_chase → CitationChaseAgent (7 节点)
+          - ingest         → IngestAgent 7 阶段 (DEPRECATED, 拆分到 literature+knowledge)
+          - literature     → LiteratureAgent 5 节点 (v3 Phase 2)
+          - knowledge      → KnowledgeAgent 4 节点 (v3 Phase 2)
+          - writing        → WritingAgent 4 节点 (v3 Phase 2)
+          - glossary       → GlossaryAgent 4 节点 (v3 Phase 2)
+          - capture        → VideoAgent 8 节点 (v3 Phase 2, 原 video)
+          - clustering     → ClusteringAgent 5 节点
+          - citation_chase → CitationChaseAgent 7 节点
           - translation    → TranslationAgent
-          - video          → VideoAgent (8 节点)
-          - rad_query      → RADQueryAgent (5 节点)
+          - video          → VideoAgent (DEPRECATED, use capture)
+          - rad_query      → RADQueryAgent (DEPRECATED, merged into knowledge)
 
         未知 agent_type / 缺关键参数 → 推 error，**不 fallback 到 ingest**
         （fallback 正是历史 P0 bug 的根因：S6/S8/S9/S12/S13 静默跑 ingest）。

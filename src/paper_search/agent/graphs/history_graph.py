@@ -1,4 +1,7 @@
-"""HistoryAgent — 历史消息处理子 Agent。
+"""HistoryAgent — 历史消息处理子 Agent (DEPRECATED v3 Phase 2).
+
+逻辑已并入 LangGraph Store episodes namespace (store.py)。
+消息归档和合并逻辑由 Store 层直接处理。
 
 Plan + Execute 双图结构:
   Plan (2 节点):

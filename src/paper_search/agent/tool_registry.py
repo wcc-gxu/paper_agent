@@ -313,8 +313,19 @@ class ToolRegistry:
         self._register_pause_subscription()
         self._register_resume_subscription()
 
-        # ── 子 Agent 工具 19（执行阶段直接调用）──
+        # ── 子 Agent 工具 25（执行阶段直接调用）──
         self._register_sub_agent_tools()
+
+        # ── v3 Phase 2: 新 Agent 工具 8 ──
+        self._register_literature_agent_tools()
+        self._register_knowledge_agent_tools()
+        self._register_writing_agent_tools()
+        self._register_glossary_agent_tools()
+        self._register_capture_agent_tools()  # 原 video agent 改名
+        self._register_user_preference_tool()
+
+        # ── v3 Phase 4: Zotero 集成 ──
+        self._register_zotero_tools()
 
     # ══════════════════════════════════════════════════════════
     # 通用工具
@@ -1796,3 +1807,282 @@ class ToolRegistry:
             return json.dumps({"original": query, "target_lang": target_lang, **result},
                               ensure_ascii=False, default=str)
         return translate_query
+
+    # ══════════════════════════════════════════════════════════
+    # v3 Phase 2: 新 Agent 工具注册
+    # ══════════════════════════════════════════════════════════
+
+    def _register_literature_agent_tools(self):
+        """Literature Agent 工具 — 文献检索与下载。"""
+        self.register_direct(
+            "literature_search", "文献检索: 跨源搜索论文 (search→evaluate→download→convert→extract_metadata)",
+            self._make_literature_search(),
+            metadata=ToolMetadata(category="literature"),
+        )
+
+    def _make_literature_search(self):
+        async def literature_search(user_query: str, sources: str = "arxiv,semantic_scholar",
+                                      year_from: int = 2022, max_results: int = 20) -> str:
+            from .graphs.literature_graph import LiteratureAgent
+            from .sub_agent import PipelineRunner
+            from .db import AgentDB
+            db = AgentDB()
+            project_id = db.create_project(user_query=user_query)
+            try:
+                runner = PipelineRunner(None, db, None, None, None, None)
+                agent = LiteratureAgent(runner)
+                graph = agent.compile()
+                result = await graph.ainvoke({
+                    "project_id": project_id,
+                    "user_query": user_query,
+                    "sources": [s.strip() for s in sources.split(",") if s.strip()],
+                    "year_from": year_from,
+                    "max_results": max_results,
+                })
+                return json.dumps(result.get("result", {}), ensure_ascii=False, default=str)
+            except Exception as e:
+                return json.dumps({"error": str(e), "project_id": project_id}, ensure_ascii=False)
+        return literature_search
+
+    def _register_knowledge_agent_tools(self):
+        """Knowledge Agent 工具 — 知识入库与 RAG 问答。"""
+        self.register_direct(
+            "knowledge_ingest", "知识入库: chunk→embed→dedup→rank（处理 Literature Agent 产出的论文）",
+            self._make_knowledge_ingest(),
+            metadata=ToolMetadata(category="knowledge"),
+        )
+        self.register_direct(
+            "knowledge_ask", "RAG 问答: 基于已入库论文的学术问答（带引用）",
+            self._make_knowledge_ask(),
+            metadata=ToolMetadata(category="knowledge"),
+        )
+
+    def _make_knowledge_ingest(self):
+        async def knowledge_ingest(project_id: str) -> str:
+            from .graphs.knowledge_graph import KnowledgeAgent
+            from .db import AgentDB
+            db = AgentDB()
+            papers = db.get_project_papers(project_id)
+            try:
+                agent = KnowledgeAgent(db=db)
+                result = await agent.run_ingest(papers, project_id)
+                return json.dumps(result.get("result", {}), ensure_ascii=False, default=str)
+            except Exception as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return knowledge_ingest
+
+    def _make_knowledge_ask(self):
+        async def knowledge_ask(question: str, project_id: str = "", top_k: int = 5) -> str:
+            from .graphs.knowledge_graph import KnowledgeAgent
+            from .chroma_store import ChromaStoreV2
+            try:
+                chroma = ChromaStoreV2()
+                agent = KnowledgeAgent(vector_store=chroma)
+                result = await agent.ask(question, project_id=project_id or None, top_k=top_k)
+                return json.dumps(result, ensure_ascii=False, default=str)
+            except Exception as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return knowledge_ask
+
+    def _register_writing_agent_tools(self):
+        """Writing Agent 工具 — 综述生成与 AI 味检测。"""
+        self.register_direct(
+            "generate_survey_v2", "生成文献综述 (v3): 基于模板的学术综述，含引用格式检查和 AI 味清理",
+            self._make_generate_survey_v2(),
+            metadata=ToolMetadata(category="writing"),
+        )
+        self.register_direct(
+            "check_ai_flavor", "AI 味检测: 检测文本中的 AI 生成痕迹并清理",
+            self._make_check_ai_flavor(),
+            metadata=ToolMetadata(category="writing"),
+        )
+
+    def _make_generate_survey_v2(self):
+        async def generate_survey_v2(project_id: str, template: str = "arxiv") -> str:
+            from .graphs.writing_graph import WritingAgent
+            from .db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            db = AgentDB()
+            papers = db.get_project_papers(project_id)
+            llm = LLMClientV2()
+            agent = WritingAgent(db=db, llm_client=llm)
+            result = await agent.generate_survey(project_id, template=template, papers=papers)
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return generate_survey_v2
+
+    def _make_check_ai_flavor(self):
+        async def check_ai_flavor(text: str) -> str:
+            from .graphs.writing_graph import quick_ai_flavor_check
+            result = quick_ai_flavor_check(text)
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return check_ai_flavor
+
+    def _register_glossary_agent_tools(self):
+        """Glossary Sub-Agent 工具 — 术语管理。"""
+        self.register_direct(
+            "build_glossary_v2", "构建术语表 (v3): 从论文提取术语→LLM翻译→去重→入库",
+            self._make_build_glossary_v2(),
+            metadata=ToolMetadata(category="glossary"),
+        )
+
+    def _make_build_glossary_v2(self):
+        async def build_glossary_v2(project_id: str, domain: str = "") -> str:
+            from .graphs.glossary_graph import GlossaryAgent
+            from .db import AgentDB
+            from .llm_client_v2 import LLMClientV2
+            from .chroma_store import ChromaStoreV2
+            db = AgentDB()
+            papers = db.get_project_papers(project_id)
+            paper_ids = [p.get("paper_id", "") for p in papers]
+            llm = LLMClientV2()
+            chroma = ChromaStoreV2()
+            agent = GlossaryAgent(db=db, vector_store=chroma, llm_client=llm)
+            result = await agent.collect_terms(paper_ids=paper_ids, domain=domain)
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return build_glossary_v2
+
+    def _register_capture_agent_tools(self):
+        """Capture Agent 工具 — 碎片采集（原 Video Agent 改名）。"""
+        self.register_direct(
+            "capture_video", "视频解析: 下载→转写→LLM总结（Capture Agent）",
+            self._make_capture_video(),
+            metadata=ToolMetadata(category="capture"),
+        )
+
+    def _make_capture_video(self):
+        async def capture_video(url: str) -> str:
+            from .graphs.video_graph import VideoAgent
+            try:
+                agent = VideoAgent()
+                result = await agent.process(url)
+                return json.dumps(result, ensure_ascii=False, default=str)
+            except Exception as e:
+                return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
+        return capture_video
+
+    def _register_user_preference_tool(self):
+        """用户偏好更新工具。"""
+        self.register_direct(
+            "update_preference", "更新用户偏好: 存长期 Store，后续对话自动注入",
+            self._make_update_preference(),
+            metadata=ToolMetadata(category="memory"),
+        )
+
+    def _make_update_preference(self):
+        async def update_preference(key: str, value: str) -> str:
+            from .store import DualBackendStore
+            import aiosqlite
+            from langgraph.store.sqlite.aio import AsyncSqliteStore
+            from ..config import get_db_path
+            store = AsyncSqliteStore.from_path(str(get_db_path()))
+            dual = DualBackendStore(store)
+            await dual.aput(
+                ("user-default", "preferences"), key,
+                {"value": value, "updated_at": ""},
+            )
+            return json.dumps({"success": True, "key": key, "value": value}, ensure_ascii=False)
+        return update_preference
+
+    # ══════════════════════════════════════════════════════════
+    # v3 Phase 4: Zotero 导入导出
+    # ══════════════════════════════════════════════════════════
+
+    def _register_zotero_tools(self):
+        self.register_direct(
+            "zotero_export", "导出论文到 Zotero (BibTeX/Better BibTeX 格式)",
+            self._make_zotero_export(),
+            metadata=ToolMetadata(category="export"),
+        )
+        self.register_direct(
+            "zotero_import", "从 Zotero 导出的 BibTeX/JSON 文件导入论文",
+            self._make_zotero_import(),
+            metadata=ToolMetadata(category="import"),
+        )
+
+    def _make_zotero_export(self):
+        async def zotero_export(project_id: str, format: str = "bibtex",
+                                  output_path: str = "") -> str:
+            from ..agent.db import AgentDB
+            from pathlib import Path
+            db = AgentDB()
+            papers = db.get_project_papers(project_id)
+            if not papers:
+                return json.dumps({"error": f"No papers in project {project_id}"})
+
+            entries = []
+            for p in papers:
+                authors_str = p.get("authors", "[]")
+                authors = json.loads(authors_str) if isinstance(authors_str, str) else (authors_str or [])
+                first_author = (authors[0].split()[-1] if authors else "Unknown").replace(",", "")
+                key = f"{first_author}{p.get('year', '')}{p.get('title', '')[:30].replace(' ', '')}"
+
+                entry = (
+                    f"@article{{{key},\n"
+                    f"  title = {{{p.get('title', '')}}},\n"
+                    f"  author = {{{' and '.join(a for a in authors[:10] if a)}}},\n"
+                    f"  year = {{{p.get('year', '')}}},\n"
+                    f"  journal = {{{p.get('venue', '')}}},\n"
+                    f"  doi = {{{p.get('doi', '')}}},\n"
+                    f"  abstract = {{{p.get('abstract', '')[:500]}}},\n"
+                    f"  url = {{{p.get('pdf_path', '')}}}\n"
+                    f"}}"
+                )
+                entries.append(entry)
+
+            bibtex = "\n\n".join(entries)
+            out_path = Path(output_path) if output_path else (
+                Path.home() / "papers" / "exports" / f"{project_id}.bib"
+            )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(bibtex, encoding="utf-8")
+            return json.dumps({
+                "success": True, "path": str(out_path),
+                "count": len(entries), "format": format,
+            }, ensure_ascii=False)
+        return zotero_export
+
+    def _make_zotero_import(self):
+        async def zotero_import(file_path: str, project_id: str = "") -> str:
+            import re as _re
+            from pathlib import Path
+            from ..agent.db import AgentDB
+            path = Path(file_path)
+            if not path.exists():
+                return json.dumps({"error": f"File not found: {file_path}"})
+
+            text = path.read_text(encoding="utf-8")
+            db = AgentDB()
+            pid = project_id or db.create_project(user_query=f"Zotero import: {path.name}")
+
+            # Parse BibTeX entries
+            entries = _re.findall(r'@\w+\{([^,]+),([^@]*)\}', text, _re.DOTALL)
+            imported = 0
+            errors = []
+            for key, fields in entries:
+                try:
+                    title = _re.search(r'title\s*=\s*\{([^}]*)\}', fields)
+                    authors = _re.search(r'author\s*=\s*\{([^}]*)\}', fields)
+                    year = _re.search(r'year\s*=\s*\{(\d+)\}', fields)
+                    doi = _re.search(r'doi\s*=\s*\{([^}]*)\}', fields)
+
+                    paper = {
+                        "title": (title.group(1) if title else key).strip(),
+                        "authors": json.dumps(
+                            [a.strip() for a in (authors.group(1) if authors else "").split("and") if a.strip()],
+                            ensure_ascii=False,
+                        ),
+                        "year": int(year.group(1)) if year else None,
+                        "doi": doi.group(1) if doi else None,
+                        "source": "zotero_import",
+                    }
+                    paper_id = db.upsert_paper(paper)
+                    db.link_paper_to_project(pid, paper_id)
+                    imported += 1
+                except Exception as e:
+                    errors.append({"key": key, "error": str(e)})
+
+            return json.dumps({
+                "success": True, "project_id": pid,
+                "imported": imported, "errors": errors[:10],
+            }, ensure_ascii=False)
+        return zotero_import

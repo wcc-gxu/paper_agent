@@ -1,3 +1,6 @@
+# Installers / large binaries
+*.sh
+
 # Test artifacts
 test_papers/
 test_queries*.json
