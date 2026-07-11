@@ -1,5 +1,5 @@
 # Installers / large binaries
-*.sh
+Anaconda*.sh
 
 # Test artifacts
 test_papers/
