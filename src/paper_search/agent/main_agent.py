@@ -580,6 +580,8 @@ class MainAgent:
         self._user_id = "default"
         if agent_id.startswith("agent-") and agent_id != "agent-001":
             self._user_id = agent_id[6:]
+        # Debug mode: wire LLM raw events → WS debug status messages
+        self._wire_llm_debug()
 
     # ── Redis (惰性) ─────────────────────────────────────
 
@@ -1627,8 +1629,8 @@ class MainAgent:
                 )
                 full_text = getattr(resp, "content", None) or str(resp)
         except Exception as e:
-            logger.warning(f"inline_reply LLM failed: {e}")
-            full_text = "抱歉，刚才出了点问题，能再说一次吗？"
+            logger.warning(f"inline_reply LLM failed: {e}", exc_info=True)
+            full_text = f"抱歉，LLM 调用出错：{e}"
 
         # 最终文本（高优先级 → APNs）
         await self._push(session_id, "message", "text", "assistant",
@@ -2338,6 +2340,25 @@ class MainAgent:
         except Exception as e:
             logger.warning(f"_push outbox failed: {e}")
             return ""
+
+    def _wire_llm_debug(self):
+        """Wire LLM raw events → WS debug status messages (DEBUG_PROTOCOL=1)."""
+        import os
+        if os.environ.get("DEBUG_PROTOCOL", "") != "1" or not self._llm:
+            return
+        if not hasattr(self._llm, 'on_raw_event'):
+            return
+
+        async def _push_debug(event_type: str, data: dict):
+            try:
+                # Use the last known session_id from the current turn
+                sid = getattr(self, '_current_session_id', 'main')
+                await self._push_status(sid, f"llm:{event_type}",
+                    str(data)[:500], level="debug")
+            except Exception:
+                pass
+
+        self._llm.on_raw_event = _push_debug
 
     async def _push_status(self, session_id: str, stage: str,
                            message: str, level: str = "info") -> None:

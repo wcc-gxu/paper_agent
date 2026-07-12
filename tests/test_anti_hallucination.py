@@ -81,63 +81,61 @@ class TestL3CacheKey:
 class TestL3Validator:
     """L3 ExternalValidator 的核心行为（不真实调外部 API）。"""
 
-    @pytest.mark.asyncio
-    async def test_validator_init_no_db(self):
-        """没传 db 时也能初始化（不阻塞）。"""
-        v = ExternalValidator(db=None)
-        assert v._db is None
+    def test_validator_init_no_redis(self):
+        """没传 redis_client 时也能初始化（不阻塞）。"""
+        v = ExternalValidator()
+        assert v._redis is None
+        assert isinstance(v._cache, dict)
 
     @pytest.mark.asyncio
     async def test_validator_api_failure_returns_unverified(self, monkeypatch):
-        """外部 API 全挂时返回 exists=None（unverified），不抛异常。"""
-        v = ExternalValidator(db=None)
+        """外部 API 全挂时返回 verified=False，不抛异常。"""
+        v = ExternalValidator()
 
-        async def fake_fail(*args, **kwargs):
-            raise RuntimeError("simulated network error")
+        async def fake_get_json(*args, **kwargs):
+            return None
 
-        monkeypatch.setattr(v, "_query_crossref_doi", fake_fail)
-        monkeypatch.setattr(v, "_query_crossref_bibliographic", fake_fail)
-        monkeypatch.setattr(v, "_query_arxiv", fake_fail)
+        monkeypatch.setattr(v, "_get_json", fake_get_json)
 
-        ref = ExtractedReference(raw_text="x", doi="10.1/abc")
-        result = await v.validate(ref)
-        assert result.exists is None  # unverified, not False
-        assert "API" in result.reason or "不可达" in result.reason
+        result = await v.verify_doi("10.1/abc")
+        assert result["verified"] is False
+        assert result["source"] == "none"
+        assert result.get("error")
 
     @pytest.mark.asyncio
     async def test_validator_doi_hit_returns_exists_true(self, monkeypatch):
-        v = ExternalValidator(db=None)
+        """DOI 命中 Crossref 时返回 verified=True。"""
+        v = ExternalValidator()
 
-        async def fake_doi(doi):
-            return {"DOI": doi, "title": ["Attention is All You Need"]}
+        async def fake_get_json(url, source, params=None, headers=None, max_retries=2):
+            return {
+                "message": {
+                    "title": ["Attention is All You Need"],
+                    "author": [{"given": "Ashish", "family": "Vaswani"}],
+                    "published-print": {"date-parts": [[2017]]},
+                }
+            }
 
-        monkeypatch.setattr(v, "_query_crossref_doi", fake_doi)
+        monkeypatch.setattr(v, "_get_json", fake_get_json)
 
-        ref = ExtractedReference(raw_text="x", doi="10.5555/3295222.3295349")
-        result = await v.validate(ref)
-        assert result.exists is True
-        assert result.source == "crossref"
-        assert result.confidence == 1.0
+        result = await v.verify_doi("10.5555/3295222.3295349")
+        assert result["verified"] is True
+        assert result["source"] == "crossref"
+        assert result["match_score"] == 1.0
 
     @pytest.mark.asyncio
-    async def test_validator_three_sources_miss_returns_false(self, monkeypatch):
-        """所有源都不命中 → exists=False（可能编造）。"""
-        v = ExternalValidator(db=None)
+    async def test_validator_title_miss_returns_false(self, monkeypatch):
+        """标题搜索无结果 → verified=False（可能编造）。"""
+        v = ExternalValidator()
 
-        async def empty(*args, **kwargs):
-            return None
+        async def fake_get_json(*args, **kwargs):
+            return {"data": []}
 
-        monkeypatch.setattr(v, "_query_crossref_doi", empty)
-        monkeypatch.setattr(v, "_query_crossref_bibliographic", empty)
-        monkeypatch.setattr(v, "_query_arxiv", empty)
+        monkeypatch.setattr(v, "_get_json", fake_get_json)
 
-        ref = ExtractedReference(
-            raw_text="x", title="Tachyon Transformer", authors=["NoSuchAuthor"],
-            year=2099,
-        )
-        result = await v.validate(ref)
-        assert result.exists is False
-        assert "未找到" in result.reason or "编造" in result.reason
+        result = await v.verify_title("Tachyon Transformer")
+        assert result["verified"] is False
+        assert result.get("error")
 
 
 # ── L2: CitationVerifier 接入 generate_report ─────────────

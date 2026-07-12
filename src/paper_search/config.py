@@ -216,54 +216,55 @@ def get_cookie_dir() -> Path:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Model Routing — 多模型路由表 (火山引擎多模型, 同一 VOLCANO_API_KEY)
+# LLM API 配置 (DeepSeek Anthropic-compatible API)
+# ═══════════════════════════════════════════════════════════════
+
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/anthropic")
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek")
+
+# ═══════════════════════════════════════════════════════════════
+# Model Routing — 模型路由表 (全部走 DeepSeek API)
 # ═══════════════════════════════════════════════════════════════
 #
-# 7 个模型全部走火山引擎同一个 API Key, 只是 model ID 不同。
-# 每个 Agent 节点配 (primary, fallback): 主模型失败(异常/超时/限流/JSON
-# 校验失败)时 LLMClientV2 自动切 fallback 重试一次。
+# 每个 Agent 节点配 (primary, fallback): 主模型失败时 LLMClientV2 自动切 fallback。
 # 详见 llm_client_v2.LLMClientV2.chat / chat_json / chat_stream 的 node 参数。
 
 MODEL_ROUTES: dict[str, tuple[str, str]] = {
     # ── 主 Agent 节点 ──────────────────────────────────────
-    "safety_filter":         ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
-    "safety_llm_confirm":    ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),  # v2: 安全异步并行二次确认
-    "fast_triage":           ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
-    "inline_reply":          ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
-    "lightweight_plan_ops":  ("doubao-seed-2.0-code", "glm-5.2"),
-    "lightweight_plan_meta": ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
-    "scenario_plan":         ("glm-5.2",              "deepseek-v4-pro"),
-    "evaluate_completion":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
-    "final_reply":           ("glm-5.2",              "deepseek-v4-pro"),
+    "safety_filter":         ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "safety_llm_confirm":    ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "fast_triage":           ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "inline_reply":          ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "lightweight_plan_ops":  ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "lightweight_plan_meta": ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "scenario_plan":         ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "evaluate_completion":   ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "final_reply":           ("deepseek-v4-pro", "deepseek-v4-pro"),
     # ── 记忆系统（Phase 2 三件套）─────────────────────────
-    "summary":               ("doubao-seed-2.0-lite", "deepseek-v4-flash"),  # 档 2 滚动摘要
-    "extract_long_term":     ("glm-5.2",              "deepseek-v4-pro"),    # 档 3 长期抽取
-    "topic_consolidate":     ("doubao-seed-2.0-lite", "deepseek-v4-flash"),  # topic 粗粒度合并
+    "summary":               ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "extract_long_term":     ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "topic_consolidate":     ("deepseek-v4-pro", "deepseek-v4-pro"),
     # ── 子 Agent 内部 ──────────────────────────────────────
-    "ingest_evaluate":   ("doubao-seed-2.0-mini", "doubao-seed-2.0-lite"),
-    "ingest_survey":     ("doubao-seed-2.0-pro",  "glm-5.2"),
-    "cluster_label":     ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
-    "gap_discovery":     ("glm-5.2",              "deepseek-v4-pro"),
-    "citation_filter":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
-    "translation":       ("glm-5.2",              "doubao-seed-2.0-pro"),
-    "video_summarize":   ("doubao-seed-2.0-pro",  "glm-5.2"),
-    "video_analyze":     ("glm-5.2",              "deepseek-v4-pro"),
-    "rad_query_route":   ("doubao-seed-2.0-lite", "deepseek-v4-flash"),
-    "rad_query_answer":  ("doubao-seed-2.0-pro",  "glm-5.2"),
+    "ingest_evaluate":   ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "ingest_survey":     ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "cluster_label":     ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "gap_discovery":     ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "citation_filter":   ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "translation":       ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "video_summarize":   ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "video_analyze":     ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "rad_query_route":   ("deepseek-v4-pro", "deepseek-v4-pro"),
+    "rad_query_answer":  ("deepseek-v4-pro", "deepseek-v4-pro"),
 }
 
-# 默认模型 (向后兼容: 未传 node 时, LLMClientV2 用 provider 自带 model)
-DEFAULT_MODEL_PRIMARY: str = "doubao-seed-2.0-lite"
-DEFAULT_MODEL_FALLBACK: str = "deepseek-v4-flash"
+DEFAULT_MODEL_PRIMARY: str = LLM_MODEL
+DEFAULT_MODEL_FALLBACK: str = LLM_MODEL
 
 
 def get_model_for_node(node_name: str) -> tuple[str, str]:
-    """返回 (primary, fallback) 模型 ID。
-
-    未知节点返回默认 (doubao-seed-2.0-lite, deepseek-v4-flash)。
-    所有模型均走火山引擎 (同一 VOLCANO_API_KEY), 只是 model ID 不同,
-    一个 SDK 即可切换, provider / base_url / api_key 不变。
-    """
+    """返回 (primary, fallback) 模型 ID。"""
     return MODEL_ROUTES.get(
         node_name, (DEFAULT_MODEL_PRIMARY, DEFAULT_MODEL_FALLBACK)
     )

@@ -87,7 +87,7 @@ class AgentManifest:
 
     @property
     def llm_provider(self) -> str:
-        return ((self.data.get("runtime") or {}).get("llm") or {}).get("provider", "volcano")
+        return ((self.data.get("runtime") or {}).get("llm") or {}).get("provider", "deepseek")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -136,7 +136,7 @@ class AgentBootstrap:
 
     # ── 核心组件构建（创建/恢复共用） ─────────────────
 
-    async def _build_core(self, manifest_data: dict, llm_provider: str = "volcano"):
+    async def _build_core(self, manifest_data: dict, llm_provider: str = "deepseek"):
         """统一构建 db / llm / tools / memory，避免 _create/_resume 重复代码。"""
         from ..config import use_postgresql
 
@@ -182,7 +182,7 @@ class AgentBootstrap:
     async def _resume(self) -> dict:
         """从已有的 manifest 恢复 Agent。"""
         manifest_data = self.manifest.load()
-        llm_provider = ((manifest_data.get("runtime") or {}).get("llm") or {}).get("provider", "volcano")
+        llm_provider = ((manifest_data.get("runtime") or {}).get("llm") or {}).get("provider", "deepseek")
         await self._build_core(manifest_data, llm_provider=llm_provider)
         # 更新 manifest 状态
         manifest_data.setdefault("agent", {})["status"] = "active"
@@ -211,10 +211,10 @@ class AgentBootstrap:
                 "status": "active",
             },
             "runtime": {
-                "llm": {"provider": "volcano"},
+                "llm": {"provider": "deepseek"},
             },
         }
-        await self._build_core(manifest_data, llm_provider="volcano")
+        await self._build_core(manifest_data, llm_provider="deepseek")
         self._db.create_session(agent_id, "main", title="新对话", user_id=self.user_id)
         self.manifest.save(manifest_data)
         return {

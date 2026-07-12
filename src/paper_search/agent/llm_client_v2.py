@@ -81,6 +81,13 @@ class ProviderConfig:
 
 # 内置供应商模板
 _PROVIDER_TEMPLATES: dict[str, ProviderConfig] = {
+    "deepseek": ProviderConfig(
+        name="deepseek",
+        base_url="https://api.deepseek.com/anthropic",
+        model="deepseek-v4-pro",
+        max_rpm=500,
+        max_tpm=200_000,
+    ),
     "volcano": ProviderConfig(
         name="volcano",
         base_url="https://ark.cn-beijing.volces.com/api/plan",
@@ -355,7 +362,7 @@ class LLMClientV2:
 
     def __init__(
         self,
-        provider: str = "volcano",
+        provider: str = "deepseek",
         max_tokens: int = 4096,
         default_temperature: float = 0.3,
     ):
@@ -364,6 +371,9 @@ class LLMClientV2:
         self._current_provider = provider
         self.max_tokens = max_tokens
         self.default_temperature = default_temperature
+        # Debug mode: when set, raw LLM events (thinking, tool_use) are pushed via this callback
+        self.on_raw_event: Optional[Callable[[str, dict]], None] = None
+        self._debug_mode = os.environ.get("DEBUG_PROTOCOL", "") == "1"
 
         # 加载内置模板
         for name, tmpl in _PROVIDER_TEMPLATES.items():
@@ -394,7 +404,15 @@ class LLMClientV2:
         except ImportError:
             pass
 
-        # 火山引擎
+        # DeepSeek (primary) — LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+        if key := os.environ.get("LLM_API_KEY"):
+            self._providers["deepseek"].api_key = key
+        if url := os.environ.get("LLM_BASE_URL"):
+            self._providers["deepseek"].base_url = url
+        if model := os.environ.get("LLM_MODEL"):
+            self._providers["deepseek"].model = model
+
+        # 火山引擎 (backward compat)
         if key := os.environ.get("VOLCANO_API_KEY"):
             self._providers["volcano"].api_key = key
             self._providers["volcano"].extra_headers["x-api-key"] = key
@@ -406,6 +424,16 @@ class LLMClientV2:
         # Anthropic
         if key := os.environ.get("ANTHROPIC_API_KEY"):
             self._providers["anthropic"].api_key = key
+
+    def _emit_debug(self, event_type: str, data: dict):
+        """Fire raw event to debug callback (non-blocking, schedules async task)."""
+        if self._debug_mode and self.on_raw_event:
+            try:
+                import asyncio
+                # Schedule the coroutine rather than awaiting it (non-blocking)
+                asyncio.ensure_future(self.on_raw_event(event_type, data))
+            except Exception:
+                pass
 
     # ── Provider Management ───────────────────────────────
 
@@ -605,6 +633,8 @@ class LLMClientV2:
                 # Anthropic 协议：强制 LLM 必须调用指定 tool（不允许自由文本回复）
                 # 让结构化输出可靠性从 ~90% 提升到 ≥99%
                 payload["tool_choice"] = {"type": "tool", "name": tools[0].name}
+                # DeepSeek v4 Pro: thinking mode does not support tool_choice
+                payload["thinking"] = {"type": "disabled"}
 
         # 速率限制
         await self._get_rate_limiter().acquire()
@@ -670,9 +700,15 @@ class LLMClientV2:
             content_text = content
         elif isinstance(content, list):
             for block in content:
-                if block.get("type") == "text":
+                bt = block.get("type", "")
+                if bt == "text":
                     content_text += block.get("text", "")
-                elif block.get("type") == "tool_use":
+                elif bt == "thinking":
+                    # DeepSeek v4 Pro thinking block — skip, wait for text/tool_use
+                    logger.debug(f"LLM thinking block ({len(block.get('thinking', ''))} chars), waiting for text...")
+                    self._emit_debug("thinking", {"thinking": block.get("thinking", "")[:500]})
+                    continue
+                elif bt == "tool_use":
                     tool_calls.append(ToolCall(
                         id=block.get("id", ""),
                         name=block.get("name", ""),
@@ -834,9 +870,7 @@ class LLMClientV2:
                         tool_use_buffers: dict[str, dict] = {}
 
                         async for line in response.aiter_lines():
-                            if not line:
-                                continue
-
+                            # Feed every line including empty ones — they are SSE event separators
                             events = parser.feed(line + "\n")
                             for event in events:
                                 if event.get("type") == "done":
@@ -847,9 +881,15 @@ class LLMClientV2:
 
                                 if delta_type == "content_block_delta":
                                     delta = event.get("delta", {})
-                                    if delta.get("type") == "text_delta":
+                                    dt = delta.get("type", "")
+                                    if dt == "text_delta":
                                         yield {"type": "text_delta", "text": delta.get("text", "")}
-                                    elif delta.get("type") == "input_json_delta":
+                                    elif dt == "thinking_delta":
+                                        # DeepSeek v4 Pro thinking — skip, wait for text/tool_use
+                                        self._emit_debug("thinking_delta",
+                                            {"thinking": delta.get("thinking", "")[:200]})
+                                        pass
+                                    elif dt == "input_json_delta":
                                         idx = event.get("index", 0)
                                         if idx not in tool_use_buffers:
                                             tool_use_buffers[idx] = {"partial_json": ""}
@@ -857,7 +897,11 @@ class LLMClientV2:
 
                                 elif delta_type == "content_block_start":
                                     block = event.get("content_block", {})
-                                    if block.get("type") == "tool_use":
+                                    bt = block.get("type", "")
+                                    if bt == "thinking":
+                                        # DeepSeek v4 Pro thinking block — skip
+                                        pass
+                                    elif bt == "tool_use":
                                         idx = event.get("index", 0)
                                         tool_use_buffers[idx] = {
                                             "id": block.get("id", ""),

@@ -2,7 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent LangGraph StateGraph · [anti-hallucination.md](docs/development/anti-hallucination.md) — 反幻觉策略 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — LangGraph 三件套 + 双存储
+> **架构文档索引**: [main-agent.md](docs/development/main-agent.md) — MainAgent LangGraph StateGraph · [anti-hallucination.md](docs/development/anti-hallucination.md) — 反幻觉策略 · [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 · [memory-system.md](docs/development/memory-system.md) — LangGraph 三件套 + 双存储 · [api-reference.md](docs/development/api-reference.md) — API 参考文档
+>
+> **在线文档下载**: 服务启动后访问 `http://host:8000/paper/docs` 获取最新文档（自动同步文件时间戳，无需手动维护）
 
 ## 项目概述
 
@@ -10,9 +12,9 @@ Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/
 
 - **产品形态**: Python 后端 (FastAPI + WebSocket) + iOS 客户端
 - **主 Agent**: MainAgent (LangGraph StateGraph 6 节点 + JSON Schema 强约束 + safety 双闸 + evaluate 5 出口)
-- **消息链路**: Outbox 模式 (Redis List + SQLite 持久化 + APNs 离线推送)
-- **记忆系统**: LangGraph 三件套（Checkpointer 短期 / Store 长期 / 消息窗口管理）+ ChromaDB+SQLite 双层存储
-- **存储**: SQLite (业务表 + LangGraph Checkpointer 标准 3 表) + ChromaDB (向量) + Redis (队列) + 文件系统 (PDF/MD/Video)
+- **消息链路**: Outbox 模式 (Redis List + PostgreSQL 持久化 + APNs 离线推送)
+- **记忆系统**: LangGraph 三件套（Checkpointer 短期 / Store 长期 / 消息窗口管理）+ pgvector 向量存储
+- **存储**: PostgreSQL+pgvector (业务表 + 向量) + Redis (队列) + 文件系统 (PDF/MD/Video)
 - **定时任务**: Celery Beat (订阅检查 + health_check + cleanup_logs + consolidate_long_term)
 
 ## 启动方式
@@ -45,56 +47,53 @@ sudo apt install ffmpeg redis-server
 
 ## 核心架构
 
-### 主 Agent — LangGraph StateGraph 6 节点 (MainAgent v2)
+### 主 Agent — v3.1 Fast Triage + ReAct Execute
 
 ```
 WS 消息 → BRPOP agent:ws:{agent_id}
               ↓
-       safety_regex_guard (同步 regex 快速通道, ~10ms)
+       Fast Triage (flash, no thinking, tool_choice)
+       → {chat, ops, research} 三维独立打分 + brief_reply
               ↓
-       safe? ─── no(高危) ──→ 推 high 拒答 → END
-              ↓ yes / regex 命中需复查
-              │  ↓ 异步并行启动 safety_llm task (asyncio.create_task)
-              ↓
-       intent_classify (LLM #1, IntentClassifyResult)
-              ↓
-       intent_kind ∈ {business, chat, meta, unsupported}
-              ↓
-       intent_kind == business?
-              ↓
-         ┌────┴────┐
-        yes        no
-         ↓          ↓
-   maybe_clarify_low_confidence (C3)
-   ├ 高置信 scenarios → 保留
-   ├ 部分高 → 留高丢低
-   └ 全低 → ask_user 列候选 + "都不是"
-         ↓             ↓
-   scenario_plan    inline_reply (LLM 流式 thinking+text)
-   (LLM #2,            ↓
-    ScenarioPlanResult)  END
-   ├ 多 scenario 时逐场景生成子 plan → 合并 tools[]
-   ├ needs_clarify? → ask_user_question
-   ├ needs_approval? → propose_plan
-   └ execute_plan (并行调度 tools[] / sub_agent / ios_tool / ask_user)
-         ↓ (每个 tool 调用前 regex 二次检测；节点边界检 safety_llm task)
-   evaluate_completion (LLM #4, EvaluateCompletionResult v2)
-         ↓
-   next_action ∈ {done, retry_tools, ask_user, replan, fail}
-         ├ done       → publish 前最后 await safety_llm → END
-         ├ retry_tools → execute_plan
-         ├ ask_user   → 推 ask + 等回复 → evaluate_completion
-         ├ replan     → scenario_plan (带 replan_hint)
-         └ fail       → END (推 fail final_message)
-         
-   总轮数硬上限：8 轮（replan 不限次数，靠总轮数兜底）
+    ┌─────────┼─────────┐
+    ▼         ▼         ▼
+  chat      ops    research
+    │         │         │
+    ▼         ▼         ▼
+ inline   Execute   Intent Classify (flash, no thinking)
+ reply   (ReAct)    → scenarios[]
+  END    (自由工具)      │
+                         ▼
+                   Scenario Plan (pro, no thinking, tool_choice)
+                   → {todos[], needs_clarify, danger_level}
+                         │
+                   needs_clarify? → ask → 用户回 → 重新 Plan
+                         │
+                         ▼
+                   Execute (pro, thinking, ReAct loop)
+                   → todo 内自由工具调用 (agent_* 子Agent + 普通tool)
+                   → 同一轮 tool_use 并行，跨轮串行
+                   → 每个 todo 结束 → checkpoint (flash)
+                         │
+                         ▼
+                   Evaluate (flash, no thinking, tool_choice)
+                   → {done, retry, ask_user, replan, fail}
 ```
 
-文件: [src/paper_search/agent/main_agent.py](src/paper_search/agent/main_agent.py) · [graphs/main_graph.py](src/paper_search/agent/graphs/main_graph.py) (Phase 2) · prompts/schemas: [main_agent_prompts.py](src/paper_search/agent/main_agent_prompts.py)
+**模型策略**：
+
+| 节点类型 | 模型 | thinking | tool_choice |
+|------|:---:|:---:|:---:|
+| 结构化判断 (Triage/Intent/Plan/Eval/Checkpoint) | `deepseek-v4-flash` | 禁用 | 强制 |
+| 生成类 (Execute ReAct/inline_reply) | `deepseek-v4-pro` | 开启 | 无 |
+
+**Tool 命名规范**：子 Agent 以 `agent_` 前缀（`agent_search`, `agent_ingest`, `agent_survey`），普通 tool 无前缀。LLM 不区分两者——都是 tool_use。
 
 **安全双闸**：(1) 入口 regex 同步秒过；(2) regex 命中后 LLM 异步并行二次确认，主流程不阻塞；(3) 每个 tool 调用前再过一次 regex 检测 arguments。fail-closed 纪律：LLM 不可用时一律拒答（详见 [anti-hallucination.md L4](docs/development/anti-hallucination.md)）。
 
-**evaluate_completion 5 出口**：扩展 `next_action` 支持 `ask_user`（需用户判断）和 `replan`（方向不对需重规划）。`INTENT_ASK_THRESHOLD` 环境变量（默认 0.6）控制 C3 灰区阈值。
+**evaluate_completion 5 出口**：`done` / `retry_tools` / `ask_user` / `replan` / `fail`。总轮数硬上限 8 轮。`INTENT_ASK_THRESHOLD` 默认 0.6 控制 C3 灰区。
+
+详细架构见: [main-agent.md](docs/development/main-agent.md)
 
 ### 17 个业务场景
 
@@ -134,7 +133,7 @@ WS 消息 → BRPOP agent:ws:{agent_id}
 ### 出站消息链路 — Outbox 模式
 
 ```
-MainAgent → outbox_publish() ─┬─ SQLite ws_messages (持久化)
+MainAgent → outbox_publish() ─┬─ PostgreSQL ws_messages (持久化)
                                └─ Redis LPUSH outbox:{agent_id}
                                         ↓
                               outbox_poller (API 进程)
@@ -150,6 +149,8 @@ MainAgent → outbox_publish() ─┬─ SQLite ws_messages (持久化)
 ```
 
 文件: [outbox.py](src/paper_search/agent/outbox.py) · [outbox_poller.py](src/paper_search/api/outbox_poller.py) · [apns_pusher.py](src/paper_search/api/apns_pusher.py) (Phase 1 骨架，aioapns 后补)
+
+**v10 capabilities**: WS handler 缓存 iOS 端上报的 `capabilities` 列表到 `_capabilities_cache`（`app.py:47` 模块级 dict），发 `tool/call` 前检查能力是否在列表中。
 
 ### 消息重要性
 
@@ -169,29 +170,29 @@ MainAgent → outbox_publish() ─┬─ SQLite ws_messages (持久化)
          → send {type: "sync_complete", payload: {synced_count: N}}
 ```
 
-### 记忆系统 — LangGraph 三件套 + 双层存储
+### 记忆系统 — LangGraph 三件套 + pgvector
 
 详见 [docs/development/memory-system.md](docs/development/memory-system.md)
 
-**对外口径（简历版）**：基于 LangGraph Checkpointer/Store 实现短期与长期记忆管理，配合 ChromaDB+SQLite 双层存储完成 RAG 检索。
+**对外口径（简历版）**：基于 LangGraph Checkpointer/Store 实现短期与长期记忆管理，配合 pgvector 向量存储完成 RAG 检索。
 
 | 件 | 名称 | 作用域 | 实现 | 存什么 |
 |:---:|---|---|---|---|
-| ① | **Checkpointer** | thread-scoped（短期）| `AsyncSqliteSaver` 同库 | graph state（messages / phase / tool_results） |
-| ② | **Store** | cross-thread（长期）| `DualBackendStore`（SQLite + ChromaDB 按 namespace 路由）| 用户偏好/画像/会话摘要/topic/策略/错误/知识 |
+| ① | **Checkpointer** | thread-scoped（短期）| `AsyncSqliteSaver`（待迁移 PG） | graph state（messages / phase / tool_results） |
+| ② | **Store** | cross-thread（长期）| `DualBackendStore`（SQLite + ChromaDB，待迁移 PG） | 用户偏好/画像/会话摘要/topic/策略/错误/知识 |
 | ③ | **消息窗口管理** | 上下文窗口控制 | `trim_messages` + `SummarizationNode` + langmem | 滚动摘要 + 长期抽取 |
 
-**Store 三层 8 个 namespace**：
+**Store 三层 8 个 namespace**（当前仍走 SQLite+ChromaDB，PG 迁移中）：
 
 ```
-(agent_id, "preferences")            ─ SQLite，用户偏好
-(agent_id, "profile")                ─ SQLite，用户画像
-(agent_id, "episodes", session_id)   ─ ChromaDB，会话摘要
-(agent_id, "topics", topic_slug)     ─ ChromaDB，主题摘要（粗粒度按研究方向）
-(agent_id, "strategies")             ─ SQLite，策略学习
-(agent_id, "errors")                 ─ SQLite，错误模式
-(agent_id, "knowledge", "papers")    ─ ChromaDB，论文元数据
-(agent_id, "knowledge", "chunks")    ─ ChromaDB，论文 chunk
+(agent_id, "preferences")            ─ 用户偏好
+(agent_id, "profile")                ─ 用户画像
+(agent_id, "episodes", session_id)   ─ 会话摘要
+(agent_id, "topics", topic_slug)     ─ 主题摘要（粗粒度按研究方向）
+(agent_id, "strategies")             ─ 策略学习
+(agent_id, "errors")                 ─ 错误模式
+(agent_id, "knowledge", "papers")    ─ 论文元数据
+(agent_id, "knowledge", "chunks")    ─ 论文 chunk
 ```
 
 **三档压缩**：
@@ -265,8 +266,9 @@ src/paper_search/
 │   ├── store.py                    # [Phase 2 新增] DualBackendStore（SQLite + ChromaDB 路由）
 │   ├── summarizer.py               # [Phase 2 新增] 档 2 SummarizationNode + map-reduce
 │   ├── message_trim.py             # [Phase 2 新增] 档 1 trim_messages 封装
-│   ├── outbox.py                   # 出站消息双写 (SQLite + Redis List)
-│   ├── db.py                       # SQLite 持久化 (AgentDB)
+│   ├── outbox.py                   # 出站消息双写 (PostgreSQL + Redis List)
+│   ├── db.py                       # SQLite 持久化 (AgentDB) — [v3 Phase 1] 逐步切换到 pgdb
+│   ├── pgdb.py                     # [v3 Phase 1] PostgreSQL 持久化 (PostgresAgentDB)
 │   ├── memory.py                   # [Phase 2 废弃] MemGPT 4 层（迁移到 checkpointer + store）
 │   ├── llm_client_v2.py            # 多供应商 LLM（[Phase 2 修复] _chat_once 加 tool_choice）
 │   ├── tool_registry.py            # 56 工具 + update_preference（新增）
@@ -279,7 +281,8 @@ src/paper_search/
 │   ├── video_downloader.py         # yt-dlp 封装
 │   ├── video_browser.py            # CloakBrowser 封装
 │   ├── knowledge.py                # RAG 问答 + 知识提取
-│   ├── chroma_store.py             # ChromaDB 集合管理
+│   ├── chroma_store.py             # ChromaDB 集合管理 — [v3 Phase 1] 逐步切换到 pgvector_store
+│   ├── pgvector_store.py           # [v3 Phase 1] pgvector 向量存储 (PgVectorStore)
 │   ├── pdf_converter.py            # PDF→Markdown
 │   ├── chunker.py                  # Section-aware 分块
 │   ├── journal_ranker.py           # CCF+SCI 期刊分级
@@ -318,21 +321,31 @@ src/paper_search/
 
 ---
 
-## SQLite 关键表
+## PostgreSQL 关键表（v3 Phase 1 已迁移）
 
-| 表 | 用途 | Phase |
+> Schema: [scripts/init_db.sql](scripts/init_db.sql) · 迁移脚本: [scripts/migrate_to_postgres.py](scripts/migrate_to_postgres.py)
+>
+> **当前状态**：Daemon + API 已切 PostgreSQL；Checkpointer/Store/Celery/CLI/ToolRegistry 仍走 SQLite（代码残留 ~80 处，逐批迁移中）。
+>
+> **SQLite 兼容文件**（`agent.db`）：仍存在于 `~/.paper_search/agent.db`（~1MB），作为迁移源保留。PG 后端不可用时回退到 SQLite（`use_postgresql()` 检查 `DATABASE_URL` 环境变量）。
+
+| 表 | 用途 | 迁移状态 |
 |---|---|---|
-| `ws_messages` | 出站消息持久化（msg_id/priority_kind/delivered_sessions/apns_sent_at） | Phase 1 |
-| `device_tokens` | iOS APNs 设备 token | Phase 1 |
-| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | LangGraph Checkpointer 标准 3 表（graph state 快照） | **Phase 2 新增** |
-| `store_data` | LangGraph Store SQLite 后端数据（preferences/profile/strategies/errors namespace） | **Phase 2 新增** |
-| `conversation_archive` | 档 2 摘要后归档的原始 messages（可回溯） | **Phase 2 新增** |
-| `hallucination_events` | 反幻觉专用 telemetry（与 Checkpointer history 互补） | Phase 2 |
-| `task_checkpoints` | 业务任务进度（**非 Checkpointer**，留作 S7 进度查询） | 已有 |
-| `knowledge_entries` | extract_knowledge 抽取的 method/contribution/limitation | 已有 |
-| `journal_ranks` | CCF+SCI 期刊分级 | 已有 |
-| ~~`agent_events`~~ | ~~主 Agent 状态变更事件~~（**Phase 2 废弃**：由 Checkpointer history 替代） | ❌ Phase 2 删除 |
-| ~~`user_preferences` / `strategy_log` / `error_patterns`~~ | ~~MetaMemory 表~~（**Phase 2 迁移**：并入 Store SQLite 后端 namespace） | ❌ Phase 2 迁移 |
+| `ws_messages` | 出站消息持久化 | ✅ PG |
+| `device_tokens` | iOS APNs 设备 token | ✅ PG |
+| `users` | 多用户账户 + api_token | ✅ PG (v3 新增) |
+| `sessions` | 会话管理 | ✅ PG (v3 新增) |
+| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | LangGraph Checkpointer 3 表 | 🔶 SQLite (待迁移) |
+| `store_data` | LangGraph Store 数据 | 🔶 SQLite (待迁移) |
+| `conversation_archive` | 档 2 摘要后归档 | 🔶 SQLite (待迁移) |
+| `hallucination_events` | 反幻觉 telemetry | 🔶 SQLite (待迁移) |
+| `task_checkpoints` | 业务任务进度 (S7) | 🔶 SQLite (待迁移) |
+| `knowledge_entries` | extract_knowledge 抽取 | 🔶 SQLite (待迁移) |
+| `journal_ranks` | CCF+SCI 期刊分级 | 🔶 SQLite (待迁移) |
+| `paper_chunks` | 论文向量 chunk | ✅ pgvector |
+| `glossary_embeddings` | 术语库向量 | ✅ pgvector |
+| ~~`agent_events`~~ | ~~主 Agent 状态变更事件~~ | ❌ 废弃 |
+| ~~`user_preferences` / `strategy_log` / `error_patterns`~~ | ~~MetaMemory 表~~ | ❌ 废弃 |
 
 ---
 
@@ -357,11 +370,13 @@ src/paper_search/
 | `ELSEVIER_API_KEY` | ScienceDirect |
 | `IEEE_API_KEY` | IEEE Xplore |
 | `WEB_SEARCH_API_KEY` | 火山引擎联网搜索 (500次/月) |
+| `DATABASE_URL` | PostgreSQL 连接 (设置后启用 PG 后端；不设则回退 SQLite) |
 | `REDIS_URL` | Redis 连接 (默认 `redis://localhost:6379/0`) |
 | `WHISPER_MODEL_SIZE` | Whisper 模型大小 (默认 `small`) |
 | `CLOAKBROWSER_HEADLESS` | 浏览器无头模式 (默认 `1`) |
 | `SUBSCRIPTION_CHECK_INTERVAL_MINUTES` | 订阅检查间隔 (默认 `60`) |
 | `INTENT_ASK_THRESHOLD` | C3 灰区阈值 (默认 `0.6`)：所有 scenario.confidence < 此值时触发 ask_user 让用户挑选场景 |
+| `DEBUG_PROTOCOL` | `=1` 时服务端推 `status{level:debug}` 消息（含 LLM thinking 过程）；默认不推 |
 | `API_KEY` | Bearer Token (REST API 认证，不设则禁用) |
 | `APNS_KEY_PATH` / `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` / `APNS_USE_SANDBOX` | APNs 推送 (Phase 1 骨架就位，aioapns 后补) |
 
@@ -372,14 +387,16 @@ src/paper_search/
 ```
 # Core
 langgraph>=0.6                          # StateGraph + AsyncSqliteSaver + Store
-langgraph-checkpoint-sqlite>=2.0        # [Phase 2] Checkpointer SQLite 后端
-langgraph-store-sqlite>=0.1             # [Phase 2] Store SQLite 后端（如启用）
+langgraph-checkpoint-sqlite>=2.0        # [Phase 2] Checkpointer SQLite 后端 (待迁移 PG)
+langgraph-store-sqlite>=0.1             # [Phase 2] Store SQLite 后端 (待迁移 PG)
 langmem>=0.0.10                         # [Phase 2] create_memory_manager / SummarizationNode
 fastapi>=0.110, uvicorn[standard]>=0.27
 celery[redis]>=5.4, redis>=5.0
 httpx>=0.27, pydantic>=2
 arxiv>=2.3, biopython, metapub
 pymupdf4llm, chromadb
+psycopg2-binary>=2.9                    # [v3 Phase 1] PostgreSQL 驱动
+pgvector>=0.3                            # [v3 Phase 1] pgvector Python 客户端
 python-dotenv, rich>=13
 
 # Video (optional)
@@ -400,8 +417,9 @@ Python >= 3.11
 
 | 模块 | 状态 | 说明 |
 |---|:---:|---|
-| MainAgent v1.1 (自研 6 节点) | ✅ | 当前实现；Phase 2 重写为 LangGraph StateGraph |
-| MainAgent v2.0 (LangGraph StateGraph) | 📐 | 文档定型（[main-agent.md](docs/development/main-agent.md)），代码 Phase 2 |
+| **v3 Phase 1: PostgreSQL+pgvector** | 🔶 | Daemon + API 已切 PG；Checkpointer/Store/Celery/CLI/ToolRegistry 残留 ~80 处 SQLite 硬编码 |
+| MainAgent v3.1 (Fast Triage + ReAct) | 📐 | 文档定型（[main-agent.md](docs/development/main-agent.md)），代码 Phase 2 |
+| MainAgent v1.1 (自研 6 节点) | ✅ | 当前运行；v3.1 重构中 |
 | LLM JSON Schema 强约束 | 🔶 | 当前 chat_json 用 tool 包装但缺 tool_choice 强制；Phase 2 修复 |
 | 17 业务场景 | ✅ | 完整覆盖 + intent_classify 路由（支持复合意图） |
 | 安全前置 (C1) | ✅ | regex 黑名单 + LLM 二次确认 |
@@ -438,7 +456,7 @@ Python >= 3.11
 
 | # | 功能 | 工作量 | 备注 |
 |---|------|:---:|------|
-| 1 | **v3 Phase 1：基础设施重构**（PostgreSQL+pgvector + 多用户 + 冷启动 + 数据迁移）| 2 周 | 当前优先，详见 [backend-dev-plan](docs/development/backend-development-plan.md) |
+| 1 | **v3 Phase 1：基础设施重构**（PostgreSQL+pgvector + 多用户 + 冷启动 + 数据迁移）| 2 周 | 🔶 Daemon/API 已切 PG；~80 处 SQLite 硬编码待迁移（celery_tasks/tool_registry/cli/checkpointer/store/tests） |
 | 2 | v3 Phase 2：Agent 架构重构（ingest 拆分 + Writing/Glossary 新建 + Celery）| 2 周 | |
 | 3 | v3 Phase 3：引用标记与验证（内外双通道 + 并行调度）| 2 周 | |
 | 4 | v3 Phase 4：评估体系与收尾（检索质量 + 反幻觉 + Zotero）| 2 周 | |

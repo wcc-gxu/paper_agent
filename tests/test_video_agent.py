@@ -283,7 +283,7 @@ class TestVideoAgentNodes:
             "user_query": "https://v.douyin.com/ABC123/ 看看",
         })
         assert "error" not in result
-        assert result["url"] == "https://v.douyin.com/ABC123/"
+        assert result["url"] == "https://v.douyin.com/ABC123"  # trailing / stripped by parse_link
         assert result["platform"] == "douyin"
 
     @pytest.mark.asyncio
@@ -306,11 +306,13 @@ class TestVideoAgentNodes:
         assert "error" in result
 
     @pytest.mark.asyncio
-    async def test_transcribe_no_whisper_model(self, agent):
+    async def test_transcribe_no_whisper_model(self, agent, tmp_path):
         """未加载 Whisper 模型时的错误处理。"""
+        af = tmp_path / "test.wav"
+        af.write_text("")  # create empty file
         result = await agent._transcribe_node({
             "duration_seconds": 60,
-            "audio_path": "/tmp/test.wav",
+            "audio_path": str(af),
         })
         assert "error" in result
         assert result["transcription_skipped"] is True

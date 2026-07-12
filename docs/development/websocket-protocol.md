@@ -242,6 +242,16 @@ LLM 完整 Markdown 回复。**一次性发送,不流式 token**(长综述生成
 
 iOS 收到后执行本地 tool(可能弹系统授权弹窗,如 EventKit/CoreLocation 权限),完成后回 `tool_result`(见 §3.4)。当前 iOS 端 tool(9 个,注册于 [tool_registry.py](../../src/paper_search/agent/tool_registry.py)):`ios_file_read` / `ios_file_write` / `ios_file_list` / `ios_calendar_add` / `ios_calendar_read` / `ios_reminder_add` / `ios_notification_local` / `ios_device_info` / `ios_location_get`。
 
+**v3.1 tool 命名规范**：
+
+| 前缀 | 含义 | 示例 | WS 通知 |
+|------|------|------|:---:|
+| `agent_` | 子 Agent（独立 LangGraph 图，长任务） | `agent_search`, `agent_ingest`, `agent_survey` | `tool/start → progress → result` |
+| `ios_` | iOS 端本地 tool | `ios_calendar_add` | `tool/call` → `tool_result` |
+| 无前缀 | 主 Agent 本地 tool | `search_papers`, `ask_user` | 直接 `tool/result` |
+
+从 LLM 视角，所有类型都是 tool_use，不需要区分。前缀仅用于服务端 dispatch 和 WS 通知策略。
+
 ### 2.4 `ask` — 用户操作入口(v10 核心)
 
 **iOS 必须实现的唯一交互 tool**。所有需要用户授权或澄清的场景统一走 `ask`,通过 `kind` 字段切换五种渲染形态。带 `ask_id` 用于关联回答。
@@ -465,6 +475,40 @@ iOS 每条 outbound 消息(即 server 视角的 inbound)都带 `capabilities: st
 | `debug` | `DEBUG_PROTOCOL=1` 环境变量 | **仅 iOS dev build 渲染**;生产 build 忽略 |
 
 `level=debug` 的 status 用于排查内部编排问题(如"intent_classify LLM 返回了什么 JSON"),`message` 字段可放原始 LLM 输出摘要。生产环境服务端不发 debug status,生产 iOS 即便收到也不渲染——双保险。
+
+#### 5.2.1 thinking_delta 思考过程可见 (v10.1 新增)
+
+当 `DEBUG_PROTOCOL=1` 时，服务端将 LLM 的 **thinking 过程**（DeepSeek v4 Pro 等推理模型的 chain-of-thought）通过 `status{level:debug}` 推送给客户端：
+
+```json
+{
+  "type": "status",
+  "msg_id": "...",
+  "agentId": "agent-001",
+  "sessionId": "main",
+  "timestamp": "...",
+  "priority": "silent",
+  "payload": {
+    "stage": "llm:thinking_delta",
+    "message": "{'thinking': 'We need to analyze the user query...'}",
+    "level": "debug"
+  }
+}
+```
+
+| stage 值 | 含义 | 触发时机 |
+|---|---|---|
+| `llm:thinking` | LLM 返回完整 thinking block（非流式） | `_parse_response` 遇到 `type=thinking` 块 |
+| `llm:thinking_delta` | LLM 流式返回思考 token | `chat_stream` 收到 `thinking_delta` SSE 事件 |
+| `llm:tool_use` | LLM 调用 tool | `chat_stream` 收到 `tool_use_start` |
+
+**行为**：生产环境（`DEBUG_PROTOCOL` 未设）不推任何 debug status；dev 环境推送但 iOS 生产 build 不渲染。debug 消息走 `priority=silent`，不持久化不 APNs。
+
+#### 5.2.2 thinking 模式与 tool_choice 兼容性
+
+DeepSeek v4 Pro 等推理模型的 thinking 模式 **不支持 `tool_choice`**。服务端自动处理：
+- 普通对话（`chat`/`chat_stream`）：保持 thinking 模式，跳过 `thinking_delta`，等待 `text_delta` 返回最终文本
+- 结构化输出（`chat_json` with `force_tool=True`）：自动添加 `thinking: {type: disabled}` 禁用思考模式
 
 ### 5.3 立即 ack 约束
 

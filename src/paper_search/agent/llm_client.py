@@ -79,7 +79,7 @@ class LLMClient:
                     load_dotenv(env_path)
             except ImportError:
                 pass
-            self.api_key = os.environ.get("VOLCANO_API_KEY", "")
+            self.api_key = os.environ.get("LLM_API_KEY") or os.environ.get("VOLCANO_API_KEY", "")
         self.max_tokens = max_tokens
 
     # ── 底层调用 ────────────────────────────────────────

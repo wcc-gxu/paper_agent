@@ -36,11 +36,101 @@ def _uuid(prefix: str = "") -> str:
     return f"{prefix}-{uid}" if prefix else uid
 
 
+class _PgCompatCursor:
+    """psycopg2 cursor 的兼容包装 — 模拟 sqlite3 Cursor 的 .fetchone()/.fetchall()。
+
+    额外提供 __iter__ 支持 ``for row in cursor`` 和 ``dict(row)``。
+    """
+
+    def __init__(self, pg_cursor, conn_wrapper):
+        self._cur = pg_cursor
+        self._conn_wrapper = conn_wrapper
+        self._lastrowid = None
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return row
+        # 如果 psycopg2 没有 RealDictCursor，手动转换为 dict
+        desc = [d[0] for d in self._cur.description] if self._cur.description else []
+        if desc:
+            return dict(zip(desc, row))
+        return row
+
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        desc = [d[0] for d in self._cur.description] if self._cur.description else []
+        if desc and rows and not isinstance(rows[0], dict):
+            return [dict(zip(desc, row)) for row in rows]
+        return rows
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    @property
+    def lastrowid(self):
+        return self._lastrowid
+
+
+class _PgCompatConnection:
+    """psycopg2 connection 的兼容包装 — 模拟 sqlite3.Connection。
+
+    核心能力:
+      - .execute(sql, params) → 返回 _PgCompatCursor（自动转换 ? → %s）
+      - .commit() → 委托给原生 conn.commit()
+      - .close() → 委托给原生 conn.close()
+    """
+
+    def __init__(self, pg_conn):
+        self._pg_conn = pg_conn
+
+    def execute(self, sql: str, params=()):
+        """执行 SQL 查询，兼容 sqlite3 调用风格。
+
+        自动将 SQLite 风格的 ? 占位符替换为 PostgreSQL 的 %s；
+        对已包含 %s 的 SQL 不做重复替换。
+        """
+        if params is None:
+            params = ()
+        # 仅在 SQL 不包含 %s 时做 ? → %s 转换
+        if "%s" not in sql and "?" in sql:
+            sql = sql.replace("?", "%s")
+        cur = self._pg_conn.cursor()
+        try:
+            cur.execute(sql, params)
+        except Exception:
+            self._pg_conn.rollback()
+            cur.close()
+            raise
+        return _PgCompatCursor(cur, self)
+
+    def commit(self):
+        self._pg_conn.commit()
+
+    def close(self):
+        try:
+            self._pg_conn.close()
+        except Exception:
+            pass
+
+    @property
+    def closed(self):
+        return self._pg_conn.closed
+
+
 class PostgresAgentDB:
     """PostgreSQL 数据访问对象，API 兼容 AgentDB (SQLite)。
 
     所有查询自动附带 user_id 过滤，实现多用户数据隔离。
-    使用 psycopg2 同步连接，与现有 SQLite 调用模式一致。
+    使用 psycopg2 同步连接，conn 属性返回 sqlite3 兼容包装。
     """
 
     def __init__(self, dsn: str = None):
@@ -51,9 +141,11 @@ class PostgresAgentDB:
         self._extras = psycopg2.extras
         self.dsn = dsn or os.environ.get("DATABASE_URL", "")
         self._conn = None
+        self._compat_conn = None
 
     @property
-    def conn(self):
+    def _raw_conn(self):
+        """返回原生 psycopg2 connection（内部方法使用）。"""
         if self._conn is None or self._conn.closed:
             if not self.dsn:
                 raise RuntimeError("DATABASE_URL 未设置，无法连接 PostgreSQL")
@@ -61,26 +153,41 @@ class PostgresAgentDB:
             self._conn.autocommit = False
         return self._conn
 
+    @property
+    def conn(self):
+        """返回 sqlite3 兼容的 connection 包装（.execute / .commit / .close）。"""
+        if self._conn is None or self._conn.closed:
+            if not self.dsn:
+                raise RuntimeError("DATABASE_URL 未设置，无法连接 PostgreSQL")
+            self._conn = self._psycopg2.connect(self.dsn)
+            self._conn.autocommit = False
+            self._compat_conn = _PgCompatConnection(self._conn)
+        return self._compat_conn
+
     def close(self):
         if self._conn and not self._conn.closed:
             self._conn.close()
             self._conn = None
 
     def _fetchone(self, sql: str, params: tuple = ()) -> Optional[dict]:
-        cur = self.conn.cursor(cursor_factory=self._extras.RealDictCursor)
+        cur = self._raw_conn.cursor(cursor_factory=self._extras.RealDictCursor)
         cur.execute(sql, params)
         row = cur.fetchone()
         return dict(row) if row else None
 
     def _fetchall(self, sql: str, params: tuple = ()) -> list[dict]:
-        cur = self.conn.cursor(cursor_factory=self._extras.RealDictCursor)
+        cur = self._raw_conn.cursor(cursor_factory=self._extras.RealDictCursor)
         cur.execute(sql, params)
         return [dict(r) for r in cur.fetchall()]
 
     def _execute(self, sql: str, params: tuple = ()):
-        cur = self.conn.cursor()
-        cur.execute(sql, params)
-        self.conn.commit()
+        cur = self._raw_conn.cursor()
+        try:
+            cur.execute(sql, params)
+            self._raw_conn.commit()
+        except Exception:
+            self._raw_conn.rollback()
+            raise
 
     # ═══════════════════════════════════════════════════════════════
     # 用户管理（新增）
@@ -109,7 +216,7 @@ class PostgresAgentDB:
 
     def count_user_papers(self, user_id: str) -> int:
         """获取用户的论文总数（用于冷启动检测）。"""
-        cur = self.conn.cursor()
+        cur = self._raw_conn.cursor()
         cur.execute("SELECT COUNT(*) FROM papers WHERE user_id = %s", (user_id,))
         return cur.fetchone()[0]
 

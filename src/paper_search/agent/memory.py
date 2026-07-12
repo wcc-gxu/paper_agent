@@ -228,7 +228,7 @@ class MidTermMemory:
         """确保 checkpoints 表存在."""
         self._db.conn.execute("""
             CREATE TABLE IF NOT EXISTS task_checkpoints (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 task_id TEXT NOT NULL,
                 step_index INTEGER NOT NULL,
                 step_name TEXT,
@@ -240,7 +240,7 @@ class MidTermMemory:
         """)
         self._db.conn.execute("""
             CREATE TABLE IF NOT EXISTS task_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 task_id TEXT NOT NULL,
                 action TEXT NOT NULL,
                 detail TEXT,
@@ -254,9 +254,12 @@ class MidTermMemory:
         """保存检查点."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._db.conn.execute(
-            """INSERT OR REPLACE INTO task_checkpoints
+            """INSERT INTO task_checkpoints
                (task_id, step_index, step_name, state, results, created_at)
-               VALUES (?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT (task_id, step_index) DO UPDATE SET
+               step_name=EXCLUDED.step_name, state=EXCLUDED.state,
+               results=EXCLUDED.results, created_at=EXCLUDED.created_at""",
             (task_id, step_index, step_name,
              json.dumps(state, ensure_ascii=False),
              json.dumps(results, ensure_ascii=False),
@@ -400,10 +403,15 @@ class LongTermMemory:
         eid = entry.id or _make_id(entry.title + entry.content[:50])
 
         self._db.conn.execute(
-            """INSERT OR REPLACE INTO knowledge_entries
+            """INSERT INTO knowledge_entries
                (id, title, content, category, source_paper_id, source_paper_title,
                 confidence, created_at, updated_at, tags)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT (id) DO UPDATE SET
+               title=EXCLUDED.title, content=EXCLUDED.content, category=EXCLUDED.category,
+               source_paper_id=EXCLUDED.source_paper_id, source_paper_title=EXCLUDED.source_paper_title,
+               confidence=EXCLUDED.confidence, updated_at=EXCLUDED.updated_at,
+               tags=EXCLUDED.tags""",
             (eid, entry.title, entry.content, entry.category,
              entry.source_paper_id, entry.source_paper_title,
              entry.confidence,
@@ -500,7 +508,8 @@ class LongTermMemory:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         val_str = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
         self._db.conn.execute(
-            "INSERT OR REPLACE INTO user_profile (key, value, updated_at) VALUES (?,?,?)",
+            "INSERT INTO user_profile (key, value, updated_at) VALUES (?,?,?) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
             (key, val_str, now),
         )
         self._db.conn.commit()
@@ -571,7 +580,7 @@ class MetaMemory:
     def _ensure_table(self):
         self._db.conn.execute("""
             CREATE TABLE IF NOT EXISTS strategy_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 task_type TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
                 parameters TEXT,
@@ -582,7 +591,7 @@ class MetaMemory:
         """)
         self._db.conn.execute("""
             CREATE TABLE IF NOT EXISTS error_patterns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 error_type TEXT NOT NULL,
                 context TEXT,
                 resolution TEXT,
@@ -684,8 +693,10 @@ class MetaMemory:
             )
         else:
             self._db.conn.execute(
-                "INSERT OR REPLACE INTO user_preferences (key, value, confidence, evidence_count, updated_at) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO user_preferences (key, value, confidence, evidence_count, updated_at) "
+                "VALUES (?,?,?,?,?) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, confidence=EXCLUDED.confidence, "
+                "evidence_count=EXCLUDED.evidence_count, updated_at=EXCLUDED.updated_at",
                 (key, val_str, confidence, 1, now),
             )
         self._db.conn.commit()
