@@ -475,16 +475,30 @@ class ToolRegistry:
 
     def _register_grep_content(self):
         def grep_content(pattern: str, path: str = ".", glob: str = None) -> str:
-            """Search for a pattern in files."""
+            """Search for a pattern in files. Uses rg (ripgrep) if available, falls back to grep -r."""
+            import subprocess as sp
+            # Build glob filter for grep if provided
+            include_flag = []
+            if glob:
+                include_flag = ["--include", glob]
+
+            # Try ripgrep first (much faster)
             try:
-                import subprocess as sp
                 cmd = ["rg", "--no-heading", "-n", "--max-count=50", pattern, path]
                 result = sp.run(cmd, capture_output=True, text=True, timeout=30)
                 return result.stdout[:8000] or "No matches found"
             except FileNotFoundError:
-                return json.dumps({"error": "ripgrep not installed"})
+                pass  # rg not installed, fall through to grep
             except Exception as e:
-                return json.dumps({"error": str(e)})
+                logger.debug(f"rg failed: {e}, trying grep fallback")
+
+            # Fallback to grep -r
+            try:
+                cmd = ["grep", "-rn", "--max-count=50", pattern, path] + include_flag
+                result = sp.run(cmd, capture_output=True, text=True, timeout=30)
+                return result.stdout[:8000] or "No matches found"
+            except Exception as e:
+                return json.dumps({"error": str(e), "hint": "Neither rg nor grep available"})
 
         self.register(
             name="grep_content",

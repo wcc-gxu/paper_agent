@@ -807,7 +807,17 @@ class MainGraph:
                     f"执行 [{todo_label}] 时 LLM 调用失败 (第{round_count}轮): {e}",
                 )
                 tool_results.append({"error": str(e), "todo_id": current_todo.get("id", "")})
-                break
+                # ── 关键: LLM 调用失败 → 停止，不再重试同一个 todo ──
+                # 设置 error 字段让 _route_after_execute 路由到 END，
+                # 同时标记当前 todo 失败，避免无限重试循环
+                return {
+                    "messages": messages,
+                    "tool_call_count": tool_call_count,
+                    "tool_results": tool_results,
+                    "current_todo_index": current_todo_index,
+                    "all_satisfied": False,
+                    "error": f"LLM 调用失败 (第{round_count}轮): {e}",
+                }
 
             if not getattr(response, 'tool_calls', None):
                 # No tool calls — LLM considers this todo complete
@@ -851,17 +861,22 @@ class MainGraph:
 
             # Dispatch tools (parallel within this round)
             batch_results = {}
+            failed_count = 0
             for tc in response.tool_calls:
                 tool_call_count += 1
                 tc_name = getattr(tc, 'name', '?')
                 result = await self._dispatch_tool(tc, session_id)
                 batch_results[getattr(tc, 'id', '')] = result
                 result_summary = str(result)[:500]
+                error_msg = result.get("error") if isinstance(result, dict) else None
+                if error_msg:
+                    failed_count += 1
                 tool_results.append({
                     "tool_call_id": getattr(tc, 'id', ''),
                     "tool_name": tc_name,
                     "todo_id": current_todo.get("id", ""),
                     "result": result_summary,
+                    "error": error_msg,
                 })
 
                 # Push tool result immediately
@@ -891,6 +906,25 @@ class MainGraph:
                     "content": result_text,
                     "tool_call_id": getattr(tc, 'id', ''),
                 })
+
+            # ── 关键: 本轮所有工具全部失败 → 立即停止，不重试 ──
+            if failed_count > 0 and failed_count == len(response.tool_calls):
+                logger.warning(
+                    "All %d tools failed in round %d for todo [%s], stopping",
+                    failed_count, round_count, todo_label,
+                )
+                await self._push_error(
+                    session_id,
+                    f"任务 [{todo_label}] 本轮全部 {failed_count} 个工具调用失败，已停止",
+                )
+                return {
+                    "messages": messages,
+                    "tool_call_count": tool_call_count,
+                    "tool_results": tool_results,
+                    "current_todo_index": current_todo_index,
+                    "all_satisfied": False,
+                    "error": f"全部 {failed_count} 个工具调用失败",
+                }
 
             # Push progress
             await self._push_status(
