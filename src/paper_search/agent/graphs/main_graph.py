@@ -563,10 +563,14 @@ class MainGraph:
         todo_label = current_todo.get("label", f"todo-{current_todo_index}")
         system = build_execute_v31_prompt(current_todo, todos)
 
+        # Build tool definitions for the LLM — without this it can't call tools at all
+        available_tools = self._build_tool_defs(current_todo)
+
         # Push todo start
         await self._push_status(
             session_id, "executing",
-            f"[{current_todo_index + 1}/{len(todos)}] {todo_label}",
+            f"[{current_todo_index + 1}/{len(todos)}] {todo_label}" +
+            (f" — {len(available_tools)} tools available" if available_tools else " — ⚠️ no tools"),
         )
 
         round_count = 0
@@ -581,6 +585,7 @@ class MainGraph:
             try:
                 response = await self.llm.chat(
                     messages=[{"role": "system", "content": system}] + safe_messages,
+                    tools=available_tools if available_tools else None,
                     temperature=0.3,
                     node="execute_v31",
                 )
@@ -710,6 +715,61 @@ class MainGraph:
         except Exception as e:
             logger.warning(f"Tool {name} failed: {e}")
             return {"error": str(e)}
+
+    def _build_tool_defs(self, todo: dict) -> list:
+        """Build Anthropic-compatible tool definitions from todo's tool_calls.
+
+        Looks up each tool in the registry to get its description and input schema,
+        so the LLM knows what tools are available and how to call them.
+        """
+        from ..llm_client_v2 import ToolDef
+
+        tool_defs = []
+        todo_name = todo.get("label", "unknown")
+        for tc in todo.get("tool_calls", []):
+            tc_name = tc.get("name", "")
+            if not tc_name:
+                continue
+            tool = self.registry.get(tc_name) if self.registry else None
+            if tool is None:
+                logger.warning("Tool %s not found in registry (todo: %s)", tc_name, todo_name)
+                # Build a best-effort definition so the LLM can at least try
+                tool_defs.append(ToolDef(
+                    name=tc_name,
+                    description=tc.get("description", f"Execute {tc_name}"),
+                    input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+                ))
+                continue
+
+            # Extract schema from the registry tool
+            schema = {"type": "object", "properties": {}, "additionalProperties": True}
+            if hasattr(tool, 'args_schema') and tool.args_schema is not None:
+                try:
+                    if hasattr(tool.args_schema, 'model_json_schema'):
+                        raw = tool.args_schema.model_json_schema()
+                    elif hasattr(tool.args_schema, 'schema'):
+                        raw = tool.args_schema.schema()
+                    else:
+                        raw = {"type": "object", "properties": {}}
+                    # Clean Pydantic noise: remove $defs, title, etc for Anthropic compat
+                    schema = {
+                        "type": "object",
+                        "properties": raw.get("properties", {}),
+                        "required": raw.get("required", []),
+                    }
+                except Exception:
+                    pass
+
+            tool_defs.append(ToolDef(
+                name=tool.name,
+                description=tool.description or f"Execute {tc_name}",
+                input_schema=schema,
+            ))
+
+        logger.debug("Built %d tool defs for todo [%s]: %s",
+                     len(tool_defs), todo_name,
+                     [td.name for td in tool_defs])
+        return tool_defs
 
     # ── Route: after execute → todo_checkpoint ──────────────
 
