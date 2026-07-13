@@ -257,7 +257,79 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
     agent_id = manifest["agent"]["agent_id"]
     logger.info(f"Agent {agent_id} (user={user_id}) ready, starting MainAgent...")
 
-    # MainAgent (Phase 3+4)
+    # v3.1: Build LangGraph MainGraph
+    from .graphs.main_graph import build_main_graph
+    from .outbox import outbox_publish
+    import redis.asyncio as aioredis
+
+    # Create Redis client for graph outbox pushes
+    _redis_client = aioredis.from_url(redis, decode_responses=True)
+
+    async def _graph_push(session_id: str, msg_type: str, subtype: str,
+                          role: str, payload: dict = None,
+                          priority_kind: str = "normal") -> None:
+        """Adapter: graph node push → outbox_publish."""
+        envelope = {
+            "type": msg_type, "subType": subtype, "role": role,
+            "agentId": agent_id, "sessionId": session_id,
+            "payload": payload or {},
+            "priority": priority_kind,
+        }
+        await outbox_publish(_redis_client, result["db"], envelope)
+
+    async def _graph_get_user(session_id: str, ask_id: str,
+                               timeout: int = 1800) -> dict | None:
+        """Wait for user reply to an ask card via Redis BRPOP.
+
+        Matches messages of type 'ask_reply' with matching session_id and ask_id.
+        Non-matching messages are parked in the parked queue for later processing.
+        Returns None on timeout.
+        """
+        ws_queue = f"agent:ws:{agent_id}"
+        parked_queue = f"agent:ws:{agent_id}:parked"
+        deadline = asyncio.get_event_loop().time() + timeout
+
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                logger.info("get_user timed out for ask_id=%s", ask_id)
+                return None
+            try:
+                raw = await _redis_client.brpop(
+                    ws_queue, timeout=int(min(remaining, 30)),
+                )
+            except Exception:
+                await asyncio.sleep(0.5)
+                continue
+            if raw is None:
+                continue
+            try:
+                msg = json.loads(raw[1])
+            except json.JSONDecodeError:
+                continue
+
+            # Match: ask_reply type, matching session and ask_id
+            p = msg.get("payload") or {}
+            if (msg.get("type") == "ask_reply"
+                    and msg.get("_session_id") == session_id
+                    and p.get("ask_id") == ask_id):
+                return p
+
+            # Not matching — park it for the main loop to pick up later
+            try:
+                await _redis_client.lpush(parked_queue, raw[1])
+            except Exception:
+                pass
+
+    compiled_graph = build_main_graph(
+        llm=result["llm"],
+        registry=result["tools"],
+        db=result["db"],
+        push_fn=_graph_push,
+        get_user_fn=_graph_get_user,
+    )
+
+    # MainAgent (v3.1: delegates to compiled_graph)
     from .main_agent import MainAgent
     main_agent = MainAgent(
         agent_id=agent_id,
@@ -266,6 +338,7 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
         db=result["db"],
         memory=result["memory"],
         registry=result["tools"],
+        graph=compiled_graph,
     )
 
     # 信号处理（优雅退出）

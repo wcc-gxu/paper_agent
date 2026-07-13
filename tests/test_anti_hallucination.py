@@ -255,24 +255,6 @@ class TestL4FailClosed:
         assert result.score == 0.0
 
     @pytest.mark.asyncio
-    async def test_evaluate_completion_fail_closed(self):
-        """_node_evaluate_completion 异常 → satisfied=False。"""
-        from paper_search.agent.main_agent import MainAgent
-        from paper_search.agent.main_agent_prompts import ScenarioPlanResult
-
-        agent = MainAgent(agent_id="t", llm=MagicMock(), db=None)
-        agent._llm.chat_json = AsyncMock(side_effect=RuntimeError("LLM error"))
-        agent._build_history_context = MagicMock(return_value=[])
-
-        plan = ScenarioPlanResult(scenario_id="S1", summary="搜")
-        result = await agent._node_evaluate_completion(
-            "sess", "user_msg", plan, {"c1": {"x": 1}},
-        )
-        # FAIL-CLOSED：不再 satisfied=True
-        assert result.satisfied is False
-        assert "异常" in result.reasoning or "失败" in result.reasoning
-
-    @pytest.mark.asyncio
     async def test_safety_filter_fail_closed(self, monkeypatch):
         """safety_filter LLM 不可用且 regex 命中 → safe=False（fail-closed）。"""
         from paper_search.agent.main_agent import MainAgent

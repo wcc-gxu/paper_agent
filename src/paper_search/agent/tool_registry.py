@@ -8,7 +8,7 @@
 
     registry = ToolRegistry.get_instance()
     tools = registry.to_langchain()  # 用于 LangGraph tool_use 节点
-    tool = registry.get("search_papers")  # 按名称获取
+    tool = registry.get("agent_search_papers")  # 按名称获取
 """
 
 from __future__ import annotations
@@ -1185,25 +1185,25 @@ class ToolRegistry:
         """注册子 Agent 工具（执行阶段由 Plan Graph 直接调用）。"""
         # Abstracts the existing CLI/MCP functions as direct tool wrappers
         sub_tools = [
-            ("search_papers", "跨多源搜索学术论文", self._make_search_papers()),
-            ("download_paper", "下载单篇论文 PDF。参数: paper_id 或 title（需先 search_papers 入库）", self._make_download_paper()),
-            ("convert_paper", "PDF 转 Markdown。参数: paper_id（用已下载的 pdf_path，或显式传 pdf_path）", self._make_convert_paper()),
-            ("index_paper", "Markdown 索引入 ChromaDB。参数: paper_id 或 project_id+all（索引项目全部已转换论文）", self._make_index_paper()),
-            ("evaluate_papers", "LLM 批量评估论文相关性。参数: project_id, query(可选), all(默认true)", self._make_evaluate_papers()),
-            ("rank_papers", "期刊等级评定 CCF/SCI → A+/A/B/C。参数: project_id（可选）, all(默认true)", self._make_rank_papers()),
-            ("generate_survey", "生成 AI 文献综述报告。参数: project_id", self._make_generate_survey()),
-            ("paper_export", "导出 BibTeX/JSON 到文件。参数: project_id, format(bibtex|json)", self._make_paper_export()),
-            ("paper_clean", "清理项目 DB/索引", self._make_paper_clean()),
-            ("batch_search", "从 JSON/CSV 批量搜索并入库。参数: file_path, download(默认false)", self._make_batch_search()),
-            ("citation_chase", "引用追溯（Semantic Scholar，默认2层）。参数: paper_title 或 doi", self._make_citation_chase()),
-            ("search_library", "ChromaDB 语义搜索已入库论文", self._make_search_library()),
-            ("search_knowledge", "ChromaDB 搜索结构化知识", self._make_search_knowledge()),
-            ("read_paper", "读取论文完整 Markdown", self._make_read_paper()),
-            ("extract_knowledge", "从论文中提取结构化知识（贡献/方法/数据集/局限）并存长期记忆。参数: paper_id, deep(默认false)", self._make_extract_knowledge()),
-            ("find_related", "发现相关论文（语义相似+引用关系）。参数: paper_id, top_k(默认10)", self._make_find_related()),
-            ("discover_gaps", "知识发现 — 研究空白/矛盾/趋势。参数: domain(可选), project_id(可选)", self._make_discover_gaps()),
-            ("build_glossary", "构建中英学术术语表。参数: project_id（从该项目论文提取术语）", self._make_build_glossary()),
-            ("translate_query", "中文查询翻译为学术英文关键词。参数: query, target_lang(en|zh, 默认en)", self._make_translate_query()),
+            ("agent_search_papers", "跨多源搜索学术论文", self._make_search_papers()),
+            ("agent_download_paper", "下载单篇论文 PDF。参数: paper_id 或 title（需先 search_papers 入库）", self._make_download_paper()),
+            ("agent_convert_paper", "PDF 转 Markdown。参数: paper_id（用已下载的 pdf_path，或显式传 pdf_path）", self._make_convert_paper()),
+            ("agent_index_paper", "Markdown 索引入 ChromaDB。参数: paper_id 或 project_id+all（索引项目全部已转换论文）", self._make_index_paper()),
+            ("agent_evaluate_papers", "LLM 批量评估论文相关性。参数: project_id, query(可选), all(默认true)", self._make_evaluate_papers()),
+            ("agent_rank_papers", "期刊等级评定 CCF/SCI → A+/A/B/C。参数: project_id（可选）, all(默认true)", self._make_rank_papers()),
+            ("agent_generate_survey", "生成 AI 文献综述报告。参数: project_id", self._make_generate_survey()),
+            ("agent_paper_export", "导出 BibTeX/JSON 到文件。参数: project_id, format(bibtex|json)", self._make_paper_export()),
+            ("agent_paper_clean", "清理项目 DB/索引", self._make_paper_clean()),
+            ("agent_batch_search", "从 JSON/CSV 批量搜索并入库。参数: file_path, download(默认false)", self._make_batch_search()),
+            ("agent_citation_chase", "引用追溯（Semantic Scholar，默认2层）。参数: paper_title 或 doi", self._make_citation_chase()),
+            ("agent_search_library", "ChromaDB 语义搜索已入库论文", self._make_search_library()),
+            ("agent_search_knowledge", "ChromaDB 搜索结构化知识", self._make_search_knowledge()),
+            ("agent_read_paper", "读取论文完整 Markdown", self._make_read_paper()),
+            ("agent_extract_knowledge", "从论文中提取结构化知识（贡献/方法/数据集/局限）并存长期记忆。参数: paper_id, deep(默认false)", self._make_extract_knowledge()),
+            ("agent_find_related", "发现相关论文（语义相似+引用关系）。参数: paper_id, top_k(默认10)", self._make_find_related()),
+            ("agent_discover_gaps", "知识发现 — 研究空白/矛盾/趋势。参数: domain(可选), project_id(可选)", self._make_discover_gaps()),
+            ("agent_build_glossary", "构建中英学术术语表。参数: project_id（从该项目论文提取术语）", self._make_build_glossary()),
+            ("agent_translate_query", "中文查询翻译为学术英文关键词。参数: query, target_lang(en|zh, 默认en)", self._make_translate_query()),
         ]
         for name, desc, func in sub_tools:
             self.register_direct(name, desc, func,
@@ -1815,7 +1815,7 @@ class ToolRegistry:
     def _register_literature_agent_tools(self):
         """Literature Agent 工具 — 文献检索与下载。"""
         self.register_direct(
-            "literature_search", "文献检索: 跨源搜索论文 (search→evaluate→download→convert→extract_metadata)",
+            "agent_literature_search", "文献检索: 跨源搜索论文 (search→evaluate→download→convert→extract_metadata)",
             self._make_literature_search(),
             metadata=ToolMetadata(category="literature"),
         )
@@ -1847,12 +1847,12 @@ class ToolRegistry:
     def _register_knowledge_agent_tools(self):
         """Knowledge Agent 工具 — 知识入库与 RAG 问答。"""
         self.register_direct(
-            "knowledge_ingest", "知识入库: chunk→embed→dedup→rank（处理 Literature Agent 产出的论文）",
+            "agent_knowledge_ingest", "知识入库: chunk→embed→dedup→rank（处理 Literature Agent 产出的论文）",
             self._make_knowledge_ingest(),
             metadata=ToolMetadata(category="knowledge"),
         )
         self.register_direct(
-            "knowledge_ask", "RAG 问答: 基于已入库论文的学术问答（带引用）",
+            "agent_knowledge_ask", "RAG 问答: 基于已入库论文的学术问答（带引用）",
             self._make_knowledge_ask(),
             metadata=ToolMetadata(category="knowledge"),
         )
@@ -1887,12 +1887,12 @@ class ToolRegistry:
     def _register_writing_agent_tools(self):
         """Writing Agent 工具 — 综述生成与 AI 味检测。"""
         self.register_direct(
-            "generate_survey_v2", "生成文献综述 (v3): 基于模板的学术综述，含引用格式检查和 AI 味清理",
+            "agent_generate_survey_v2", "生成文献综述 (v3): 基于模板的学术综述，含引用格式检查和 AI 味清理",
             self._make_generate_survey_v2(),
             metadata=ToolMetadata(category="writing"),
         )
         self.register_direct(
-            "check_ai_flavor", "AI 味检测: 检测文本中的 AI 生成痕迹并清理",
+            "agent_check_ai_flavor", "AI 味检测: 检测文本中的 AI 生成痕迹并清理",
             self._make_check_ai_flavor(),
             metadata=ToolMetadata(category="writing"),
         )
@@ -1920,7 +1920,7 @@ class ToolRegistry:
     def _register_glossary_agent_tools(self):
         """Glossary Sub-Agent 工具 — 术语管理。"""
         self.register_direct(
-            "build_glossary_v2", "构建术语表 (v3): 从论文提取术语→LLM翻译→去重→入库",
+            "agent_build_glossary_v2", "构建术语表 (v3): 从论文提取术语→LLM翻译→去重→入库",
             self._make_build_glossary_v2(),
             metadata=ToolMetadata(category="glossary"),
         )
@@ -1944,7 +1944,7 @@ class ToolRegistry:
     def _register_capture_agent_tools(self):
         """Capture Agent 工具 — 碎片采集（原 Video Agent 改名）。"""
         self.register_direct(
-            "capture_video", "视频解析: 下载→转写→LLM总结（Capture Agent）",
+            "agent_capture_video", "视频解析: 下载→转写→LLM总结（Capture Agent）",
             self._make_capture_video(),
             metadata=ToolMetadata(category="capture"),
         )

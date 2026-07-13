@@ -232,7 +232,13 @@ LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek")
 # 详见 llm_client_v2.LLMClientV2.chat / chat_json / chat_stream 的 node 参数。
 
 MODEL_ROUTES: dict[str, tuple[str, str]] = {
-    # ── 主 Agent 节点 ──────────────────────────────────────
+    # ── v3.1 节点 ──────────────────────────────────────────
+    "fast_triage_v31":       ("deepseek-v4-flash", "deepseek-v4-flash"),   # flash, no thinking, tool_choice
+    "intent_classify_v31":   ("deepseek-v4-flash", "deepseek-v4-flash"),   # flash, no thinking, tool_choice
+    "plan_v31":              ("deepseek-v4-pro", "deepseek-v4-pro"),       # pro, no thinking, tool_choice
+    "execute_v31":           ("deepseek-v4-pro", "deepseek-v4-pro"),       # pro+thinking, free tool_use
+    "evaluate_v31":          ("deepseek-v4-flash", "deepseek-v4-flash"),   # flash, no thinking, tool_choice
+    # ── 主 Agent 节点 (legacy, 过渡期保留) ──────────────────
     "safety_filter":         ("deepseek-v4-pro", "deepseek-v4-pro"),
     "safety_llm_confirm":    ("deepseek-v4-pro", "deepseek-v4-pro"),
     "fast_triage":           ("deepseek-v4-pro", "deepseek-v4-pro"),
@@ -242,7 +248,7 @@ MODEL_ROUTES: dict[str, tuple[str, str]] = {
     "scenario_plan":         ("deepseek-v4-pro", "deepseek-v4-pro"),
     "evaluate_completion":   ("deepseek-v4-pro", "deepseek-v4-pro"),
     "final_reply":           ("deepseek-v4-pro", "deepseek-v4-pro"),
-    # ── 记忆系统（Phase 2 三件套）─────────────────────────
+    # ── 记忆系统 ───────────────────────────────────────────
     "summary":               ("deepseek-v4-pro", "deepseek-v4-pro"),
     "extract_long_term":     ("deepseek-v4-pro", "deepseek-v4-pro"),
     "topic_consolidate":     ("deepseek-v4-pro", "deepseek-v4-pro"),
