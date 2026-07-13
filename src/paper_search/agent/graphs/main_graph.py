@@ -43,6 +43,43 @@ MAX_PLAN_ITERATIONS = 3       # evaluate→replan→execute→evaluate 全局上
 MAX_TODO_RETRIES = 2          # 单个 todo checkpoint 重试上限
 
 
+def _to_message_dicts(messages: list) -> list[dict]:
+    """Convert LangChain message objects to plain dicts for LLM calls.
+
+    LangGraph's add_messages reducer converts dicts to LangChain message objects
+    (HumanMessage/AIMessage/ToolMessage) which lack a .role attribute.
+    Our LLM client expects dicts with 'role' and 'content' keys.
+    """
+    result = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            result.append(msg)
+            continue
+        # LangChain message: has .type ("human"/"ai"/"system"/"tool") and .content
+        msg_type = getattr(msg, "type", "unknown")
+        role_map = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
+        entry: dict = {
+            "role": role_map.get(msg_type, "user"),
+            "content": getattr(msg, "content", "") or "",
+        }
+        tc_id = getattr(msg, "tool_call_id", None)
+        if tc_id:
+            entry["tool_call_id"] = tc_id
+        # Preserve tool_calls from assistant messages (needed for ReAct loop)
+        tc_list = getattr(msg, "tool_calls", None)
+        if tc_list:
+            entry["tool_calls"] = [
+                {"id": tc.get("id", ""), "name": tc.get("name", ""),
+                 "arguments": tc.get("arguments", {})}
+                if isinstance(tc, dict) else
+                {"id": getattr(tc, "id", ""), "name": getattr(tc, "name", ""),
+                 "arguments": getattr(tc, "arguments", {})}
+                for tc in tc_list
+            ]
+        result.append(entry)
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════
 # State
 # ═══════════════════════════════════════════════════════════════
@@ -123,6 +160,52 @@ class MainGraph:
         self._push = push_fn
         self._get_user = get_user_fn
 
+    # ── Push Helpers ──────────────────────────────────────────
+
+    async def _push_status(self, session_id: str, stage: str, message: str,
+                           level: str = "info") -> None:
+        """Push a status message to the client (non-blocking, best-effort)."""
+        if not self._push:
+            return
+        try:
+            await self._push(
+                session_id, "status", stage, "system",
+                payload={"stage": stage, "message": message, "level": level},
+                priority_kind="silent",
+            )
+        except Exception:
+            pass
+
+    async def _push_error(self, session_id: str, message: str, recoverable: bool = True) -> None:
+        """Push an error to the client immediately (high priority)."""
+        if not self._push:
+            return
+        try:
+            await self._push(
+                session_id, "error", "INTERNAL_ERROR", "system",
+                payload={"message": message, "recoverable": recoverable},
+                priority_kind="urgent",
+            )
+        except Exception:
+            pass
+
+    async def _push_tool_status(self, session_id: str, tool_call_id: str,
+                                tool_name: str, status: str, detail: dict = None) -> None:
+        """Push tool call/start/result to the client."""
+        if not self._push:
+            return
+        try:
+            # Push tool/call when starting, tool/result when done
+            subtype = "call" if status == "started" else "result"
+            await self._push(
+                session_id, "tool", subtype, "assistant",
+                payload={"tool_call_id": tool_call_id, "name": tool_name,
+                         "status": status, **(detail or {})},
+                priority_kind="normal" if status == "result" else "normal",
+            )
+        except Exception:
+            pass
+
     # ── Compile ─────────────────────────────────────────────
 
     def compile(self, checkpointer: Any = None) -> Any:
@@ -202,6 +285,10 @@ class MainGraph:
     async def _fast_triage(self, state: MainState) -> dict:
         """Flash model, 3-dimension scoring. Returns triage_* scores."""
         user = state.get("user_content", "")
+        session_id = state.get("session_id", "main")
+
+        await self._push_status(session_id, "analyzing", "正在分析请求类型...")
+
         try:
             data = await self.llm.chat_json(
                 messages=[{"role": "user", "content": user}],
@@ -212,27 +299,44 @@ class MainGraph:
             )
         except Exception as e:
             logger.warning(f"fast_triage LLM failed: {e}, fallback to chat")
+            await self._push_status(session_id, "analyzing", "正在回复...")
             return {
                 "triage_chat": 0.9, "triage_ops": 0.0, "triage_research": 0.0,
                 "triage_reasoning": f"LLM error fallback: {e}",
             }
 
+        triage_chat = data.get("chat", 0.0)
+        triage_ops = data.get("ops", 0.0)
+        triage_research = data.get("research", 0.0)
+
+        # Push research-dimension visibility to user
+        logger.info(
+            "Triage: chat=%.2f ops=%.2f research=%.2f → %s",
+            triage_chat, triage_ops, triage_research,
+            "research" if triage_research > 0.4 else ("ops" if triage_ops > 0.6 else "chat"),
+        )
+
         return {
-            "triage_chat": data.get("chat", 0.0),
-            "triage_ops": data.get("ops", 0.0),
-            "triage_research": data.get("research", 0.0),
+            "triage_chat": triage_chat,
+            "triage_ops": triage_ops,
+            "triage_research": triage_research,
             "triage_reasoning": data.get("reasoning", ""),
         }
 
     # ── Route: triage → chat/ops/research ──────────────────
 
-    def _route_triage(self, state: MainState) -> str:
+    async def _route_triage(self, state: MainState) -> str:
         research = state.get("triage_research", 0.0)
         ops = state.get("triage_ops", 0.0)
+        session_id = state.get("session_id", "main")
+
         if research > 0.4:
+            await self._push_status(session_id, "planning", "识别为研究类请求，正在分析意图...")
             return "research"
         if ops > 0.6:
+            await self._push_status(session_id, "planning", "识别为运维操作，正在确认...")
             return "ops"
+        await self._push_status(session_id, "responding", "正在回复...")
         return "chat"
 
     # ═══════════════════════════════════════════════════════════
@@ -242,6 +346,10 @@ class MainGraph:
     async def _intent_classify(self, state: MainState) -> dict:
         """Flash model, determines if the research intent needs detailed planning."""
         user = state.get("user_content", "")
+        session_id = state.get("session_id", "main")
+
+        await self._push_status(session_id, "planning", "正在分析研究意图...")
+
         try:
             data = await self.llm.chat_json(
                 messages=[{"role": "user", "content": user}],
@@ -250,8 +358,10 @@ class MainGraph:
                 temperature=0.0,
                 node="intent_classify_v31",
             )
+            logger.info("Intent classify: research=%.2f", data.get("research", 0.0))
         except Exception as e:
             logger.warning(f"intent_classify LLM failed: {e}")
+            await self._push_error(session_id, f"意图分类失败: {e}")
             return {}  # Continue with plan using default
 
         return {}  # Intent already determined by triage; proceed to plan
@@ -266,10 +376,14 @@ class MainGraph:
         On replan: consumes replan_hint from state and injects it into the user prompt.
         """
         user = state.get("user_content", "")
+        session_id = state.get("session_id", "main")
         replan_hint = state.get("replan_hint", "")
 
         if replan_hint:
+            await self._push_status(session_id, "planning", f"正在根据反馈重新规划: {replan_hint[:80]}...")
             user = f"{user}\n\n[重新规划提示] 上一轮规划的改进建议: {replan_hint}"
+        else:
+            await self._push_status(session_id, "planning", "正在制定研究计划...")
 
         try:
             data = await self.llm.chat_json(
@@ -281,13 +395,33 @@ class MainGraph:
             )
         except Exception as e:
             logger.error(f"plan LLM failed: {e}")
+            await self._push_error(session_id, f"计划生成失败: {e}")
             return {"error": f"Plan generation failed: {e}", "needs_clarify": False, "todos": []}
+
+        todos = data.get("todos", [])
+        needs_clarify = data.get("needs_clarify", False)
+        danger_level = data.get("danger_level", "low")
+
+        if needs_clarify:
+            clarify_questions = data.get("clarify_questions", [])
+            await self._push_status(
+                session_id, "planning",
+                f"需要更多信息以制定计划，生成了 {len(clarify_questions)} 个澄清问题",
+                level="warning",
+            )
+        else:
+            await self._push_status(
+                session_id, "planning",
+                f"研究计划已生成: {len(todos)} 个步骤，预估 {data.get('estimated_seconds', 0)}秒，风险等级 {danger_level}",
+            )
+            logger.info("Plan: %d todos, danger=%s, summary=%s",
+                        len(todos), danger_level, data.get("summary", "")[:100])
 
         return {
             "plan": data,
-            "needs_clarify": data.get("needs_clarify", False),
+            "needs_clarify": needs_clarify,
             "clarify_questions": data.get("clarify_questions", []),
-            "todos": data.get("todos", []),
+            "todos": todos,
             "current_todo_index": 0,
             "tool_call_count": 0,
             "tool_results": [],
@@ -295,6 +429,7 @@ class MainGraph:
             "all_satisfied": False,
             "next_action": "done",       # Reset for fresh start
             "needs_more_tools": [],      # Reset
+            "danger_level": danger_level,
         }
 
     # ── Route: plan → clarify / execute ──────────────────
@@ -317,6 +452,13 @@ class MainGraph:
         high_risk_keywords = ["rm ", "delete", "drop ", "truncate", "sudo ", "kill",
                               "format", "fdisk", "shutdown", "reboot", "mv /"]
         is_high_risk = any(kw in user.lower() for kw in high_risk_keywords)
+        danger = "high" if is_high_risk else "low"
+
+        await self._push_status(
+            session_id, "executing",
+            f"运维操作 (风险等级: {danger})，正在执行...",
+            level="warning" if is_high_risk else "info",
+        )
 
         if is_high_risk:
             # Push ask/confirm to user
@@ -349,6 +491,9 @@ class MainGraph:
 
         On retry_tools from evaluate: consumes needs_more_tools, executes them,
         then returns for re-evaluation.
+
+        Key fix: converts LangChain message objects to dicts before passing to LLM,
+        since add_messages reducer converts dicts to AIMessage/HumanMessage etc.
         """
         session_id = state.get("session_id", "main")
         tool_call_count = state.get("tool_call_count", 0)
@@ -363,17 +508,36 @@ class MainGraph:
                 tc_call_id = spec.get("call_id", f"retry-{uuid.uuid4().hex[:10]}")
                 tc_name = spec.get("name", "")
                 tc_args = spec.get("arguments", {})
+
+                # Push tool start
+                await self._push_tool_status(
+                    session_id, tc_call_id, tc_name, "started",
+                    detail={"arguments": tc_args},
+                )
+
                 tc = type("ToolCall", (), {
                     "id": tc_call_id, "name": tc_name, "arguments": tc_args,
                 })()
                 tool_call_count += 1
                 result = await self._dispatch_tool(tc, session_id)
+                result_summary = str(result)[:500]
                 tool_results.append({
                     "tool_call_id": tc_call_id,
                     "tool_name": tc_name,
                     "todo_id": "_retry",
-                    "result": str(result)[:500],
+                    "result": result_summary,
                 })
+
+                # Push tool result
+                error_msg = result.get("error") if isinstance(result, dict) else None
+                await self._push_tool_status(
+                    session_id, tc_call_id, tc_name,
+                    "failed" if error_msg else "completed",
+                    detail={"result": result_summary, "error": error_msg} if error_msg else {"result": result_summary},
+                )
+                if error_msg:
+                    await self._push_error(session_id, f"工具 {tc_name} 执行失败: {error_msg}")
+
                 messages.append({
                     "role": "tool",
                     "content": json.dumps(result, ensure_ascii=False),
@@ -396,61 +560,116 @@ class MainGraph:
             return {"all_satisfied": True}
 
         current_todo = todos[current_todo_index]
+        todo_label = current_todo.get("label", f"todo-{current_todo_index}")
         system = build_execute_v31_prompt(current_todo, todos)
+
+        # Push todo start
+        await self._push_status(
+            session_id, "executing",
+            f"[{current_todo_index + 1}/{len(todos)}] {todo_label}",
+        )
 
         round_count = 0
         while round_count < MAX_REACT_ROUNDS and tool_call_count < MAX_REACT_ROUNDS:
             round_count += 1
 
+            # Convert LangChain messages to dicts before passing to LLM
+            # (add_messages reducer converts dicts → HumanMessage/AIMessage/ToolMessage
+            #  which lack .role and crash the LLM client)
+            safe_messages = _to_message_dicts(messages)
+
             try:
                 response = await self.llm.chat(
-                    messages=[{"role": "system", "content": system}] + messages,
+                    messages=[{"role": "system", "content": system}] + safe_messages,
                     temperature=0.3,
                     node="execute_v31",
                 )
             except Exception as e:
                 logger.error(f"execute LLM failed: {e}")
+                await self._push_error(
+                    session_id,
+                    f"执行 [{todo_label}] 时 LLM 调用失败 (第{round_count}轮): {e}",
+                )
                 tool_results.append({"error": str(e), "todo_id": current_todo.get("id", "")})
                 break
 
             if not getattr(response, 'tool_calls', None):
                 # No tool calls — LLM considers this todo complete
-                messages.append({"role": "assistant", "content": getattr(response, 'content', '') or ""})
+                messages.append({
+                    "role": "assistant",
+                    "content": getattr(response, 'content', '') or "",
+                })
+                logger.info("Todo [%s] complete after %d rounds (no more tool calls)",
+                            todo_label, round_count)
                 break
+
+            # Push tool call starts (before dispatching)
+            for tc in response.tool_calls:
+                tc_name = getattr(tc, 'name', '?')
+                tc_args = getattr(tc, 'arguments', {})
+                if isinstance(tc_args, str):
+                    try:
+                        tc_args = json.loads(tc_args)
+                    except json.JSONDecodeError:
+                        tc_args = {"raw": tc_args[:200]}
+                await self._push_tool_status(
+                    session_id, getattr(tc, 'id', ''), tc_name, "started",
+                    detail={"arguments": tc_args},
+                )
+
+            # Add assistant message with tool_calls to conversation
+            messages.append({
+                "role": "assistant",
+                "content": getattr(response, 'content', '') or "",
+                "tool_calls": [{
+                    "id": getattr(tc, 'id', ''),
+                    "name": getattr(tc, 'name', ''),
+                    "arguments": getattr(tc, 'arguments', {}),
+                } for tc in response.tool_calls],
+            })
 
             # Dispatch tools (parallel within this round)
             batch_results = {}
             for tc in response.tool_calls:
                 tool_call_count += 1
+                tc_name = getattr(tc, 'name', '?')
                 result = await self._dispatch_tool(tc, session_id)
-                batch_results[tc.id] = result
+                batch_results[getattr(tc, 'id', '')] = result
+                result_summary = str(result)[:500]
                 tool_results.append({
-                    "tool_call_id": tc.id,
-                    "tool_name": tc.name,
+                    "tool_call_id": getattr(tc, 'id', ''),
+                    "tool_name": tc_name,
                     "todo_id": current_todo.get("id", ""),
-                    "result": str(result)[:500],
+                    "result": result_summary,
                 })
+
+                # Push tool result immediately
+                error_msg = result.get("error") if isinstance(result, dict) else None
+                await self._push_tool_status(
+                    session_id, getattr(tc, 'id', ''), tc_name,
+                    "failed" if error_msg else "completed",
+                    detail={"result": result_summary, "error": error_msg} if error_msg else {"result": result_summary},
+                )
+                if error_msg:
+                    await self._push_error(session_id, f"工具 {tc_name} 失败: {error_msg}")
 
             # Add tool results as tool role messages
             for tc in response.tool_calls:
-                result_text = json.dumps(batch_results.get(tc.id, {}), ensure_ascii=False)
+                result_text = json.dumps(
+                    batch_results.get(getattr(tc, 'id', ''), {}),
+                    ensure_ascii=False,
+                )
                 messages.append({
                     "role": "tool",
                     "content": result_text,
-                    "tool_call_id": tc.id,
+                    "tool_call_id": getattr(tc, 'id', ''),
                 })
 
             # Push progress
-            if self._push:
-                await self._push(
-                    session_id, "tool", "progress", "assistant",
-                    payload={
-                        "tool_call_id": current_todo.get("id", "todo"),
-                        "round": round_count,
-                        "tool_name": ",".join(tc.name for tc in response.tool_calls),
-                    },
-                    priority_kind="normal",
-                )
+            await self._push_status(
+                session_id, "executing",
+                f"[{current_todo_index + 1}/{len(todos)}] {todo_label} — 第{round_count}轮完成 ({tool_call_count}次工具调用)",
+            )
 
         # Don't advance index — todo_checkpoint decides
         return {
@@ -509,7 +728,10 @@ class MainGraph:
         tool_results = state.get("tool_results", [])
         user = state.get("user_content", "")
         user_reply = state.get("user_reply")
+        session_id = state.get("session_id", "main")
         plan_iterations = state.get("plan_iterations", 0)
+
+        await self._push_status(session_id, "evaluating", "正在评估执行结果...")
 
         # Build summary for evaluation
         summary_lines = [f"用户需求: {user}"]
@@ -533,6 +755,7 @@ class MainGraph:
             )
         except Exception as e:
             logger.warning(f"evaluate LLM failed: {e}")
+            await self._push_error(session_id, f"评估失败: {e}")
             return {
                 "all_satisfied": False,
                 "next_action": "fail",
@@ -540,14 +763,31 @@ class MainGraph:
                 "plan_iterations": plan_iterations + 1,
             }
 
+        next_action = data.get("next_action", "fail")
+        satisfied = data.get("satisfied", False)
+        final_message = data.get("final_message", "")
+
+        # Push evaluation result to user
+        action_labels = {
+            "done": "✅ 完成", "retry_tools": "🔄 补充工具调用",
+            "ask_user": "❓ 需要用户判断", "replan": "🔁 重新规划", "fail": "❌ 失败",
+        }
+        await self._push_status(
+            session_id, "evaluating",
+            f"评估: {action_labels.get(next_action, next_action)} | 可信度: {data.get('truth_confidence', 0):.0%}",
+            level="info" if next_action == "done" else "warning",
+        )
+        logger.info("Evaluate: satisfied=%s next=%s confidence=%.2f",
+                    satisfied, next_action, data.get("truth_confidence", 0))
+
         # Convert ask_user_question from Pydantic model to dict if present
         auq = data.get("ask_user_question")
         ask_user_dict = auq.model_dump() if auq is not None and hasattr(auq, "model_dump") else None
 
         return {
-            "all_satisfied": data.get("satisfied", False),
-            "next_action": data.get("next_action", "fail"),
-            "final_reply": data.get("final_message", ""),
+            "all_satisfied": satisfied,
+            "next_action": next_action,
+            "final_reply": final_message,
             "needs_more_tools": [
                 t.model_dump() if hasattr(t, "model_dump") else t
                 for t in (data.get("needs_more_tools") or [])
@@ -639,6 +879,7 @@ class MainGraph:
         todos = state.get("todos", [])
         current_todo_index = state.get("current_todo_index", 0)
         tool_results = state.get("tool_results", [])
+        session_id = state.get("session_id", "main")
         retry_count = state.get("todo_retry_count", 0)
 
         # Edge cases: empty todos or past the end
@@ -650,6 +891,11 @@ class MainGraph:
             r for r in tool_results
             if r.get("todo_id") == current_todo.get("id", "")
         ]
+
+        await self._push_status(
+            session_id, "executing",
+            f"检查 [{current_todo.get('label', '?')}] 完成度...",
+        )
 
         prompt = (
             f"Todo: {current_todo.get('label', '?')}\n"
@@ -668,9 +914,14 @@ class MainGraph:
             satisfied = data.get("satisfied", False)
         except Exception as e:
             logger.warning(f"todo_checkpoint LLM failed: {e}")
+            await self._push_error(session_id, f"检查点评估失败: {e}")
             satisfied = False
 
         if satisfied:
+            await self._push_status(
+                session_id, "executing",
+                f"✅ [{current_todo.get('label', '?')}] 已完成",
+            )
             return {
                 "todo_checkpoint_satisfied": True,
                 "todo_retry_count": 0,
@@ -683,11 +934,21 @@ class MainGraph:
                     "Todo %s checkpoint retry exhausted (%d), advancing anyway",
                     current_todo.get("id", "?"), new_retry,
                 )
+                await self._push_status(
+                    session_id, "executing",
+                    f"⚠️ [{current_todo.get('label', '?')}] 重试{new_retry}次仍未完成，跳过",
+                    level="warning",
+                )
                 return {
                     "todo_checkpoint_satisfied": True,
                     "todo_retry_count": 0,
                     "current_todo_index": current_todo_index + 1,
                 }
+            await self._push_status(
+                session_id, "executing",
+                f"🔄 [{current_todo.get('label', '?')}] 未完成，重试 (第{new_retry}次)...",
+                level="warning",
+            )
             return {
                 "todo_checkpoint_satisfied": False,
                 "todo_retry_count": new_retry,
@@ -713,6 +974,8 @@ class MainGraph:
         user = state.get("user_content", "")
         session_id = state.get("session_id", "main")
 
+        await self._push_status(session_id, "responding", "正在生成回复...")
+
         full_text = ""
         try:
             if hasattr(self.llm, "chat_stream"):
@@ -724,6 +987,8 @@ class MainGraph:
                     if isinstance(chunk, dict):
                         if chunk.get("type") == "text_delta":
                             full_text += chunk.get("text", "")
+                        elif chunk.get("type") == "error":
+                            logger.warning(f"inline_reply stream error: {chunk.get('message')}")
             else:
                 resp = await self.llm.chat(
                     messages=[{"role": "user", "content": user}],
@@ -734,6 +999,7 @@ class MainGraph:
         except Exception as e:
             logger.warning(f"inline_reply failed: {e}")
             full_text = f"抱歉，LLM 调用出错：{e}"
+            await self._push_error(session_id, f"回复生成失败: {e}")
 
         # Push final reply
         if self._push:
@@ -743,6 +1009,7 @@ class MainGraph:
                 priority_kind="high",
             )
 
+        await self._push_status(session_id, "done", "回复完成")
         return {"final_reply": full_text.strip()}
 
 

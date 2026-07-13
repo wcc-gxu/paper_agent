@@ -243,6 +243,10 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    # Enable debug protocol: pushes LLM thinking + tool call details to WS client
+    os.environ.setdefault("DEBUG_PROTOCOL", "1")
+    logger.info("DEBUG_PROTOCOL enabled — LLM thinking + tool calls will be pushed to clients")
+
     path = Path(data_dir) if data_dir else None
     redis = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
