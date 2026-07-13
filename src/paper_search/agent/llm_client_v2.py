@@ -486,7 +486,9 @@ class LLMClientV2:
         result = []
         for msg in messages:
             if isinstance(msg, dict):
-                result.append(msg)
+                # Convert dict messages too — they may have tool_calls that need
+                # to be transformed into Anthropic content block format
+                result.append(self._dict_to_anthropic(msg))
                 continue
 
             entry: dict[str, Any] = {"role": msg.role}
@@ -516,6 +518,38 @@ class LLMClientV2:
 
             result.append(entry)
         return result
+
+    @staticmethod
+    def _dict_to_anthropic(msg: dict) -> dict:
+        """Convert a plain dict message to Anthropic API format.
+
+        Handles the case where dict messages have a 'tool_calls' field
+        (as produced by the execute ReAct loop in main_graph.py), which
+        needs to be transformed into Anthropic content-block format.
+        """
+        role = msg.get("role", "user")
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls", [])
+        tool_call_id = msg.get("tool_call_id", "")
+
+        if role == "tool" and tool_call_id:
+            return {"role": "tool", "content": str(content), "tool_call_id": tool_call_id}
+
+        if role == "assistant" and tool_calls:
+            content_blocks = []
+            if content:
+                content_blocks.append({"type": "text", "text": str(content)})
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": tc.get("name", ""),
+                        "input": tc.get("arguments", tc.get("input", {})),
+                    })
+            return {"role": "assistant", "content": content_blocks}
+
+        return {"role": role, "content": str(content)}
 
     def _to_anthropic_tools(self, tools: list[ToolDef]) -> list[dict]:
         return [t.to_anthropic() for t in tools]

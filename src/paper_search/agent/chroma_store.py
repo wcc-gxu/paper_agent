@@ -319,6 +319,23 @@ class ChromaStoreV2:
             logger.warning(f"ChromaDB abstract search 失败: {e}")
             return []
 
+    def search_similar(self, query: str, n_results: int = 20) -> list[dict]:
+        """语义搜索 — 兼容旧 API (KnowledgeAgent 调用的入口)。
+
+        合并 abstract + fulltext 搜索结果，按 paper_id 去重。
+        """
+        papers = self.search_abstract(query, n_results=n_results)
+        try:
+            fulltext = self.search_fulltext(query, n_results=n_results)
+            seen = {p["paper_id"] for p in papers}
+            for p in fulltext:
+                if p.get("paper_id") not in seen:
+                    papers.append(p)
+                    seen.add(p["paper_id"])
+        except Exception as e:
+            logger.debug(f"Fulltext search skipped: {e}")
+        return papers
+
     # ── 全文分块索引 ────────────────────────────────────
 
     def add_fulltext_chunks(self, chunks: list) -> int:
