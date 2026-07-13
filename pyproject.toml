@@ -40,7 +40,7 @@ agent = [
 # Async Task Queue
 celery = ["celery[redis]>=5.4", "redis>=5.0"]
 # Web API
-web = ["fastapi>=0.110", "uvicorn[standard]>=0.27"]
+web = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "PyJWT>=2.8"]
 # CAPTCHA handling (CNKI)
 ocr = ["pytesseract>=0.3"]
 # Video processing (yt-dlp + Whisper + CloakBrowser)
@@ -57,6 +57,7 @@ all = [
     "pytesseract>=0.3",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.27",
+    "PyJWT>=2.8",
     "langgraph>=0.6.0",
     "langgraph-checkpoint-sqlite>=2.0.0",
     "langchain-core>=0.3.0",

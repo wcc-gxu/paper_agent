@@ -226,29 +226,32 @@ if _docs_dir.exists():
 # ═══════════════════════════════════════════════════════════════
 
 @app.websocket("/ws/chat/{agent_id}/{session_id}")
-async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str):
-    """WebSocket 中继 — v9.0 无握手协议 + Phase 1 outbox 模式。
+async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
+                  token: str = Query(None)):
+    """WebSocket 中继 — v10.1 协议 + JWT 认证 + Phase 1 outbox 模式。
 
-    - 连接即用，不需要握手
+    - 连接: ws://host/ws/chat/{agent_id}/{session_id}?token=<jwt>
+    - JWT 验证: token 无效则拒绝连接 (code 4001)
+    - 连接即用，不需要额外握手
     - 收消息 → LPUSH agent:ws:{agent_id} → Daemon 消费
     - Daemon 通过 outbox_publish 写消息 → API 进程的 outbox_poller
       从 outbox:{agent_id} BRPOP → 这里 send_text
-    - sync_request: iOS 发 sync_request → 拉取未送达的历史消息回放
+    - sync_request: 客户端发 sync_request → 拉取未送达的历史消息回放
     - 永不主动断开连接
 
-    v3 Phase 1: 从 agent_id 提取 user_id（格式: agent-{user_id}）。
+    v3 Phase 1: JWT 验证后 user_id 来自 token payload。
     """
     import json as _json
     import os
     import asyncio as _asyncio
 
-    # 从 agent_id 提取 user_id
-    # 格式: "agent-{user_id}" → user_id,  "agent-001" → "default"
-    _user_id = "default"
-    if agent_id.startswith("agent-"):
-        extracted = agent_id[6:]  # 去掉 "agent-" 前缀
-        if extracted and extracted != "001":
-            _user_id = extracted
+    # ── JWT 验证 (优先) ──────────────────────────────────
+    from .auth import verify_ws_token
+    try:
+        _user_id = await verify_ws_token(websocket, agent_id, token)
+    except HTTPException:
+        # verify_ws_token 已经关闭了 WebSocket
+        return
 
     await websocket.accept()
     await ws_manager.connect(agent_id, session_id, websocket)

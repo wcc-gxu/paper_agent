@@ -19,6 +19,7 @@ CREATE TABLE users (
     username    TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     api_token   TEXT NOT NULL UNIQUE,
+    password_hash TEXT,
     role        TEXT NOT NULL DEFAULT 'researcher',
     is_active   BOOLEAN NOT NULL DEFAULT true,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),

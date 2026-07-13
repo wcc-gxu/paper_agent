@@ -1,31 +1,101 @@
-"""API Key 认证 — 简单 Bearer Token，支持多用户。
+"""认证模块 — JWT (首选) + Bearer Token (兼容)。
 
-配置:
-  API_KEY=your-secret-key  (.env)  — 设置后启用认证模式
-  未设置 → 开放访问，所有请求使用 "anonymous" 用户
+JWT 认证:
+  - POST /api/auth/register → 注册 + 返回 access_token
+  - POST /api/auth/login    → 登录 + 返回 access_token
+  - WebSocket /ws/chat/{agent_id}/{session_id}?token=<jwt>  → 验证 JWT
 
-多用户模式:
-  设置 API_KEY 后，系统从 users 表中按 api_token 查找用户。
-  默认用户 "user-default" 的 token 为 "tok-migrated-default"。
-  可通过 POST /api/users 创建新用户并获取 token。
+Bearer Token (兼容):
+  - API_KEY=xxx  (.env) → 静态 API Key 模式
+  - 多用户: users 表 api_token 字段
 
-用法:
-  from .auth import verify_api_key
-  user_id: str = Depends(verify_api_key)
+配置 (环境变量):
+  JWT_SECRET                 — JWT 签名密钥 (必需)
+  JWT_ALGORITHM=HS256        — 签名算法
+  ACCESS_TOKEN_EXPIRE_MINUTES=30      — access token 过期时间
+  REFRESH_TOKEN_EXPIRE_DAYS=7         — refresh token 过期时间
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-from fastapi import HTTPException, Security
+from fastapi import HTTPException, Query, Security, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+import jwt
+from jwt import PyJWTError
 
 logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
 API_KEY = os.getenv("API_KEY", "")
+
+# ── JWT 配置 ────────────────────────────────────────────
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+
+def _hash_password(password: str) -> str:
+    """SHA-256 哈希密码（生产环境应使用 bcrypt）。"""
+    salt = os.urandom(16).hex()
+    h = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+    return f"sha256:{salt}:{h}"
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    """验证密码哈希。"""
+    if not password_hash or ":" not in password_hash:
+        return False
+    try:
+        algo, salt, h = password_hash.split(":", 2)
+        if algo != "sha256":
+            return False
+        expected = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+        return h == expected
+    except Exception:
+        return False
+
+
+def _create_jwt(user_id: str, username: str, token_type: str = "access") -> str:
+    """创建 JWT token。"""
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET not configured")
+    now = datetime.now(timezone.utc)
+    if token_type == "access":
+        expire = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    else:
+        expire = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode = {
+        "sub": user_id,
+        "username": username,
+        "type": token_type,
+        "iat": now,
+        "exp": expire,
+        "jti": str(uuid.uuid4()),
+    }
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _decode_jwt(token: str) -> dict:
+    """解码并验证 JWT token。返回 payload dict。"""
+    if not JWT_SECRET:
+        raise RuntimeError("JWT_SECRET not configured")
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# REST API 依赖 — Bearer Token / JWT 验证
+# ═══════════════════════════════════════════════════════════════
 
 
 async def verify_api_key(
@@ -33,42 +103,216 @@ async def verify_api_key(
 ) -> str:
     """验证 Bearer Token，返回 user_id。
 
+    同时支持 JWT 和静态 API Key。
     行为:
+    - JWT_SECRET 已设置 + Bearer JWT → 解码 JWT 返回 user_id
     - API_KEY 未设置 → 返回 "anonymous"（开放访问模式）
-    - API_KEY 已设置 + 有效 token → 返回对应的 user_id
-    - API_KEY 已设置 + 无效/缺失 token → 401/403
+    - API_KEY 已设置 + token==API_KEY → 返回 "user-default"
+    - API_KEY 已设置 + DB 多用户 → 查找 users 表
+    - 否则 → 403
     """
-    if not API_KEY:
-        # 未配置 API_KEY → 开放访问，所有请求使用 anonymous 用户
-        return "anonymous"
+    # 优先 JWT 验证
+    if credentials is not None:
+        token = credentials.credentials
+        if JWT_SECRET and token.count(".") == 2:
+            # 看起来像 JWT（header.payload.signature）
+            try:
+                payload = _decode_jwt(token)
+                if payload.get("type") == "access":
+                    return payload["sub"]
+            except HTTPException:
+                pass  # JWT 验证失败，回退到 API Key 模式
 
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Missing API key")
-
-    token = credentials.credentials
-
-    # 向后兼容：如果 token 等于 API_KEY，返回默认用户
-    if token == API_KEY:
-        return "user-default"
-
-    # 多用户模式：从 users 表中查找
-    try:
-        from ..config import use_postgresql
-
-        if use_postgresql():
-            from ..agent.pgdb import PostgresAgentDB
-            db = PostgresAgentDB()
-        else:
-            from ..agent.db import AgentDB
-            db = AgentDB()
-
-        user = db.get_user_by_token(token)
-        if user:
-            return user["id"]
-    except Exception as e:
-        logger.warning(f"Auth lookup failed: {e}")
-        # 如果 DB 不可用，回退到单 token 模式
+        # API Key 模式
         if token == API_KEY:
             return "user-default"
+        if API_KEY:
+            try:
+                from ..config import use_postgresql
+                if use_postgresql():
+                    from ..agent.pgdb import PostgresAgentDB
+                    db = PostgresAgentDB()
+                else:
+                    from ..agent.db import AgentDB
+                    db = AgentDB()
+                user = db.get_user_by_token(token)
+                if user:
+                    return user["id"]
+            except Exception as e:
+                logger.warning(f"Auth lookup failed: {e}")
 
-    raise HTTPException(status_code=403, detail="Invalid API key")
+        raise HTTPException(status_code=403, detail="Invalid token")
+
+    if not API_KEY:
+        return "anonymous"
+
+    raise HTTPException(status_code=401, detail="Missing token")
+
+
+# ═══════════════════════════════════════════════════════════════
+# WebSocket JWT 验证
+# ═══════════════════════════════════════════════════════════════
+
+
+async def verify_ws_token(
+    websocket: WebSocket,
+    agent_id: str,
+    token: Optional[str] = None,
+) -> str:
+    """WebSocket 连接时验证 JWT token，返回 user_id。
+
+    token 来源: 查询参数 ?token=<jwt>
+
+    验证规则:
+    - JWT_SECRET 已设置 + 有效 JWT → 返回 user_id（必须匹配 agent_id）
+    - JWT_SECRET 未设置 → 开放模式，从 agent_id 提取 user_id
+    - token 无效/缺失/JWT_SECRET 已设置但无 token → 拒绝连接（401）
+
+    返回: user_id 字符串
+    异常: 连接被拒绝时 raise WebSocket close
+    """
+    if not JWT_SECRET:
+        # 开放模式: 从 agent_id 提取 user_id
+        if agent_id.startswith("agent-"):
+            extracted = agent_id[6:]
+            if extracted and extracted != "001":
+                return extracted
+        return "default"
+
+    if not token:
+        await websocket.close(code=4001, reason="Missing JWT token (?token=<jwt>)")
+        raise HTTPException(status_code=401, detail="Missing JWT token")
+
+    try:
+        payload = _decode_jwt(token)
+    except HTTPException:
+        await websocket.close(code=4001, reason="Invalid or expired JWT token")
+        raise
+
+    if payload.get("type") != "access":
+        await websocket.close(code=4001, reason="Token must be access token")
+        raise HTTPException(status_code=401, detail="Not an access token")
+
+    user_id = payload["sub"]
+
+    # 交叉验证: agent_id 必须匹配 user_id
+    expected_agent = f"agent-{user_id}" if user_id != "default" else "agent-001"
+    if agent_id != expected_agent and agent_id != "agent-001":
+        logger.warning(
+            "WS auth mismatch: agent_id=%s does not match JWT user_id=%s",
+            agent_id, user_id,
+        )
+        await websocket.close(code=4003, reason="agent_id mismatch with JWT")
+        raise HTTPException(status_code=403, detail="agent_id mismatch")
+
+    return user_id
+
+
+# ═══════════════════════════════════════════════════════════════
+# 认证业务逻辑
+# ═══════════════════════════════════════════════════════════════
+
+
+def auth_register(username: str, password: str, display_name: str = "") -> dict:
+    """注册新用户 → 返回 tokens。
+
+    返回: {user_id, username, access_token, refresh_token, token_type:"bearer"}
+    """
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="username must be >= 3 chars")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="password must be >= 6 chars")
+
+    from ..config import use_postgresql
+    if use_postgresql():
+        from ..agent.pgdb import PostgresAgentDB
+        db = PostgresAgentDB()
+    else:
+        from ..agent.db import AgentDB
+        db = AgentDB()
+
+    # 检查用户名是否已存在
+    existing = db.get_user_by_username(username)
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already exists")
+
+    pwd_hash = _hash_password(password)
+    display = display_name or username
+    user_id = db.create_user(username, display, password_hash=pwd_hash)
+
+    access_token = _create_jwt(user_id, username, "access")
+    refresh_token = _create_jwt(user_id, username, "refresh")
+
+    return {
+        "user_id": user_id,
+        "username": username,
+        "display_name": display,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+def auth_login(username: str, password: str) -> dict:
+    """用户登录 → 返回 tokens。
+
+    返回: {user_id, username, access_token, refresh_token, token_type:"bearer"}
+    """
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+
+    from ..config import use_postgresql
+    if use_postgresql():
+        from ..agent.pgdb import PostgresAgentDB
+        db = PostgresAgentDB()
+    else:
+        from ..agent.db import AgentDB
+        db = AgentDB()
+
+    user = db.get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    if not user.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Account is deactivated")
+
+    pwd_hash = user.get("password_hash", "")
+    if not _verify_password(password, pwd_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    access_token = _create_jwt(user["id"], username, "access")
+    refresh_token = _create_jwt(user["id"], username, "refresh")
+
+    return {
+        "user_id": user["id"],
+        "username": username,
+        "display_name": user.get("display_name", username),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+def auth_refresh(refresh_token: str) -> dict:
+    """使用 refresh_token 获取新的 access_token。"""
+    if not refresh_token:
+        raise HTTPException(status_code=400, detail="refresh_token required")
+
+    payload = _decode_jwt(refresh_token)
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Token must be refresh token")
+
+    user_id = payload["sub"]
+    username = payload.get("username", "")
+    new_access = _create_jwt(user_id, username, "access")
+    new_refresh = _create_jwt(user_id, username, "refresh")
+
+    return {
+        "user_id": user_id,
+        "username": username,
+        "access_token": new_access,
+        "refresh_token": new_refresh,
+        "token_type": "bearer",
+    }

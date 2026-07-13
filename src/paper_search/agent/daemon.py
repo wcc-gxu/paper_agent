@@ -283,10 +283,16 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
 
     async def _graph_get_user(session_id: str, ask_id: str,
                                timeout: int = 1800) -> dict | None:
-        """Wait for user reply to an ask card via Redis BRPOP.
+        """Wait for user reply to an ask/plan_review card via Redis BRPOP.
 
-        Matches messages of type 'ask_reply' with matching session_id and ask_id.
-        Non-matching messages are parked in the parked queue for later processing.
+        Handles multiple reply types:
+          - ask_reply: user response to ask card (clarification/choice)
+          - plan_approve: user approves a plan
+          - plan_revise: user requests plan revision with feedback
+
+        Matches by session_id and ask_id/review_id.
+        Returns payload dict with _type field set to distinguish reply types.
+        Non-matching messages are parked for later processing.
         Returns None on timeout.
         """
         ws_queue = f"agent:ws:{agent_id}"
@@ -312,12 +318,34 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
             except json.JSONDecodeError:
                 continue
 
-            # Match: ask_reply type, matching session and ask_id
             p = msg.get("payload") or {}
-            if (msg.get("type") == "ask_reply"
+            msg_type = msg.get("type", "")
+
+            # Match: ask_reply type, matching session and ask_id
+            if (msg_type == "ask_reply"
                     and msg.get("_session_id") == session_id
                     and p.get("ask_id") == ask_id):
+                p["_type"] = "ask_reply"
                 return p
+
+            # Match: plan_approve type, matching session and review_id (plan_review→approve)
+            if (msg_type == "plan_approve"
+                    and msg.get("_session_id") == session_id
+                    and p.get("plan_id", "")):
+                # review_id format: review-plan-{plan_id}
+                review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
+                if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
+                    p["_type"] = "plan_approve"
+                    return p
+
+            # Match: plan_revise type, matching session and review_id (plan_review→revise)
+            if (msg_type == "plan_revise"
+                    and msg.get("_session_id") == session_id
+                    and p.get("plan_id", "")):
+                review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
+                if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
+                    p["_type"] = "plan_revise"
+                    return p
 
             # Not matching — park it for the main loop to pick up later
             try:

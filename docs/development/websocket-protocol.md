@@ -1,18 +1,20 @@
 # Paper Agent v3 — WebSocket 通信协议
 
-> iOS 客户端对接规范 | v10.0 | 2026-06-23
+> iOS / Vue 客户端对接规范 | v10.1 | 2026-07-13
+>
+> 变更: v10.1 新增 JWT 认证、plan_review / plan_todo_update / tool_execution 消息类型
 
 ---
 
 ## 设计哲学
 
-v10 围绕**小屏 iOS** 与**移动端 AI 助手**(GLM 龙虾 / Kimi / 豆包 Task Mode / Manus)的交互范式重构,核心三条:
+v10 围绕**小屏 iOS** 与 **Web SPA** 的交互范式重构,核心三条:
 
 1. **内部编排对用户不可见**。主 Agent 的 intent_classify / scenario_plan / evaluate_completion 等 LLM JSON 来回是后端编排细节,用户不该看到 schema 字段名或 JSON 片段。v9 的 `message/thinking` 流式 CoT **已删除**。需要让用户感知进度时,走人类可读的 `status` 消息("正在分析请求..."/"正在搜索论文...")。
-2. **用户操作入口唯一**。任何需要用户授权或澄清的交互——确认、单选、多选、自由文本、方案审批——**统一**走 `ask` 消息(iOS 必须实现的唯一交互 tool)。其他 tool 调用(子 Agent / iOS 端 tool)只通过 `tool/*` 消息汇报进度,不渲染按钮。
+2. **用户操作入口唯一**。任何需要用户授权或澄清的交互——确认、单选、多选、自由文本、方案审批——**统一**走 `ask` 消息(客户端必须实现的唯一交互 tool)。其他 tool 调用(子 Agent / iOS 端 tool)只通过 `tool/*` 消息汇报进度,不渲染按钮。
 3. **立即反馈,无空白**。用户发消息后服务端 <200ms 回 `status{stage:"received"}`,再开始 intent_classify(~5–10s)。期间持续推 `status` 阶段更新,用户绝不面对空白屏幕。
 
-**协议规模**:outbound **7** 个 type + inbound **5** 个 type = 12 种消息(从 v9.1 的 22 种 (type,subType) 砍到一半以下);iOS 渲染 **5 种卡片**(从 7 种简化)。
+**协议规模**: outbound **10** 个 type + inbound **7** 个 type = 17 种消息。
 
 ---
 
@@ -21,44 +23,61 @@ v10 围绕**小屏 iOS** 与**移动端 AI 助手**(GLM 龙虾 / Kimi / 豆包 T
 ### 1.1 WebSocket 地址
 
 ```
-ws://{host}:{port}/ws/chat/{agent_id}/{session_id}
+ws://{host}:{port}/ws/chat/{agent_id}/{session_id}?token=<jwt>
 ```
 
 | 参数 | 说明 |
 |------|------|
-| `agent_id` | Agent 实例 ID。默认 `"agent-001"` |
+| `agent_id` | Agent 实例 ID。格式 `agent-{user_id}`,默认 `"agent-001"` |
 | `session_id` | 会话 ID。默认 `"main"` |
+| `token` | **JWT access_token** (v10.1 新增)。通过 `POST /api/auth/login` 获取。`JWT_SECRET` 未配置时可选 |
 
-### 1.2 连接建立
+### 1.2 认证 (v10.1)
 
-无握手。iOS 连接后立即发 ping,服务端回 pong,开始通信。服务端永不主动断开。
+**JWT 认证流程**:
+
+```
+1. POST /api/auth/register 或 POST /api/auth/login → 获取 access_token + refresh_token
+2. WebSocket 连接: ws://host/ws/chat/{agent_id}/{session_id}?token=<access_token>
+3. 服务端验证 JWT → 提取 user_id → 交叉验证 agent_id 格式匹配
+4. token 无效/过期 → 拒绝连接 (code 4001)
+5. agent_id 不匹配 → 拒绝连接 (code 4003)
+```
+
+**token 刷新**: 客户端在 access_token 过期前调用 `POST /api/auth/refresh` 获取新 token，然后重新连接 WebSocket。
+
+**开放模式**: 若 `JWT_SECRET` 未配置，`?token=` 参数可选，服务端从 `agent_id` 提取 `user_id`（开发/测试用）。
+
+### 1.3 连接建立
+
+客户端连接后发送 JWT token 作为查询参数。服务端验证通过后 accept 连接。之后立即发 ping,服务端回 pong,开始通信。服务端永不主动断开。
 
 ```
 → {"type":"ping","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{}}
 ← {"type":"pong","agentId":"agent-001","sessionId":"main","timestamp":"...","payload":{}}
 ```
 
-### 1.3 重连同步
+### 1.4 重连同步
 
-iOS 重连后**应主动发送** `sync` 拉取离线期间错过的消息(详见 §3.5)。
+客户端重连后**应主动发送** `sync` 拉取离线期间错过的消息(详见 §3.5)。
 
 ```
-[iOS] WS connect → [Server] accept
-[iOS] sync {last_msg_id?: "..."}
+[Client] WS connect?token=<jwt> → [Server] JWT验证 → accept
+[Client] sync {last_msg_id?: "..."}
 [Server] 逐条回放 ws_messages 中本 session 未送达的消息(含原 msg_id)
 [Server] sync_complete {synced_count: N}
 ```
 
-### 1.4 通用信封
+### 1.5 通用信封
 
 ```json
 {
-  "type": "status | message | tool | ask | error | pong | sync_complete",
+  "type": "status | message | tool | tool_execution | plan_review | plan_todo_update | ask | error | pong | sync_complete",
   "subType": "<子类,仅 tool/error 用>",
   "msg_id": "<uuid,server 出站必填>",
   "agentId": "agent-001",
   "sessionId": "main",
-  "timestamp": "2026-06-23T12:00:00Z",
+  "timestamp": "2026-07-13T12:00:00Z",
   "priority": "silent | normal | high | urgent",
   "capabilities": ["calendar", "location", "file_read"],
   "payload": {}
@@ -69,40 +88,45 @@ iOS 重连后**应主动发送** `sync` 拉取离线期间错过的消息(详见
 |------|:----:|------|
 | `type` | 双向 | 消息大类 |
 | `subType` | 双向 | 子类,仅 `tool`/`error` 用 |
-| `msg_id` | 出站 | UUID。iOS 用于 ack / 排重 / `sync.last_msg_id` |
+| `msg_id` | 出站 | UUID。客户端用于 ack / 排重 / `sync.last_msg_id` |
 | `agentId` / `sessionId` | 双向 | 路由标识 |
 | `timestamp` | 双向 | ISO 8601 UTC |
-| `priority` | 出站 | `silent`=不持久化(仅 pong) / `normal`=普通进度 / `high`=回复/提问/完成 → 触发 APNs / `urgent`=错误 |
-| `capabilities` | **入站** | iOS 端可用能力列表,**每条 inbound 消息都带**;服务端缓存最新值 |
+| `priority` | 出站 | `silent`=不持久化 / `normal`=普通进度 / `high`=回复/审批/完成 → 可触发通知 / `urgent`=错误 |
+| `capabilities` | **入站** | 客户端可用能力列表,**每条 inbound 消息都带**;服务端缓存最新值 |
 | `payload` | 双向 | 消息体 |
 
-> **v9 → v10 字段变更**:`priorityKind` → `priority`(缩短);`role` 删除(由 `type` 隐含,保留为可选向后兼容);新增 `capabilities`(仅入站方向)。
+> **v10→v10.1 变更**: `priorityKind` → `priority`; `role` 删除; 新增 `plan_review`/`plan_todo_update`/`tool_execution` 消息类型; WebSocket 连接新增 JWT 认证。
 
-### 1.5 消息速查全表
+### 1.6 消息速查全表
 
-**Outbound (server → iOS)**
+**Outbound (server → client)**
 
-| type | subType | priority | 卡片 | 说明 |
-|------|---------|:--------:|------|------|
-| `status` | — | normal | Status 气泡 | 人类可读阶段更新 |
-| `message` | `reply` | high | Reply 气泡 | LLM 最终 Markdown 回复(完整一次性) |
-| `tool` | `start` | high | Tool Card | 启动子 Agent / 长任务 |
-| `tool` | `progress` | normal | Tool Card | 任务进度更新 |
-| `tool` | `result` | high | Tool Card | 任务终态(done/failed) |
-| `tool` | `call` | high | Tool Card | 请求 iOS 执行本地 tool |
-| `ask` | — | high | Ask Card | **唯一**用户操作入口(5 种 kind) |
-| `error` | `TASK_FAILED` / `INTERNAL_ERROR` / `ASK_TIMEOUT` | urgent | Error 气泡 | 错误(纯文本,无按钮) |
-| `pong` | — | silent | — | 心跳回复 |
-| `sync_complete` | — | silent | — | 重连回放完毕 |
+| type | subType | priority | 说明 |
+|------|---------|:--------:|------|
+| `status` | — | normal | 人类可读阶段更新 |
+| `message` | `reply` | high | LLM 最终 Markdown 回复 |
+| `tool` | `start` | high | 启动子 Agent / 长任务 |
+| `tool` | `progress` | normal | 任务进度更新 |
+| `tool` | `result` | high | 任务终态(done/failed) |
+| `tool` | `call` | high | 请求客户端执行本地 tool |
+| `tool_execution` | — | normal | 每次 tool 调用的独立追踪消息 (v10.1) |
+| `plan_review` | — | high | 计划审批卡片 (v10.1) |
+| `plan_todo_update` | — | normal | Todo 进度全量快照 (v10.1) |
+| `ask` | — | high | **唯一**用户操作入口(5 种 kind) |
+| `error` | `TASK_FAILED` / `INTERNAL_ERROR` / `ASK_TIMEOUT` | urgent | 错误 |
+| `pong` | — | silent | 心跳回复 |
+| `sync_complete` | — | silent | 重连回放完毕 |
 
-**Inbound (iOS → server)**
+**Inbound (client → server)**
 
 | type | 说明 |
 |------|------|
 | `ping` | 心跳 |
 | `message` | 用户文本输入 |
 | `ask_reply` | **统一**所有 Ask Card 回执 |
-| `tool_result` | 仅 `tool/call`(iOS-side tool)的执行结果 |
+| `plan_approve` | 批准计划 (v10.1) |
+| `plan_revise` | 修改计划 (v10.1) |
+| `tool_result` | 仅 `tool/call` 的执行结果 |
 | `sync` | 重连同步请求 |
 
 ---
@@ -252,7 +276,77 @@ iOS 收到后执行本地 tool(可能弹系统授权弹窗,如 EventKit/CoreLoca
 
 从 LLM 视角，所有类型都是 tool_use，不需要区分。前缀仅用于服务端 dispatch 和 WS 通知策略。
 
-### 2.4 `ask` — 用户操作入口(v10 核心)
+### 2.4 `tool_execution` — 工具执行追踪 (v10.1 新增)
+
+每次 tool 调用的独立消息，提供细粒度的执行追踪。与 `tool/start → tool/result` 互补：tool_execution 携带参数和结果摘要，适合执行历史视图。
+
+```json
+{
+  "type": "tool_execution",
+  "priority": "normal",
+  "payload": {
+    "tool_call_id": "tc-abc123",
+    "todo_id": "todo-1",
+    "name": "agent_search_papers",
+    "status": "completed",
+    "arguments": {"keywords": "transformer", "max_results": 20},
+    "result_summary": "找到 50 篇论文，已入库 prj-001",
+    "started_at": "2026-07-13T10:00:00Z",
+    "completed_at": "2026-07-13T10:00:15Z"
+  }
+}
+```
+
+`status` ∈ `running` | `completed` | `failed`。`error` 字段仅在 `failed` 时有值。
+
+### 2.5 `plan_review` — 计划审批 (v10.1 新增)
+
+plan 生成后发送，**等待用户批准**才能执行。替代旧的直接执行模式。
+
+```json
+{
+  "type": "plan_review",
+  "priority": "high",
+  "payload": {
+    "plan_id": "plan-a1b2c3d4e5f6",
+    "summary": "搜索 Transformer 论文 → 评估 → 生成综述",
+    "danger_level": "medium",
+    "estimated_seconds": 120,
+    "permissions": ["search", "download"],
+    "todos": [
+      {"id": "todo-1", "label": "搜索论文", "status": "pending", "sub_steps": [...]},
+      {"id": "todo-2", "label": "评估相关性", "status": "pending", "sub_steps": [...]}
+    ],
+    "revision_note": ""
+  }
+}
+```
+
+**客户端响应**: 发 `plan_approve` 批准，或 `plan_revise` 带 `feedback` 修改。
+
+### 2.6 `plan_todo_update` — Todo 进度快照 (v10.1 新增)
+
+execute 过程中全量推送 todos 状态。客户端可据此渲染进度条/步骤列表。
+
+```json
+{
+  "type": "plan_todo_update",
+  "priority": "normal",
+  "payload": {
+    "plan_id": "plan-a1b2c3d4e5f6",
+    "current_todo_index": 1,
+    "todos": [
+      {"id": "todo-1", "label": "搜索论文", "status": "completed", "sub_steps": [...]},
+      {"id": "todo-2", "label": "评估相关性", "status": "in_progress", "sub_steps": [...]}
+    ],
+    "message": "[2/3] 评估相关性"
+  }
+}
+```
+
+`todos[].status` ∈ `pending` | `in_progress` | `completed` | `failed` | `skipped`。
+
+### 2.7 `ask` — 用户操作入口(v10 核心)
 
 **iOS 必须实现的唯一交互 tool**。所有需要用户授权或澄清的场景统一走 `ask`,通过 `kind` 字段切换五种渲染形态。带 `ask_id` 用于关联回答。
 
@@ -360,7 +454,19 @@ iOS 收到后执行本地 tool(可能弹系统授权弹窗,如 EventKit/CoreLoca
 {"ask_id":"a1","value":false,"reason":"先不下载,只列表"}
 ```
 
-### 3.4 `tool_result` — iOS tool 执行结果
+### 3.4 `plan_approve` — 批准计划 (v10.1 新增)
+
+```json
+{"type":"plan_approve","agentId":"agent-001","sessionId":"main","payload":{"plan_id":"plan-a1b2c3d4e5f6"}}
+```
+
+### 3.5 `plan_revise` — 修改计划 (v10.1 新增)
+
+```json
+{"type":"plan_revise","agentId":"agent-001","sessionId":"main","payload":{"plan_id":"plan-a1b2c3d4e5f6","feedback":"只需要搜索，不用下载"}}
+```
+
+### 3.6 `tool_result` — 客户端 tool 执行结果
 
 仅用于 `tool/call`(iOS 端 tool)的回执,通过 `tool_call_id` 关联。
 

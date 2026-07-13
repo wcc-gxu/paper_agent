@@ -16,10 +16,119 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from ..config import get_papers_dir, get_markdown_dir, get_outputs_dir
-from .auth import verify_api_key
+from .auth import (
+    verify_api_key,
+    auth_register,
+    auth_login,
+    auth_refresh,
+)
 
 router = APIRouter(prefix="/api", tags=["paper-agent"])
 _DEFAULT_USER = "anonymous"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Auth Models
+# ═══════════════════════════════════════════════════════════════
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=6, max_length=100)
+    display_name: str = Field("", max_length=100)
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(..., min_length=1)
+
+
+class TokenResponse(BaseModel):
+    user_id: str
+    username: str
+    display_name: str = ""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Auth Routes (JWT)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.post("/auth/register", response_model=TokenResponse)
+async def api_register(body: RegisterRequest):
+    """注册新用户 → 返回 JWT access_token + refresh_token。
+
+    用户名 3-50 字符，密码 ≥6 字符。
+    """
+    try:
+        result = auth_register(
+            username=body.username.strip(),
+            password=body.password,
+            display_name=body.display_name.strip(),
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
+
+
+@router.post("/auth/login", response_model=TokenResponse)
+async def api_login(body: LoginRequest):
+    """用户登录 → 返回 JWT access_token + refresh_token。
+
+    access_token 有效期 30 分钟，refresh_token 有效期 7 天。
+    """
+    try:
+        result = auth_login(
+            username=body.username.strip(),
+            password=body.password,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Login failed: {e}")
+
+
+@router.post("/auth/refresh", response_model=TokenResponse)
+async def api_refresh(body: RefreshRequest):
+    """使用 refresh_token 获取新的 access_token。"""
+    try:
+        result = auth_refresh(body.refresh_token)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
+
+
+@router.get("/auth/me")
+async def api_me(user_id: str = Depends(verify_api_key)):
+    """获取当前用户信息（需要 Bearer Token）。"""
+    from ..config import use_postgresql
+    if use_postgresql():
+        from ..agent.pgdb import PostgresAgentDB
+        db = PostgresAgentDB()
+    else:
+        from ..agent.db import AgentDB
+        db = AgentDB()
+    user = db.get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {
+        "user_id": user.get("id", user_id),
+        "username": user.get("username", ""),
+        "display_name": user.get("display_name", ""),
+        "role": user.get("role", "researcher"),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -122,8 +122,8 @@ def _paper_to_bibtex(p: dict) -> str:
 @dataclass
 class ToolMetadata:
     """工具元数据标签（对应 CLAUDE.md §工具注册）."""
-    location: str = "server"       # "server" | "ios"
-    category: str = ""             # search | download | convert | index | analyze | export | manage | kb | subscription | system | network | memory | ios
+    location: str = "server"       # "server" | "ios" | "vue"
+    category: str = ""             # search | download | convert | index | analyze | export | manage | kb | subscription | system | network | memory | ios | literature | knowledge | writing | glossary | capture | import
     is_idempotent: bool = False     # 重试安全
     is_long_running: bool = False   # → Celery
     progress_report: bool = False   # → TaskLogger JSON 日志
@@ -156,11 +156,44 @@ class ToolRegistry:
         """重置单例（用于测试）."""
         cls._instance = None
 
+    # ── Schema Builder ───────────────────────────────────
+
+    @staticmethod
+    def _build_args_schema(tool_name: str, params: dict[str, dict[str, str]]) -> type:
+        """Convert {name: {type:str, description:str, required?:bool}} to Pydantic model.
+
+        Supported types: str, int, float, bool, list, dict, any.
+        """
+        from pydantic import create_model, Field
+        from typing import Optional as Opt
+
+        TYPE_MAP: dict[str, type] = {
+            "str": str, "int": int, "float": float, "bool": bool,
+            "list": list, "dict": dict, "any": Any,
+        }
+        fields: dict[str, Any] = {}
+        for pname, spec in params.items():
+            py_type = TYPE_MAP.get(spec.get("type", "str"), str)
+            desc = spec.get("description", f"Parameter: {pname}")
+            required = spec.get("required", True)
+            if not required:
+                py_type = Opt[py_type]
+                fields[pname] = (py_type, Field(default=None, description=desc))
+            else:
+                fields[pname] = (py_type, Field(description=desc))
+        return create_model(f"{tool_name}_args", **fields)
+
     # ── 注册 API ─────────────────────────────────────────
 
     def register(self, name: str, description: str, func: Callable,
                  args_schema: dict | type = None, metadata: ToolMetadata = None):
-        """注册一个工具。func 可以是 sync 或 async。"""
+        """注册一个工具。func 可以是 sync 或 async。
+
+        args_schema 支持两种格式：
+          - Pydantic 类型（直接作为 input_schema）
+          - dict: {param_name: {"type": "str", "description": "...", "required": bool}}
+          - 旧 dict: {param_name: PythonType} (deprecated, 自动升级)
+        """
         if metadata is None:
             metadata = ToolMetadata()
 
@@ -176,14 +209,19 @@ class ToolRegistry:
             coroutine = _async_wrapper
 
         if args_schema is None or isinstance(args_schema, dict):
-            # 对于 dict schema，使用简单的 args_schema
             from pydantic import create_model, Field
             if args_schema:
-                fields = {k: (type(v), Field(description=f"Parameter: {k}")) for k, v in args_schema.items()}
-                model = create_model(f"{name}_args", **fields)
+                # Detect format: {name: {"type":...}} vs {name: PythonType}
+                first_val = next(iter(args_schema.values()), None)
+                if isinstance(first_val, dict) and "type" in first_val:
+                    # New format: {name: {type:str, description:str}}
+                    args_schema = self._build_args_schema(name, args_schema)
+                else:
+                    # Legacy format: {name: PythonType}
+                    fields = {k: (type(v), Field(description=f"Parameter: {k}")) for k, v in args_schema.items()}
+                    args_schema = create_model(f"{name}_args", **fields)
             else:
-                model = create_model(f"{name}_args")
-            args_schema = model
+                args_schema = create_model(f"{name}_args")
 
         tool = StructuredTool(
             name=name,
@@ -197,22 +235,30 @@ class ToolRegistry:
         return tool
 
     def register_direct(self, name: str, description: str, func: Callable,
-                        metadata: ToolMetadata = None):
-        """直接注册一个工具（薄包装已有函数）。"""
+                        args_schema: dict = None, metadata: ToolMetadata = None):
+        """直接注册一个工具（薄包装已有函数）。
+
+        args_schema: {param_name: {"type": "str", "description": "...", "required": bool}}
+        """
         if metadata is None:
             metadata = ToolMetadata()
 
         from pydantic import create_model
         coroutine = func if asyncio.iscoroutinefunction(func) else None
         sync_func = func if not asyncio.iscoroutinefunction(func) else None
-        args_schema = create_model(f"{name}_args")
+
+        if args_schema:
+            model = self._build_args_schema(name, args_schema)
+        else:
+            model = create_model(f"{name}_args")
+        args_schema_model = model
 
         tool = StructuredTool(
             name=name,
             description=description,
             func=sync_func,
             coroutine=coroutine,
-            args_schema=args_schema,
+            args_schema=args_schema_model,
         )
         self._tools[name] = tool
         self._metadata[name] = metadata
@@ -348,6 +394,11 @@ class ToolRegistry:
             name="read_file",
             description="读取文件内容。参数: file_path (文件路径), limit (最大行数, 默认2000), offset (起始行, 默认0)",
             func=read_file,
+            args_schema={
+                "file_path": {"type": "str", "description": "文件绝对路径"},
+                "limit": {"type": "int", "description": "最大读取行数", "required": False},
+                "offset": {"type": "int", "description": "起始行号（0-based）", "required": False},
+            },
             metadata=ToolMetadata(category="system", is_idempotent=True),
         )
 
@@ -366,6 +417,10 @@ class ToolRegistry:
             name="write_file",
             description="写入文件内容。参数: file_path (文件路径), content (内容)",
             func=write_file,
+            args_schema={
+                "file_path": {"type": "str", "description": "文件绝对路径"},
+                "content": {"type": "str", "description": "要写入的文件内容"},
+            },
             metadata=ToolMetadata(category="system"),
         )
 
@@ -389,6 +444,11 @@ class ToolRegistry:
             name="edit_file",
             description="精确替换文件中的字符串。参数: file_path, old_string (要替换的文本), new_string (替换后文本)",
             func=edit_file,
+            args_schema={
+                "file_path": {"type": "str", "description": "文件绝对路径"},
+                "old_string": {"type": "str", "description": "要替换的原文本（须精确匹配）"},
+                "new_string": {"type": "str", "description": "替换后的新文本"},
+            },
             metadata=ToolMetadata(category="system"),
         )
 
@@ -406,6 +466,10 @@ class ToolRegistry:
             name="glob_files",
             description="文件模式匹配。参数: pattern (glob 模式), path (搜索目录, 默认当前)",
             func=glob_files,
+            args_schema={
+                "pattern": {"type": "str", "description": "glob 匹配模式，如 **/*.py"},
+                "path": {"type": "str", "description": "搜索根目录", "required": False},
+            },
             metadata=ToolMetadata(category="system", is_idempotent=True),
         )
 
@@ -426,6 +490,11 @@ class ToolRegistry:
             name="grep_content",
             description="文件内容正则搜索。参数: pattern (正则表达式), path (搜索目录), glob (文件名过滤)",
             func=grep_content,
+            args_schema={
+                "pattern": {"type": "str", "description": "正则表达式搜索模式"},
+                "path": {"type": "str", "description": "搜索目录", "required": False},
+                "glob": {"type": "str", "description": "文件名 glob 过滤", "required": False},
+            },
             metadata=ToolMetadata(category="system", is_idempotent=True),
         )
 
@@ -455,6 +524,11 @@ class ToolRegistry:
             name="bash_exec",
             description="执行 Shell 命令。参数: command (命令), timeout (超时秒数, 默认120), cwd (工作目录)",
             func=bash_exec,
+            args_schema={
+                "command": {"type": "str", "description": "要执行的 Shell 命令"},
+                "timeout": {"type": "int", "description": "超时秒数", "required": False},
+                "cwd": {"type": "str", "description": "工作目录", "required": False},
+            },
             metadata=ToolMetadata(category="system", is_long_running=True),
         )
 
@@ -517,6 +591,11 @@ class ToolRegistry:
             name="web_search",
             description="通用网页搜索（火山引擎，500次/月）。降级链: 火山引擎→web_fetch→curl。参数: keywords, count(默认10), time_range(OneDay/OneWeek/OneMonth/OneYear)",
             func=web_search,
+            args_schema={
+                "keywords": {"type": "str", "description": "搜索关键词"},
+                "count": {"type": "int", "description": "返回条数", "required": False},
+                "time_range": {"type": "str", "description": "时间范围 OneDay/OneWeek/OneMonth/OneYear", "required": False},
+            },
             metadata=ToolMetadata(category="network", is_idempotent=True),
         )
 
@@ -543,6 +622,9 @@ class ToolRegistry:
             name="web_fetch",
             description="抓取 URL 内容并转为文本。参数: url (网页地址)",
             func=web_fetch,
+            args_schema={
+                "url": {"type": "str", "description": "网页地址"},
+            },
             metadata=ToolMetadata(category="network", is_idempotent=True),
         )
 
@@ -560,6 +642,9 @@ class ToolRegistry:
                 return json.dumps({"error": str(e)})
 
         self.register(name="service_start", description="启动 systemd 服务。参数: name (服务名)", func=service_start,
+                      args_schema={
+                          "name": {"type": "str", "description": "systemd 服务名称"},
+                      },
                       metadata=ToolMetadata(category="system", is_long_running=True))
 
     def _register_service_stop(self):
@@ -570,6 +655,9 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="service_stop", description="停止 systemd 服务。参数: name (服务名)", func=service_stop,
+                      args_schema={
+                          "name": {"type": "str", "description": "systemd 服务名称"},
+                      },
                       metadata=ToolMetadata(category="system"))
 
     def _register_service_status(self):
@@ -580,6 +668,9 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="service_status", description="查看 systemd 服务状态。参数: name (服务名)", func=service_status,
+                      args_schema={
+                          "name": {"type": "str", "description": "systemd 服务名称"},
+                      },
                       metadata=ToolMetadata(category="system", is_idempotent=True))
 
     def _register_docker_compose_up(self):
@@ -592,6 +683,9 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="docker_compose_up", description="Docker Compose 一键启动。参数: cwd (项目目录)", func=docker_compose_up,
+                      args_schema={
+                          "cwd": {"type": "str", "description": "项目目录", "required": False},
+                      },
                       metadata=ToolMetadata(category="system", is_long_running=True))
 
     def _register_docker_compose_down(self):
@@ -604,6 +698,9 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="docker_compose_down", description="Docker Compose 停止。参数: cwd (项目目录)", func=docker_compose_down,
+                      args_schema={
+                          "cwd": {"type": "str", "description": "项目目录", "required": False},
+                      },
                       metadata=ToolMetadata(category="system"))
 
     def _register_apt_install(self):
@@ -616,6 +713,9 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="apt_install", description="Ubuntu 包安装。参数: packages (空格分隔的包名)", func=apt_install,
+                      args_schema={
+                          "packages": {"type": "str", "description": "空格分隔的包名列表"},
+                      },
                       metadata=ToolMetadata(category="system", is_long_running=True))
 
     def _register_pip_install(self):
@@ -628,6 +728,9 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="pip_install", description="Python 包安装。参数: packages (pip 安装参数)", func=pip_install,
+                      args_schema={
+                          "packages": {"type": "str", "description": "pip 安装参数"},
+                      },
                       metadata=ToolMetadata(category="system", is_long_running=True))
 
     def _register_env_config(self):
@@ -658,6 +761,11 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="env_config", description="读写 .env 配置。参数: action(read/set), key, value", func=env_config,
+                      args_schema={
+                          "action": {"type": "str", "description": "read 或 set"},
+                          "key": {"type": "str", "description": "环境变量名", "required": False},
+                          "value": {"type": "str", "description": "环境变量值", "required": False},
+                      },
                       metadata=ToolMetadata(category="system"))
 
     def _register_log_view(self):
@@ -673,6 +781,10 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="log_view", description="查看最近日志。参数: lines(默认50), log_path(日志文件路径)", func=log_view,
+                      args_schema={
+                          "lines": {"type": "int", "description": "查看最近行数", "required": False},
+                          "log_path": {"type": "str", "description": "日志文件路径", "required": False},
+                      },
                       metadata=ToolMetadata(category="system", is_idempotent=True))
 
     def _register_health_check(self):
@@ -700,6 +812,7 @@ class ToolRegistry:
                 checks["db"] = f"error: {e}"
             return json.dumps(checks, ensure_ascii=False)
         self.register(name="health_check", description="全面健康检查（DB + 磁盘 + 环境）", func=health_check,
+                      args_schema={},
                       metadata=ToolMetadata(category="system", is_idempotent=True))
 
     # ══════════════════════════════════════════════════════════
@@ -718,6 +831,7 @@ class ToolRegistry:
             results = await mem.long_term.search(query, top_k=top_k)
             return json.dumps([{"title": r.title, "content": r.content[:300], "category": r.category} for r in results], ensure_ascii=False)
         self.register(name="search_memory", description="搜索历史对话和知识。参数: query, top_k(默认5)", func=search_memory,
+                      args_schema={"query": {"type": "str", "description": "搜索查询"}, "top_k": {"type": "int", "description": "返回条数", "required": False}},
                       metadata=ToolMetadata(category="memory", is_idempotent=True))
 
     def _register_summarize_memory(self):
@@ -764,6 +878,7 @@ class ToolRegistry:
             name="summarize_memory",
             description="把多条历史消息压缩成摘要并替换 short_term。参数: messages_json (JSON 数组[{role,content}])",
             func=summarize_memory,
+            args_schema={"messages_json": {"type": "str", "description": "JSON 数组 [{role,content}]"}},
             metadata=ToolMetadata(category="memory"),
         )
 
@@ -809,6 +924,7 @@ class ToolRegistry:
             name="delete_memory",
             description="从短期+长期记忆中删除指定条目。参数: message_ids (JSON 数组或单 ID)",
             func=delete_memory,
+            args_schema={"message_ids": {"type": "str", "description": "JSON 数组或单个 ID 字符串"}},
             metadata=ToolMetadata(category="memory"),
         )
 
@@ -867,6 +983,7 @@ class ToolRegistry:
             name="extract_to_long_term",
             description="把要点条目存入长期记忆（SQLite + 向量索引）。参数: content_json (JSON 数组[{key,value,type,paper_id?}])",
             func=extract_to_long_term,
+            args_schema={"content_json": {"type": "str", "description": "JSON 数组 [{key,value,type,paper_id?}]"}},
             metadata=ToolMetadata(category="memory"),
         )
 
@@ -909,6 +1026,7 @@ class ToolRegistry:
             name="tag_memory",
             description="给长期记忆条目打标签。参数: message_id (knowledge_entries.id), tags (JSON 数组)",
             func=tag_memory,
+            args_schema={"message_id": {"type": "str", "description": "knowledge_entries.id"}, "tags": {"type": "str", "description": "JSON 数组标签"}},
             metadata=ToolMetadata(category="memory"),
         )
 
@@ -918,6 +1036,7 @@ class ToolRegistry:
             val = mem.meta.get_preference(key)
             return json.dumps({key: val} if val else {"error": f"No preference for {key}"})
         self.register(name="get_user_preference", description="获取用户偏好。参数: key (偏好键名)", func=get_user_preference,
+                      args_schema={"key": {"type": "str", "description": "偏好键名"}},
                       metadata=ToolMetadata(category="memory", is_idempotent=True))
 
     def _register_list_collections(self):
@@ -930,44 +1049,55 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"collections": ["papers_abstract", "papers_fulltext"], "note": f"placeholder: {e}"})
         self.register(name="list_collections", description="列出 ChromaDB 所有集合", func=list_collections,
+                      args_schema={},
                       metadata=ToolMetadata(category="memory", is_idempotent=True))
 
     # ══════════════════════════════════════════════════════════
     # iOS 自动工具
     # ══════════════════════════════════════════════════════════
 
-    def _register_ios_tool(self, name, description):
+    def _register_ios_tool(self, name, description, args_schema=None):
         def ios_stub(**kwargs) -> str:
             return json.dumps({"ios_tool": name, "args": kwargs, "note": "Sent via WebSocket tool(ios) message. Result returned asynchronously."})
         self.register(name=name, description=description, func=ios_stub,
+                      args_schema=args_schema or {},
                       metadata=ToolMetadata(location="ios", category="ios"))
 
     def _register_ios_file_read(self):
-        self._register_ios_tool("ios_file_read", "读取 iOS 本地文件。参数: path (文件路径)")
+        self._register_ios_tool("ios_file_read", "读取 iOS 本地文件。参数: path (文件路径)",
+                                args_schema={"path": {"type": "str", "description": "文件路径"}})
 
     def _register_ios_file_write(self):
-        self._register_ios_tool("ios_file_write", "写入文件到 iOS 本地。参数: path, content")
+        self._register_ios_tool("ios_file_write", "写入文件到 iOS 本地。参数: path, content",
+                                args_schema={"path": {"type": "str", "description": "文件路径"}, "content": {"type": "str", "description": "文件内容"}})
 
     def _register_ios_file_list(self):
-        self._register_ios_tool("ios_file_list", "列出 iOS 本地目录。参数: path")
+        self._register_ios_tool("ios_file_list", "列出 iOS 本地目录。参数: path",
+                                args_schema={"path": {"type": "str", "description": "目录路径"}})
 
     def _register_ios_calendar_add(self):
-        self._register_ios_tool("ios_calendar_add", "添加日历事件。参数: title, start_time, end_time, notes")
+        self._register_ios_tool("ios_calendar_add", "添加日历事件。参数: title, start_time, end_time, notes",
+                                args_schema={"title": {"type": "str", "description": "事件标题"}, "start_time": {"type": "str", "description": "开始时间 ISO 格式"}, "end_time": {"type": "str", "description": "结束时间 ISO 格式"}, "notes": {"type": "str", "description": "备注", "required": False}})
 
     def _register_ios_calendar_read(self):
-        self._register_ios_tool("ios_calendar_read", "读取日历事件。参数: start_date, end_date")
+        self._register_ios_tool("ios_calendar_read", "读取日历事件。参数: start_date, end_date",
+                                args_schema={"start_date": {"type": "str", "description": "开始日期"}, "end_date": {"type": "str", "description": "结束日期"}})
 
     def _register_ios_reminder_add(self):
-        self._register_ios_tool("ios_reminder_add", "添加提醒事项。参数: title, due_date, notes")
+        self._register_ios_tool("ios_reminder_add", "添加提醒事项。参数: title, due_date, notes",
+                                args_schema={"title": {"type": "str", "description": "提醒标题"}, "due_date": {"type": "str", "description": "到期日期"}, "notes": {"type": "str", "description": "备注", "required": False}})
 
     def _register_ios_notification_local(self):
-        self._register_ios_tool("ios_notification_local", "发送本地通知。参数: title, body, category")
+        self._register_ios_tool("ios_notification_local", "发送本地通知。参数: title, body, category",
+                                args_schema={"title": {"type": "str", "description": "通知标题"}, "body": {"type": "str", "description": "通知内容"}, "category": {"type": "str", "description": "通知类别", "required": False}})
 
     def _register_ios_device_info(self):
-        self._register_ios_tool("ios_device_info", "获取 iOS 设备信息（型号/系统版本/存储/网络）")
+        self._register_ios_tool("ios_device_info", "获取 iOS 设备信息（型号/系统版本/存储/网络）",
+                                args_schema={})
 
     def _register_ios_location_get(self):
-        self._register_ios_tool("ios_location_get", "获取 iPhone 当前位置。无参数")
+        self._register_ios_tool("ios_location_get", "获取 iPhone 当前位置。无参数",
+                                args_schema={})
 
     # ══════════════════════════════════════════════════════════
     # 直接查询
@@ -987,6 +1117,7 @@ class ToolRegistry:
                 return json.dumps({"project_id": project_id, "total": len(papers), "papers": [{"title": p.get("title",""), "year": p.get("year"), "relevance_score": p.get("relevance_score")} for p in papers[:20]]}, ensure_ascii=False)
             return json.dumps({"error": "Provide project_id or paper_id"})
         self.register(name="paper_status", description="查看项目/论文进度。参数: project_id 或 paper_id", func=paper_status,
+                      args_schema={"project_id": {"type": "str", "description": "项目 ID", "required": False}, "paper_id": {"type": "str", "description": "论文 ID", "required": False}},
                       metadata=ToolMetadata(category="export", is_idempotent=True))
 
     def _register_list_sources(self):
@@ -998,6 +1129,7 @@ class ToolRegistry:
             except Exception as e:
                 return json.dumps({"error": str(e)})
         self.register(name="list_sources", description="列出所有可用学术搜索来源及其状态", func=list_sources,
+                      args_schema={},
                       metadata=ToolMetadata(category="export", is_idempotent=True))
 
     def _register_get_paper_abstract(self):
@@ -1009,6 +1141,7 @@ class ToolRegistry:
                 return json.dumps(dict(row), ensure_ascii=False, default=str)
             return json.dumps({"error": f"Paper not found: {paper_id}"})
         self.register(name="get_paper_abstract", description="获取论文摘要。参数: paper_id", func=get_paper_abstract,
+                      args_schema={"paper_id": {"type": "str", "description": "论文 ID"}},
                       metadata=ToolMetadata(category="export", is_idempotent=True))
 
     # ══════════════════════════════════════════════════════════
@@ -1078,6 +1211,13 @@ class ToolRegistry:
                 "max_papers_per_check (默认5)。Celery Beat 已周期检查 subscriptions 表，无需手动触发。"
             ),
             func=create_subscription,
+            args_schema={
+                "query": {"type": "str", "description": "研究方向关键词"},
+                "name": {"type": "str", "description": "显示名", "required": False},
+                "interval_hours": {"type": "int", "description": "检查间隔小时", "required": False},
+                "sources": {"type": "str", "description": "逗号分隔的来源", "required": False},
+                "max_papers_per_check": {"type": "int", "description": "每次最大论文数", "required": False},
+            },
             metadata=ToolMetadata(category="subscription"),
         )
 
@@ -1104,6 +1244,7 @@ class ToolRegistry:
             name="list_subscriptions",
             description="列出全部订阅。参数: enabled_only (默认 false，true 时仅返回未暂停)。",
             func=list_subscriptions,
+            args_schema={"enabled_only": {"type": "bool", "description": "仅返回启用的", "required": False}},
             metadata=ToolMetadata(category="subscription", is_idempotent=True),
         )
 
@@ -1128,6 +1269,7 @@ class ToolRegistry:
             name="delete_subscription",
             description="删除订阅及其全部推送历史。参数: subscription_id (必需)。",
             func=delete_subscription,
+            args_schema={"subscription_id": {"type": "str", "description": "订阅 ID"}},
             metadata=ToolMetadata(category="subscription"),
         )
 
@@ -1151,6 +1293,7 @@ class ToolRegistry:
             name="pause_subscription",
             description="暂停订阅（保留历史，仅停止 Beat 检查）。参数: subscription_id (必需)。",
             func=pause_subscription,
+            args_schema={"subscription_id": {"type": "str", "description": "订阅 ID"}},
             metadata=ToolMetadata(category="subscription"),
         )
 
@@ -1174,6 +1317,7 @@ class ToolRegistry:
             name="resume_subscription",
             description="恢复已暂停的订阅。参数: subscription_id (必需)。",
             func=resume_subscription,
+            args_schema={"subscription_id": {"type": "str", "description": "订阅 ID"}},
             metadata=ToolMetadata(category="subscription"),
         )
 
@@ -1185,30 +1329,48 @@ class ToolRegistry:
         """注册子 Agent 工具（执行阶段由 Plan Graph 直接调用）。"""
         # Abstracts the existing CLI/MCP functions as direct tool wrappers
         sub_tools = [
-            ("agent_search_papers", "跨多源搜索学术论文", self._make_search_papers()),
-            ("agent_download_paper", "下载单篇论文 PDF。参数: paper_id 或 title（需先 search_papers 入库）", self._make_download_paper()),
-            ("agent_convert_paper", "PDF 转 Markdown。参数: paper_id（用已下载的 pdf_path，或显式传 pdf_path）", self._make_convert_paper()),
-            ("agent_index_paper", "Markdown 索引入 ChromaDB。参数: paper_id 或 project_id+all（索引项目全部已转换论文）", self._make_index_paper()),
-            ("agent_evaluate_papers", "LLM 批量评估论文相关性。参数: project_id, query(可选), all(默认true)", self._make_evaluate_papers()),
-            ("agent_rank_papers", "期刊等级评定 CCF/SCI → A+/A/B/C。参数: project_id（可选）, all(默认true)", self._make_rank_papers()),
-            ("agent_generate_survey", "生成 AI 文献综述报告。参数: project_id", self._make_generate_survey()),
-            ("agent_paper_export", "导出 BibTeX/JSON 到文件。参数: project_id, format(bibtex|json)", self._make_paper_export()),
-            ("agent_paper_clean", "清理项目 DB/索引", self._make_paper_clean()),
-            ("agent_batch_search", "从 JSON/CSV 批量搜索并入库。参数: file_path, download(默认false)", self._make_batch_search()),
-            ("agent_citation_chase", "引用追溯（Semantic Scholar，默认2层）。参数: paper_title 或 doi", self._make_citation_chase()),
-            ("agent_search_library", "ChromaDB 语义搜索已入库论文", self._make_search_library()),
-            ("agent_search_knowledge", "ChromaDB 搜索结构化知识", self._make_search_knowledge()),
-            ("agent_read_paper", "读取论文完整 Markdown", self._make_read_paper()),
-            ("agent_extract_knowledge", "从论文中提取结构化知识（贡献/方法/数据集/局限）并存长期记忆。参数: paper_id, deep(默认false)", self._make_extract_knowledge()),
-            ("agent_find_related", "发现相关论文（语义相似+引用关系）。参数: paper_id, top_k(默认10)", self._make_find_related()),
-            ("agent_discover_gaps", "知识发现 — 研究空白/矛盾/趋势。参数: domain(可选), project_id(可选)", self._make_discover_gaps()),
-            ("agent_build_glossary", "构建中英学术术语表。参数: project_id（从该项目论文提取术语）", self._make_build_glossary()),
-            ("agent_translate_query", "中文查询翻译为学术英文关键词。参数: query, target_lang(en|zh, 默认en)", self._make_translate_query()),
+            ("agent_search_papers", "跨多源搜索学术论文", self._make_search_papers(),
+             {"keywords": {"type": "str", "description": "搜索关键词"}, "sources": {"type": "str", "description": "逗号分隔的来源", "required": False}, "year_from": {"type": "int", "description": "起始年份", "required": False}, "max_results": {"type": "int", "description": "最大返回数", "required": False}}),
+            ("agent_download_paper", "下载单篇论文 PDF。参数: paper_id 或 title（需先 search_papers 入库）", self._make_download_paper(),
+             {"title": {"type": "str", "description": "论文标题", "required": False}, "source": {"type": "str", "description": "来源", "required": False}, "paper_id": {"type": "str", "description": "论文 ID", "required": False}}),
+            ("agent_convert_paper", "PDF 转 Markdown。参数: paper_id（用已下载的 pdf_path，或显式传 pdf_path）", self._make_convert_paper(),
+             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "pdf_path": {"type": "str", "description": "PDF 路径", "required": False}}),
+            ("agent_index_paper", "Markdown 索引入 ChromaDB。参数: paper_id 或 project_id+all（索引项目全部已转换论文）", self._make_index_paper(),
+             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "project_id": {"type": "str", "description": "项目 ID", "required": False}, "all": {"type": "bool", "description": "索引该项目全部论文", "required": False}}),
+            ("agent_evaluate_papers", "LLM 批量评估论文相关性。参数: project_id, query(可选), all(默认true)", self._make_evaluate_papers(),
+             {"project_id": {"type": "str", "description": "项目 ID", "required": False}, "query": {"type": "str", "description": "评估查询", "required": False}, "all": {"type": "bool", "description": "评估全部未评估论文", "required": False}}),
+            ("agent_rank_papers", "期刊等级评定 CCF/SCI → A+/A/B/C。参数: project_id（可选）, all(默认true)", self._make_rank_papers(),
+             {"project_id": {"type": "str", "description": "项目 ID", "required": False}, "all": {"type": "bool", "description": "评定全部期刊", "required": False}}),
+            ("agent_generate_survey", "生成 AI 文献综述报告。参数: project_id", self._make_generate_survey(),
+             {"project_id": {"type": "str", "description": "项目 ID", "required": False}}),
+            ("agent_paper_export", "导出 BibTeX/JSON 到文件。参数: project_id, format(bibtex|json)", self._make_paper_export(),
+             {"project_id": {"type": "str", "description": "项目 ID", "required": False}, "format": {"type": "str", "description": "导出格式 bibtex/json", "required": False}}),
+            ("agent_paper_clean", "清理项目 DB/索引", self._make_paper_clean(),
+             {"project_id": {"type": "str", "description": "项目 ID"}, "keep_pdfs": {"type": "bool", "description": "保留 PDF 文件", "required": False}}),
+            ("agent_batch_search", "从 JSON/CSV 批量搜索并入库。参数: file_path, download(默认false)", self._make_batch_search(),
+             {"file_path": {"type": "str", "description": "JSON/CSV 文件路径", "required": False}, "download": {"type": "bool", "description": "是否下载 PDF", "required": False}}),
+            ("agent_citation_chase", "引用追溯（Semantic Scholar，默认2层）。参数: paper_title 或 doi", self._make_citation_chase(),
+             {"paper_title": {"type": "str", "description": "论文标题", "required": False}, "doi": {"type": "str", "description": "DOI", "required": False}}),
+            ("agent_search_library", "ChromaDB 语义搜索已入库论文", self._make_search_library(),
+             {"query": {"type": "str", "description": "搜索查询"}, "top_k": {"type": "int", "description": "返回条数", "required": False}}),
+            ("agent_search_knowledge", "ChromaDB 搜索结构化知识", self._make_search_knowledge(),
+             {"query": {"type": "str", "description": "搜索查询"}, "top_k": {"type": "int", "description": "返回条数", "required": False}}),
+            ("agent_read_paper", "读取论文完整 Markdown", self._make_read_paper(),
+             {"paper_id": {"type": "str", "description": "论文 ID"}}),
+            ("agent_extract_knowledge", "从论文中提取结构化知识（贡献/方法/数据集/局限）并存长期记忆。参数: paper_id, deep(默认false)", self._make_extract_knowledge(),
+             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "deep": {"type": "bool", "description": "深度提取模式", "required": False}}),
+            ("agent_find_related", "发现相关论文（语义相似+引用关系）。参数: paper_id, top_k(默认10)", self._make_find_related(),
+             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "top_k": {"type": "int", "description": "返回条数", "required": False}}),
+            ("agent_discover_gaps", "知识发现 — 研究空白/矛盾/趋势。参数: domain(可选), project_id(可选)", self._make_discover_gaps(),
+             {"domain": {"type": "str", "description": "研究领域", "required": False}, "project_id": {"type": "str", "description": "项目 ID", "required": False}}),
+            ("agent_build_glossary", "构建中英学术术语表。参数: project_id（从该项目论文提取术语）", self._make_build_glossary(),
+             {"project_id": {"type": "str", "description": "项目 ID", "required": False}}),
+            ("agent_translate_query", "中文查询翻译为学术英文关键词。参数: query, target_lang(en|zh, 默认en)", self._make_translate_query(),
+             {"query": {"type": "str", "description": "待翻译查询", "required": False}, "target_lang": {"type": "str", "description": "目标语言 en/zh", "required": False}}),
         ]
-        for name, desc, func in sub_tools:
-            self.register_direct(name, desc, func,
+        for name, desc, func, args_schema in sub_tools:
+            self.register_direct(name, desc, func, args_schema=args_schema,
                                  metadata=ToolMetadata(category="search"))
-
     def _make_search_papers(self):
         async def search_papers(keywords: str, sources: str = "arxiv,semantic_scholar",
                                  year_from: int = 2020, max_results: int = 20) -> str:
@@ -1817,6 +1979,7 @@ class ToolRegistry:
         self.register_direct(
             "agent_literature_search", "文献检索: 跨源搜索论文 (search→evaluate→download→convert→extract_metadata)",
             self._make_literature_search(),
+            args_schema={"user_query": {"type": "str", "description": "用户查询"}, "sources": {"type": "str", "description": "逗号分隔的来源", "required": False}, "year_from": {"type": "int", "description": "起始年份", "required": False}, "max_results": {"type": "int", "description": "最大返回数", "required": False}},
             metadata=ToolMetadata(category="literature"),
         )
 
@@ -1849,11 +2012,13 @@ class ToolRegistry:
         self.register_direct(
             "agent_knowledge_ingest", "知识入库: chunk→embed→dedup→rank（处理 Literature Agent 产出的论文）",
             self._make_knowledge_ingest(),
+            args_schema={"project_id": {"type": "str", "description": "项目 ID"}},
             metadata=ToolMetadata(category="knowledge"),
         )
         self.register_direct(
             "agent_knowledge_ask", "RAG 问答: 基于已入库论文的学术问答（带引用）",
             self._make_knowledge_ask(),
+            args_schema={"question": {"type": "str", "description": "学术问题"}, "project_id": {"type": "str", "description": "项目 ID", "required": False}, "top_k": {"type": "int", "description": "检索 top-k", "required": False}},
             metadata=ToolMetadata(category="knowledge"),
         )
 
@@ -1889,11 +2054,13 @@ class ToolRegistry:
         self.register_direct(
             "agent_generate_survey_v2", "生成文献综述 (v3): 基于模板的学术综述，含引用格式检查和 AI 味清理",
             self._make_generate_survey_v2(),
+            args_schema={"project_id": {"type": "str", "description": "项目 ID"}, "template": {"type": "str", "description": "模板名 arxiv/ieee", "required": False}},
             metadata=ToolMetadata(category="writing"),
         )
         self.register_direct(
             "agent_check_ai_flavor", "AI 味检测: 检测文本中的 AI 生成痕迹并清理",
             self._make_check_ai_flavor(),
+            args_schema={"text": {"type": "str", "description": "待检测文本"}},
             metadata=ToolMetadata(category="writing"),
         )
 
@@ -1922,6 +2089,7 @@ class ToolRegistry:
         self.register_direct(
             "agent_build_glossary_v2", "构建术语表 (v3): 从论文提取术语→LLM翻译→去重→入库",
             self._make_build_glossary_v2(),
+            args_schema={"project_id": {"type": "str", "description": "项目 ID"}, "domain": {"type": "str", "description": "领域名", "required": False}},
             metadata=ToolMetadata(category="glossary"),
         )
 
@@ -1946,6 +2114,7 @@ class ToolRegistry:
         self.register_direct(
             "agent_capture_video", "视频解析: 下载→转写→LLM总结（Capture Agent）",
             self._make_capture_video(),
+            args_schema={"url": {"type": "str", "description": "视频 URL"}},
             metadata=ToolMetadata(category="capture"),
         )
 
@@ -1965,6 +2134,7 @@ class ToolRegistry:
         self.register_direct(
             "update_preference", "更新用户偏好: 存长期 Store，后续对话自动注入",
             self._make_update_preference(),
+            args_schema={"key": {"type": "str", "description": "偏好键名"}, "value": {"type": "str", "description": "偏好值"}},
             metadata=ToolMetadata(category="memory"),
         )
 
@@ -1991,11 +2161,13 @@ class ToolRegistry:
         self.register_direct(
             "zotero_export", "导出论文到 Zotero (BibTeX/Better BibTeX 格式)",
             self._make_zotero_export(),
+            args_schema={"project_id": {"type": "str", "description": "项目 ID"}, "format": {"type": "str", "description": "导出格式", "required": False}, "output_path": {"type": "str", "description": "输出路径", "required": False}},
             metadata=ToolMetadata(category="export"),
         )
         self.register_direct(
             "zotero_import", "从 Zotero 导出的 BibTeX/JSON 文件导入论文",
             self._make_zotero_import(),
+            args_schema={"file_path": {"type": "str", "description": "BibTeX 文件路径"}, "project_id": {"type": "str", "description": "项目 ID", "required": False}},
             metadata=ToolMetadata(category="import"),
         )
 

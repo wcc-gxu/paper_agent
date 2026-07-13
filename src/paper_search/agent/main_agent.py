@@ -331,6 +331,10 @@ def _v9_to_v10_envelope(
     if (msg_type, sub_type) == ("message", "text"):
         return ("message", "reply", payload or {})
 
+    # ── v3.1 Plan Review + Execution Transparency (透传，已是 v10 格式) ──
+    if msg_type in ("plan_review", "plan_todo_update", "tool_execution"):
+        return (msg_type, sub_type, payload or {})
+
     # ── 其他类型透传（status / error / pong / sync_complete / 已 v10 命名的）──
     return (msg_type, sub_type, payload or {})
 
@@ -489,6 +493,10 @@ class MainAgent:
                 "user_content": user_content,
                 "session_id": session_id,
                 "correlation_id": self._correlation_id,
+                "plan_id": "",
+                "plan_approved": False,
+                "plan_feedback": "",
+                "plan_iterations": 0,
             }
             try:
                 final_state = await self._graph.ainvoke(

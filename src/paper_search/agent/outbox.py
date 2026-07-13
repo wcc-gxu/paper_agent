@@ -42,6 +42,11 @@ PRIORITY_DEFAULTS: dict[tuple[str, str], str] = {
     ("tool", "progress"):          "normal",
     ("tool", "result"):            "high",
     ("tool", "call"):              "high",
+    # ── v3.1 Plan Review + Execution Transparency ──
+    ("plan_review", ""):           "high",     # plan 审批卡片 → APNs
+    ("plan_todo_update", ""):      "normal",   # todos 进度全量推送
+    ("tool_execution", ""):        "normal",   # 每次 tool 调用独立消息
+    # ── v10 ask/error ──
     ("ask", ""):                   "high",
     ("error", "TASK_FAILED"):      "urgent",
     ("error", "INTERNAL_ERROR"):   "urgent",

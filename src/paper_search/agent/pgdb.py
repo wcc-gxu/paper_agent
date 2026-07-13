@@ -203,14 +203,21 @@ class PostgresAgentDB:
     def get_user(self, user_id: str) -> Optional[dict]:
         return self._fetchone("SELECT * FROM users WHERE id = %s", (user_id,))
 
+    def get_user_by_username(self, username: str) -> Optional[dict]:
+        """按用户名查找用户（用于登录）。"""
+        return self._fetchone(
+            "SELECT id, username, display_name, password_hash, role, is_active FROM users WHERE username = %s",
+            (username,),
+        )
+
     def create_user(self, username: str, display_name: str, api_token: str = None,
-                    role: str = "researcher") -> str:
+                    role: str = "researcher", password_hash: str = None) -> str:
         user_id = f"user-{_uuid('')[4:16]}"
         token = api_token or f"tok-{_uuid('')[4:24]}"
         self._execute(
-            """INSERT INTO users (id, username, display_name, api_token, role)
-               VALUES (%s, %s, %s, %s, %s)""",
-            (user_id, username, display_name, token, role),
+            """INSERT INTO users (id, username, display_name, api_token, role, password_hash)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (user_id, username, display_name, token, role, password_hash),
         )
         return user_id
 

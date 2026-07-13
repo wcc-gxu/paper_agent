@@ -34,6 +34,10 @@ from ..main_agent_prompts import (
     build_execute_v31_prompt,
     build_evaluate_v31_prompt,
     build_todo_checkpoint_prompt,
+    build_plan_review_prompt,
+    PlanReviewPayload,
+    PlanTodoUpdatePayload,
+    ToolExecutionPayload,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +134,12 @@ class MainState(TypedDict, total=False):
     todo_checkpoint_satisfied: bool
     todo_retry_count: int
 
+    # Plan Review (v3.1 plan approval flow)
+    plan_id: str
+    plan_approved: bool
+    plan_feedback: str
+    plan_iterations: int  # plan review loop counter (distinct from evaluate replan)
+
 
 # ═══════════════════════════════════════════════════════════════
 # MainGraph
@@ -206,6 +216,57 @@ class MainGraph:
         except Exception:
             pass
 
+    async def _push_tool_execution(self, session_id: str, tool_call_id: str,
+                                   todo_id: str, tool_name: str, status: str,
+                                   arguments: dict = None, result_summary: str = "",
+                                   error: str = None) -> None:
+        """Push tool_execution message — granular per-tool-execution tracking."""
+        if not self._push:
+            return
+        try:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            payload = {
+                "tool_call_id": tool_call_id,
+                "todo_id": todo_id,
+                "name": tool_name,
+                "status": status,
+                "arguments": arguments or {},
+                "result_summary": result_summary[:500] if result_summary else "",
+                "started_at": now if status == "running" else "",
+                "completed_at": now if status in ("completed", "failed") else "",
+            }
+            if error:
+                payload["error"] = error
+            await self._push(
+                session_id, "tool_execution", "", "assistant",
+                payload=payload,
+                priority_kind="normal",
+            )
+        except Exception:
+            pass
+
+    async def _push_plan_todo_update(self, session_id: str, plan_id: str,
+                                     todos: list[dict], current_todo_index: int = 0,
+                                     message: str = "") -> None:
+        """Push plan_todo_update — full todos state snapshot."""
+        if not self._push:
+            return
+        try:
+            payload = {
+                "plan_id": plan_id,
+                "current_todo_index": current_todo_index,
+                "todos": todos,
+                "message": message,
+            }
+            await self._push(
+                session_id, "plan_todo_update", "", "assistant",
+                payload=payload,
+                priority_kind="normal",
+            )
+        except Exception:
+            pass
+
     # ── Compile ─────────────────────────────────────────────
 
     def compile(self, checkpointer: Any = None) -> Any:
@@ -215,6 +276,7 @@ class MainGraph:
         builder.add_node("fast_triage", self._fast_triage)
         builder.add_node("intent_classify", self._intent_classify)
         builder.add_node("plan", self._plan)
+        builder.add_node("plan_review", self._plan_review)
         builder.add_node("ops_confirm", self._ops_confirm)
         builder.add_node("execute", self._execute)
         builder.add_node("todo_checkpoint", self._todo_checkpoint)
@@ -236,10 +298,18 @@ class MainGraph:
         )
         builder.add_edge("intent_classify", "plan")
 
+        # plan → clarify (ask_user) or plan_review (send for approval)
         builder.add_conditional_edges(
             "plan",
             self._route_plan,
-            {"clarify": END, "execute": "execute"},
+            {"clarify": "ask_user", "plan_review": "plan_review"},
+        )
+
+        # plan_review → approve→execute / revise→plan / fail→END
+        builder.add_conditional_edges(
+            "plan_review",
+            self._route_plan_review,
+            {"execute": "execute", "plan": "plan", "fail": END},
         )
 
         builder.add_edge("ops_confirm", "execute")
@@ -374,12 +444,17 @@ class MainGraph:
         """Pro model, no thinking, tool_choice: plan_output.
 
         On replan: consumes replan_hint from state and injects it into the user prompt.
+        On revise: consumes plan_feedback from plan_review and injects it into the prompt.
         """
         user = state.get("user_content", "")
         session_id = state.get("session_id", "main")
         replan_hint = state.get("replan_hint", "")
+        plan_feedback = state.get("plan_feedback", "")
 
-        if replan_hint:
+        if plan_feedback:
+            await self._push_status(session_id, "planning", f"正在根据用户反馈重新规划: {plan_feedback[:80]}...")
+            user = f"{user}\n\n[用户反馈] 请根据以下反馈重新制定计划: {plan_feedback}"
+        elif replan_hint:
             await self._push_status(session_id, "planning", f"正在根据反馈重新规划: {replan_hint[:80]}...")
             user = f"{user}\n\n[重新规划提示] 上一轮规划的改进建议: {replan_hint}"
         else:
@@ -426,18 +501,137 @@ class MainGraph:
             "tool_call_count": 0,
             "tool_results": [],
             "replan_hint": "",           # Consumed
+            "plan_feedback": "",         # Consumed
+            "plan_approved": False,      # Reset — must go through plan_review
             "all_satisfied": False,
             "next_action": "done",       # Reset for fresh start
             "needs_more_tools": [],      # Reset
             "danger_level": danger_level,
         }
 
-    # ── Route: plan → clarify / execute ──────────────────
+    # ── Route: plan → clarify / plan_review ──────────────────
 
     def _route_plan(self, state: MainState) -> str:
         if state.get("needs_clarify") and state.get("clarify_questions"):
             return "clarify"
-        return "execute"
+        return "plan_review"
+
+    # ═══════════════════════════════════════════════════════════
+    # Node: plan_review (NEW — plan approval gate)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _plan_review(self, state: MainState) -> dict:
+        """Push plan_review card to user and wait for approve/revise.
+
+        This node is a human-in-the-loop gate: the plan is generated but
+        NOT executed until the user explicitly approves it.
+        """
+        session_id = state.get("session_id", "main")
+        plan = state.get("plan") or {}
+        plan_id = state.get("plan_id", "")
+        plan_iterations = state.get("plan_iterations", 0)
+        plan_feedback = state.get("plan_feedback", "")
+
+        # Generate plan_id on first visit
+        if not plan_id:
+            import uuid as _uuid
+            plan_id = f"plan-{_uuid.uuid4().hex[:12]}"
+        todos = plan.get("todos", [])
+        # Initialize todos with sub_steps (one per tool_call)
+        enriched_todos = []
+        for i, todo in enumerate(todos):
+            sub_steps = []
+            for tc in todo.get("tool_calls", []):
+                sub_steps.append({
+                    "id": tc.get("call_id", f"step-{i}-{len(sub_steps)}"),
+                    "name": tc.get("name", "?"),
+                    "status": "pending",
+                })
+            enriched_todos.append({
+                "id": todo.get("id", f"todo-{i}"),
+                "label": todo.get("label", ""),
+                "status": "pending",
+                "sub_steps": sub_steps,
+            })
+
+        # Push plan_review card (high priority → APNs) and wait for user
+        if self._push:
+            review_payload = {
+                "plan_id": plan_id,
+                "summary": plan.get("summary", ""),
+                "danger_level": state.get("danger_level", "low"),
+                "estimated_seconds": plan.get("estimated_seconds", 0),
+                "permissions": plan.get("permissions", []),
+                "todos": enriched_todos,
+                "revision_note": plan_feedback if plan_iterations > 0 else "",
+            }
+            await self._push(
+                session_id, "plan_review", "", "assistant",
+                payload=review_payload,
+                priority_kind="high",
+            )
+
+        # Wait for user: plan_approve or plan_revise
+        if self._get_user:
+            review_id = f"review-{plan_id}"
+            reply = await self._get_user(session_id, review_id, timeout=30 * 60)
+            if reply is None:
+                logger.warning("plan_review timed out for %s", plan_id)
+                return {
+                    "plan_approved": False,
+                    "plan_feedback": "用户未响应，计划审批超时",
+                    "plan_id": plan_id,
+                    "plan_iterations": plan_iterations + 1,
+                }
+            # reply is the payload from plan_approve or plan_revise
+            _type = reply.get("_type", "")
+            if _type == "plan_approve":
+                logger.info("Plan %s approved by user", plan_id)
+                return {
+                    "plan_approved": True,
+                    "plan_feedback": "",
+                    "plan_id": plan_id,
+                    "plan_iterations": plan_iterations + 1,
+                }
+            elif _type == "plan_revise":
+                feedback = reply.get("feedback", "")
+                logger.info("Plan %s revised: %s", plan_id, feedback[:80])
+                return {
+                    "plan_approved": False,
+                    "plan_feedback": feedback,
+                    "plan_id": plan_id,
+                    "plan_iterations": plan_iterations + 1,
+                }
+            else:
+                # Unknown reply type — treat as approve (best-effort)
+                logger.warning("Unknown plan_review reply type: %s, treating as approve", _type)
+                return {
+                    "plan_approved": True,
+                    "plan_feedback": "",
+                    "plan_id": plan_id,
+                    "plan_iterations": plan_iterations + 1,
+                }
+        else:
+            # No get_user_fn configured — auto-approve in non-interactive mode
+            logger.info("No get_user_fn, auto-approving plan %s", plan_id)
+            return {
+                "plan_approved": True,
+                "plan_feedback": "",
+                "plan_id": plan_id,
+                "plan_iterations": plan_iterations + 1,
+            }
+
+    # ── Route: plan_review → execute / plan / fail ─────────
+
+    def _route_plan_review(self, state: MainState) -> str:
+        plan_iterations = state.get("plan_iterations", 0)
+        if plan_iterations >= MAX_PLAN_ITERATIONS:
+            logger.warning("Plan review iterations exceeded %d, failing", MAX_PLAN_ITERATIONS)
+            return "fail"
+        if state.get("plan_approved"):
+            return "execute"
+        # plan_revise with feedback → re-plan
+        return "plan"
 
     # ═══════════════════════════════════════════════════════════
     # Node: ops_confirm
@@ -514,6 +708,11 @@ class MainGraph:
                     session_id, tc_call_id, tc_name, "started",
                     detail={"arguments": tc_args},
                 )
+                # NEW: Push tool_execution (running) for retry tools
+                await self._push_tool_execution(
+                    session_id, tc_call_id, "_retry",
+                    tc_name, "running", arguments=tc_args,
+                )
 
                 tc = type("ToolCall", (), {
                     "id": tc_call_id, "name": tc_name, "arguments": tc_args,
@@ -534,6 +733,12 @@ class MainGraph:
                     session_id, tc_call_id, tc_name,
                     "failed" if error_msg else "completed",
                     detail={"result": result_summary, "error": error_msg} if error_msg else {"result": result_summary},
+                )
+                # NEW: Push tool_execution (completed/failed) for retry tools
+                await self._push_tool_execution(
+                    session_id, tc_call_id, "_retry",
+                    tc_name, "failed" if error_msg else "completed",
+                    arguments=tc_args, result_summary=result_summary, error=error_msg,
                 )
                 if error_msg:
                     await self._push_error(session_id, f"工具 {tc_name} 执行失败: {error_msg}")
@@ -566,11 +771,17 @@ class MainGraph:
         # Build tool definitions for the LLM — without this it can't call tools at all
         available_tools = self._build_tool_defs(current_todo)
 
-        # Push todo start
+        # Push todo start and plan_todo_update
         await self._push_status(
             session_id, "executing",
             f"[{current_todo_index + 1}/{len(todos)}] {todo_label}" +
             (f" — {len(available_tools)} tools available" if available_tools else " — ⚠️ no tools"),
+        )
+        # Push plan_todo_update snapshot (current todo in_progress)
+        plan_id = state.get("plan_id", "")
+        await self._push_plan_todo_update(
+            session_id, plan_id, todos, current_todo_index,
+            message=f"[{current_todo_index + 1}/{len(todos)}] {todo_label}",
         )
 
         round_count = 0
@@ -621,6 +832,11 @@ class MainGraph:
                     session_id, getattr(tc, 'id', ''), tc_name, "started",
                     detail={"arguments": tc_args},
                 )
+                # NEW: Push tool_execution (running)
+                await self._push_tool_execution(
+                    session_id, getattr(tc, 'id', ''), current_todo.get("id", ""),
+                    tc_name, "running", arguments=tc_args,
+                )
 
             # Add assistant message with tool_calls to conversation
             messages.append({
@@ -654,6 +870,12 @@ class MainGraph:
                     session_id, getattr(tc, 'id', ''), tc_name,
                     "failed" if error_msg else "completed",
                     detail={"result": result_summary, "error": error_msg} if error_msg else {"result": result_summary},
+                )
+                # NEW: Push tool_execution (completed/failed)
+                await self._push_tool_execution(
+                    session_id, getattr(tc, 'id', ''), current_todo.get("id", ""),
+                    tc_name, "failed" if error_msg else "completed",
+                    result_summary=result_summary, error=error_msg,
                 )
                 if error_msg:
                     await self._push_error(session_id, f"工具 {tc_name} 失败: {error_msg}")
@@ -977,10 +1199,18 @@ class MainGraph:
             await self._push_error(session_id, f"检查点评估失败: {e}")
             satisfied = False
 
+        plan_id = state.get("plan_id", "")
+        todos = state.get("todos", [])
+
         if satisfied:
             await self._push_status(
                 session_id, "executing",
                 f"✅ [{current_todo.get('label', '?')}] 已完成",
+            )
+            # Push plan_todo_update (current todo → completed)
+            await self._push_plan_todo_update(
+                session_id, plan_id, todos, current_todo_index + 1,
+                message=f"✅ [{current_todo.get('label', '?')}] 已完成",
             )
             return {
                 "todo_checkpoint_satisfied": True,
@@ -999,6 +1229,11 @@ class MainGraph:
                     f"⚠️ [{current_todo.get('label', '?')}] 重试{new_retry}次仍未完成，跳过",
                     level="warning",
                 )
+                # Push plan_todo_update (current todo → skipped)
+                await self._push_plan_todo_update(
+                    session_id, plan_id, todos, current_todo_index + 1,
+                    message=f"⚠️ [{current_todo.get('label', '?')}] 已跳过（重试{new_retry}次未完成）",
+                )
                 return {
                     "todo_checkpoint_satisfied": True,
                     "todo_retry_count": 0,
@@ -1008,6 +1243,11 @@ class MainGraph:
                 session_id, "executing",
                 f"🔄 [{current_todo.get('label', '?')}] 未完成，重试 (第{new_retry}次)...",
                 level="warning",
+            )
+            # Push plan_todo_update (current todo → still in_progress, retrying)
+            await self._push_plan_todo_update(
+                session_id, plan_id, todos, current_todo_index,
+                message=f"🔄 [{current_todo.get('label', '?')}] 重试第{new_retry}次",
             )
             return {
                 "todo_checkpoint_satisfied": False,
