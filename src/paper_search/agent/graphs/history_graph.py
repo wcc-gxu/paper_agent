@@ -220,8 +220,8 @@ class HistoryAgent:
         for msg_id in targets:
             try:
                 self._memory.long_term.add("archived_messages", {"id": msg_id, "archived_at": _now()})
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"HistoryAgent long_term.add failed: {e}")
 
         return {"archived": targets}
 
@@ -292,8 +292,8 @@ class HistoryAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"HistoryAgent on_progress error: {e}")
 
 
 def _now() -> str:

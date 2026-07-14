@@ -194,7 +194,8 @@ class ClusteringAgent:
                     node="cluster_label",
                 )
                 cluster_names[lbl] = result.get("name", f"方向 {lbl + 1}")
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Cluster labeling LLM failed for cluster {lbl}: {e}, using fallback name")
                 cluster_names[lbl] = f"研究方向 {lbl + 1}"
 
         logger.info(f"Cluster labels: {cluster_names}")
@@ -307,8 +308,8 @@ class ClusteringAgent:
                             "rationale": llm_result.get("rationale", ""),
                             "papers": [o["paper_id"] for o in outliers],
                         })
-                except Exception:
-                    pass
+                except Exception as e:
+                                        logger.warning(f"LLM outlier detection failed: {e}")
 
         except Exception as e:
             logger.error(f"Outlier detection failed: {e}")
@@ -340,5 +341,5 @@ class ClusteringAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"ClusteringAgent on_progress error: {e}")

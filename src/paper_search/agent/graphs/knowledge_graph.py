@@ -79,6 +79,7 @@ class KnowledgeQueryState(TypedDict, total=False):
     confidence: float
     follow_up_questions: list[str]
     error: Optional[str]
+    errors: list[dict]     # 累积的 AgentError（包含 agent/node/type/message/traceback）
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -392,8 +393,37 @@ class KnowledgeAgent:
                     "retrieval_rounds": state.get("retrieval_rounds", 0) + 1,
                 }
         except Exception as e:
-            logger.error(f"KnowledgeAgent search failed: {e}")
-            return {"error": str(e)}
+            import traceback
+            tb = traceback.format_exc()
+            logger.error(
+                f"KnowledgeAgent search failed (round {state.get('retrieval_rounds', 0) + 1}/{state.get('max_rounds', 3)}): "
+                f"{type(e).__name__}: {e}\n{tb}"
+            )
+            # CRITICAL: increment retrieval_rounds even on error to prevent infinite loop
+            current_round = state.get("retrieval_rounds", 0) + 1
+            accumulated_errors = list(state.get("errors", []))
+            accumulated_errors.append({
+                "agent": "KnowledgeAgent",
+                "node": "_search_node",
+                "error_type": type(e).__name__,
+                "message": str(e),
+                "traceback": tb,
+                "context": {
+                    "question": question[:200],
+                    "top_k": top_k,
+                    "use_fulltext": use_fulltext,
+                    "project_id": project_id,
+                },
+                "retry_count": current_round,
+                "max_retries": state.get("max_rounds", 3),
+            })
+            return {
+                "error": str(e),
+                "errors": accumulated_errors,
+                "retrieval_rounds": current_round,
+                "confidence": 0.0,
+                "sources": [],
+            }
 
     async def _evaluate_node(self, state: KnowledgeQueryState) -> dict:
         confidence = state.get("confidence", 0)
@@ -559,7 +589,8 @@ class KnowledgeAgent:
                     if score > 0.95:
                         return {"is_duplicate": True, "duplicate_of": r["paper_id"]}
             return {"is_duplicate": False}
-        except Exception:
+        except Exception as e:
+            logger.warning(f"_dedup_with_vector_store failed for {paper_id}: {e}")
             return {"is_duplicate": False}
 
     async def _llm_rerank(self, question: str, results: list[dict], top_k: int) -> list[dict]:
@@ -583,7 +614,8 @@ class KnowledgeAgent:
             indices = [int(m.group(1)) for m in re.finditer(r'\[(\d+)\]', response)]
             ranked = [results[i] for i in indices if i < len(results)]
             return ranked[:top_k] if ranked else results[:top_k]
-        except Exception:
+        except Exception as e:
+            logger.warning(f"_llm_rerank failed: {e}")
             return results[:top_k]
 
     async def _notify(self, stage: str, index: int, total: int, msg: str,
@@ -592,5 +624,5 @@ class KnowledgeAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, current, paper_total)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"KnowledgeAgent on_progress error: {e}")

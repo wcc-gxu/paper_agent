@@ -373,6 +373,62 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
         graph=compiled_graph,
     )
 
+    # ── Agent Error Report 消费者 ─────────────────────────
+    # 订阅 agent:reports:{agent_id} Pub/Sub channel，
+    # 消费子 agent / tool 通过 Reporter.publish_agent_error() 上报的错误，
+    # 推入 MainAgent._error_queue 供当前 turn 检查
+
+    async def _consume_agent_reports():
+        """Background task: subscribe to agent error reports from Redis Pub/Sub."""
+        import redis.asyncio as aioredis
+
+        sub_redis = aioredis.from_url(redis, decode_responses=True)
+        channel_name = f"agent:reports:{agent_id}"
+
+        try:
+            pubsub = sub_redis.pubsub()
+            await pubsub.subscribe(channel_name)
+            logger.info("Agent error report consumer started on channel: %s", channel_name)
+
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    data = json.loads(message.get("data", "{}"))
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type", "")
+                if msg_type == "agent_error":
+                    # 推入 MainAgent 的错误队列
+                    main_agent.push_agent_error(data)
+                elif msg_type == "agent_retry":
+                    logger.info(
+                        "[RETRY] agent=%s node=%s retry=%s/%s reason=%s",
+                        data.get("agent", "?"),
+                        data.get("node", "?"),
+                        data.get("retry_count", "?"),
+                        data.get("max_retries", "?"),
+                        data.get("reason", "")[:100],
+                    )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Agent report consumer crashed: {e}", exc_info=True)
+        finally:
+            try:
+                await pubsub.unsubscribe(channel_name)
+            except Exception:
+                pass
+            try:
+                await sub_redis.close()
+            except Exception:
+                pass
+
+    report_consumer_task = asyncio.create_task(
+        _consume_agent_reports(), name="agent-report-consumer",
+    )
+
     # 信号处理（优雅退出）
     stop_event = asyncio.Event()
 
@@ -401,8 +457,13 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
         pass
     finally:
         run_task.cancel()
+        report_consumer_task.cancel()
         try:
             await run_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await report_consumer_task
         except (asyncio.CancelledError, Exception):
             pass
 

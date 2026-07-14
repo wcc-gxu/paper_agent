@@ -202,8 +202,8 @@ class CitationChaseAgent:
                                         'venue': c.get('venue', ''), 'source': 'semantic_scholar'})
                 j = await self._llm.evaluate_relevance(p, f"引用自: {seed_title}")
                 evaluated.append({**c, "score": j.score, "reason": j.reason, "is_relevant": j.is_relevant})
-            except Exception:
-                logger.warning(f"相关性评估失败 for {title[:30]}, FAIL-CLOSED → is_relevant=False")
+            except Exception as e:
+                logger.warning(f"相关性评估失败 for {title[:30]} ({e}), FAIL-CLOSED → is_relevant=False")
                 evaluated.append({**c, "score": 0.0, "reason": f"评估失败", "is_relevant": False})
 
         relevant = [e for e in evaluated if e.get("is_relevant", False)]
@@ -262,7 +262,8 @@ class CitationChaseAgent:
                 node="citation_filter",
             )
             should_continue = result.get("should_continue", False)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Citation chase decide LLM failed: {e}, fallback to count-based heuristic")
             should_continue = len(relevant) >= 5
 
         return {"should_continue": should_continue,
@@ -321,5 +322,5 @@ class CitationChaseAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"CitationChaseAgent on_progress error: {e}")

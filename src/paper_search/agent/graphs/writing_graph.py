@@ -507,8 +507,8 @@ class WritingAgent:
                 issues = json.loads(json_match.group())
                 return [{"pattern": i["pattern"], "count": i.get("count", 1),
                          "layer": "llm_judge"} for i in issues]
-        except Exception:
-            pass
+        except Exception as e:
+                        logger.warning(f"LLM AI flavor check failed: {e}")
         return []
 
     async def _notify(self, stage: str, index: int, total: int, msg: str):
@@ -516,8 +516,8 @@ class WritingAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"WritingAgent on_progress error: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════

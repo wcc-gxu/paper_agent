@@ -235,8 +235,8 @@ class GlossaryAgent:
                 # 尝试 glossary_terms 表（如果存在）
                 db_results = self._db_term_search(query)
                 results.extend(db_results)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.warning(f"DB fallback term search failed: {e}")
 
         return {"search_results": results, "current_stage": "search", "stage_index": 2}
 
@@ -470,8 +470,8 @@ class GlossaryAgent:
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
-        except Exception:
-            pass
+        except Exception as e:
+                        logger.warning(f"LLM term verification failed: {e}")
 
         return {"passed": True, "confidence": 0.5, "issues": []}
 
@@ -481,7 +481,8 @@ class GlossaryAgent:
             # 尝试 glossary_terms 表
             results = self.db.search_glossary_terms(query, limit=10)
             return results
-        except Exception:
+        except Exception as e:
+            logger.debug(f"_db_term_search failed for '{query}': {e}")
             return []
 
     async def _notify(self, stage: str, index: int, total: int, msg: str):
@@ -489,5 +490,5 @@ class GlossaryAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"GlossaryAgent on_progress error: {e}")

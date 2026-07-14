@@ -317,8 +317,8 @@ class PipelineRunner:
                     relevance_score=judgment.score,
                     relevance_reason=judgment.reason,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"link_paper_to_project failed for {paper.get('paper_id', '?')}: {e}")
             evaluations.append({"score": judgment.score, "reason": judgment.reason,
                                 "is_relevant": judgment.is_relevant})
             tlog.paper_progress(task_id, "evaluate", paper["paper_id"], paper["title"], "eval_complete")
@@ -485,8 +485,8 @@ class PipelineRunner:
                     try:
                         self.db.upsert_journal_rank(venue, unified=level)
                         self.db.update_paper_meta(paper["paper_id"], unified_level=level)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"upsert_journal_rank failed for {paper.get('paper_id', '?')}: {e}")
                     results.append({"paper_id": paper["paper_id"], "venue": venue, "level": level})
                     tlog.paper_progress(task_id, "rank", paper["paper_id"], paper["title"], "rank_done")
 

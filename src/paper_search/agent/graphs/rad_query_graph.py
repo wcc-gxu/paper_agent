@@ -229,5 +229,5 @@ class RADQueryAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"RADQueryAgent on_progress error: {e}")

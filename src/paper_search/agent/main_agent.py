@@ -376,6 +376,10 @@ class MainAgent:
             self._user_id = agent_id[6:]
         # Track current session for debug callback
         self._current_session_id: str = "main"
+        # AgentError 队列：子 agent / tool 通过 Reporter Redis Pub/Sub 上报的错误
+        self._error_queue: asyncio.Queue[dict] = asyncio.Queue()
+        # 当前 turn 内累积的 AgentError（在 _run_turn 开始时清空）
+        self._pending_agent_errors: list[dict] = []
         # Debug mode: wire LLM raw events → WS debug status messages
         self._wire_llm_debug()
 
@@ -387,6 +391,70 @@ class MainAgent:
             import redis.asyncio as aioredis
             self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
         return self._redis
+
+    # ── AgentError 处理 ─────────────────────────────────
+
+    def push_agent_error(self, error_data: dict) -> None:
+        """接收来自 Redis Pub/Sub consumer 的 AgentError。
+
+        由 daemon.py 的 _consume_agent_reports 协程调用，
+        将错误推入队列供当前 turn 检查。
+        """
+        try:
+            self._error_queue.put_nowait(error_data)
+        except asyncio.QueueFull:
+            logger.warning("AgentError queue full, dropping error: %s",
+                          error_data.get("error", {}).get("message", "")[:100])
+
+    async def drain_pending_errors(self, session_id: str) -> int:
+        """清空错误队列，将累积的 AgentError 推送给用户。
+
+        Returns:
+            清空的错误数量。
+        """
+        count = 0
+        # Drain from queue
+        while not self._error_queue.empty():
+            try:
+                err = self._error_queue.get_nowait()
+                self._pending_agent_errors.append(err)
+                count += 1
+            except asyncio.QueueEmpty:
+                break
+
+        # Push accumulated errors to user
+        for err_data in self._pending_agent_errors:
+            error_obj = err_data.get("error", err_data)
+            if isinstance(error_obj, dict):
+                msg = error_obj.get("message", str(error_obj))
+                agent = error_obj.get("agent", "unknown")
+                node = error_obj.get("node", "unknown")
+                error_type = error_obj.get("error_type", "Exception")
+                user_msg = f"[{agent}.{node}] {error_type}: {msg}"
+            else:
+                user_msg = str(error_obj)
+
+            await self._push(
+                session_id, "error", "TASK_FAILED", "system",
+                payload={
+                    "message": user_msg,
+                    "recoverable": False,
+                    "agent_error": error_obj if isinstance(error_obj, dict) else str(error_obj),
+                },
+                priority_kind="urgent",
+            )
+            logger.error(
+                "AgentError pushed to user: agent=%s node=%s type=%s msg=%s",
+                error_obj.get("agent", "?") if isinstance(error_obj, dict) else "?",
+                error_obj.get("node", "?") if isinstance(error_obj, dict) else "?",
+                error_obj.get("error_type", "?") if isinstance(error_obj, dict) else "?",
+                error_obj.get("message", str(error_obj))[:200] if isinstance(error_obj, dict) else str(error_obj)[:200],
+            )
+
+        self._pending_agent_errors.clear()
+        if count:
+            logger.info("Drained %d AgentError(s), pushed to user", count)
+        return count
 
     # ── 主循环 ─────────────────────────────────────────
 
@@ -469,6 +537,9 @@ class MainAgent:
                      chat → inline_reply → END
         """
         self._current_session_id = session_id
+
+        # Drain any pending AgentErrors from previous async operations
+        await self.drain_pending_errors(session_id)
 
         # 收到消息后立即推 status{received}（协议 v10 要求 <200ms ack）
         await self._push_status(session_id, "received", "收到，正在分析...", level="user")

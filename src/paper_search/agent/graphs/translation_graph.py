@@ -240,8 +240,8 @@ class TranslationAgent:
                     (terms_added,),
                 ).fetchall()
                 self._chroma.add_terms_batch([dict(t) for t in terms])
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.warning(f"ChromaDB term index failed: {e}")
 
         logger.info(f"Glossary built: {terms_added} new terms added (total: {len(seen_terms)})")
         return {
@@ -288,8 +288,8 @@ class TranslationAgent:
                         (f"%{word}%", f"%{word}%"),
                     ).fetchall()
                     results.extend(dict(r) for r in rows)
-        except Exception:
-            pass
+        except Exception as e:
+                        logger.debug(f"Glossary lookup failed: {e}")
         return results[:10]
 
     # ── 直接调用接口 (工具型 Agent) ─────────────────
@@ -321,5 +321,5 @@ class TranslationAgent:
         if self._on_progress:
             try:
                 await self._on_progress(stage, index, total, 0, 0)
-            except Exception:
-                pass
+            except Exception as e:
+                                logger.debug(f"TranslationAgent on_progress error: {e}")

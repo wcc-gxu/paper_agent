@@ -161,6 +161,7 @@ class ChatMessage:
     name: Optional[str] = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: Optional[str] = None
+    thinking_blocks: list[dict] = field(default_factory=list)  # DeepSeek thinking blocks for multi-turn passthrough
 
 
 @dataclass
@@ -169,6 +170,7 @@ class ChatResponse:
 
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
+    thinking_blocks: list[dict] = field(default_factory=list)  # DeepSeek thinking blocks for multi-turn passthrough
     stop_reason: str = "end_turn"  # end_turn | max_tokens | tool_use
     usage: dict[str, int] = field(default_factory=dict)
     model: str = ""
@@ -494,12 +496,22 @@ class LLMClientV2:
             entry: dict[str, Any] = {"role": msg.role}
 
             if msg.role == "tool":
-                entry.update({
-                    "content": msg.content,
-                    "tool_call_id": msg.tool_call_id,
-                })
-            elif msg.role == "assistant" and msg.tool_calls:
+                # Convert OpenAI-style tool result → Anthropic content-block format
+                # DeepSeek API rejects role="tool"
+                entry = {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.tool_call_id,
+                        "content": msg.content,
+                    }],
+                }
+            elif msg.role == "assistant" and (msg.tool_calls or msg.thinking_blocks):
                 content_blocks = []
+                # Thinking blocks first (preserve original order from API response)
+                for tb in msg.thinking_blocks:
+                    if isinstance(tb, dict) and tb.get("type") == "thinking":
+                        content_blocks.append(tb)
                 if msg.content:
                     content_blocks.append({"type": "text", "text": msg.content})
                 for tc in msg.tool_calls:
@@ -531,12 +543,26 @@ class LLMClientV2:
         content = msg.get("content", "") or ""
         tool_calls = msg.get("tool_calls", [])
         tool_call_id = msg.get("tool_call_id", "")
+        thinking_blocks = msg.get("thinking_blocks", [])
 
         if role == "tool" and tool_call_id:
-            return {"role": "tool", "content": str(content), "tool_call_id": tool_call_id}
+            # Convert OpenAI-style tool result → Anthropic content-block format
+            # DeepSeek API rejects role="tool" — must use user+tool_result
+            return {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": str(content),
+                }],
+            }
 
-        if role == "assistant" and tool_calls:
+        if role == "assistant" and (tool_calls or thinking_blocks):
             content_blocks = []
+            # Thinking blocks first (preserve original order from API response)
+            for tb in thinking_blocks:
+                if isinstance(tb, dict) and tb.get("type") == "thinking":
+                    content_blocks.append(tb)
             if content:
                 content_blocks.append({"type": "text", "text": str(content)})
             for tc in tool_calls:
@@ -728,6 +754,7 @@ class LLMClientV2:
         """解析 Anthropic/兼容 API 响应."""
         content_text = ""
         tool_calls = []
+        thinking_blocks = []
 
         content = data.get("content", [])
         if isinstance(content, str):
@@ -738,10 +765,10 @@ class LLMClientV2:
                 if bt == "text":
                     content_text += block.get("text", "")
                 elif bt == "thinking":
-                    # DeepSeek v4 Pro thinking block — skip, wait for text/tool_use
-                    logger.debug(f"LLM thinking block ({len(block.get('thinking', ''))} chars), waiting for text...")
+                    # DeepSeek v4 Pro thinking block — capture for multi-turn passthrough
+                    thinking_blocks.append(block)
+                    logger.debug(f"LLM thinking block ({len(block.get('thinking', ''))} chars) captured")
                     self._emit_debug("thinking", {"thinking": block.get("thinking", "")[:500]})
-                    continue
                 elif bt == "tool_use":
                     tool_calls.append(ToolCall(
                         id=block.get("id", ""),
@@ -757,6 +784,7 @@ class LLMClientV2:
         return ChatResponse(
             content=content_text,
             tool_calls=tool_calls,
+            thinking_blocks=thinking_blocks,
             stop_reason=data.get("stop_reason", "end_turn"),
             usage={
                 "input_tokens": usage.get("input_tokens", 0),
@@ -1259,6 +1287,7 @@ class LLMClientV2:
                 role="assistant",
                 content=response.content,
                 tool_calls=response.tool_calls,
+                thinking_blocks=response.thinking_blocks,
             ))
 
             # 执行每个工具调用

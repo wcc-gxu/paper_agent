@@ -74,12 +74,16 @@ def _to_message_dicts(messages: list) -> list[dict]:
         if tc_list:
             entry["tool_calls"] = [
                 {"id": tc.get("id", ""), "name": tc.get("name", ""),
-                 "arguments": tc.get("arguments", {})}
+                 "args": tc.get("arguments", tc.get("args", {}))}
                 if isinstance(tc, dict) else
                 {"id": getattr(tc, "id", ""), "name": getattr(tc, "name", ""),
-                 "arguments": getattr(tc, "arguments", {})}
+                 "args": getattr(tc, "arguments", getattr(tc, "args", {}))}
                 for tc in tc_list
             ]
+        # Preserve thinking_blocks from assistant messages (needed for DeepSeek multi-turn)
+        tb = getattr(msg, "thinking_blocks", None)
+        if tb:
+            entry["thinking_blocks"] = tb
         result.append(entry)
     return result
 
@@ -183,21 +187,33 @@ class MainGraph:
                 payload={"stage": stage, "message": message, "level": level},
                 priority_kind="silent",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"push failed: {e}")
 
-    async def _push_error(self, session_id: str, message: str, recoverable: bool = True) -> None:
-        """Push an error to the client immediately (high priority)."""
+    async def _push_error(self, session_id: str, message: str, recoverable: bool = True,
+                          subtype: str = "INTERNAL_ERROR", agent_error: dict = None) -> None:
+        """Push an error to the client immediately (high priority).
+
+        Args:
+            session_id: session id
+            message: human-readable error message
+            recoverable: whether the error can be recovered from
+            subtype: error subtype — "INTERNAL_ERROR" | "TASK_FAILED" | "MAX_ROUNDS" | "PERMISSION_DENIED"
+            agent_error: optional AgentError.to_dict() for full context
+        """
         if not self._push:
             return
         try:
+            payload = {"message": message, "recoverable": recoverable}
+            if agent_error:
+                payload["agent_error"] = agent_error
             await self._push(
-                session_id, "error", "INTERNAL_ERROR", "system",
-                payload={"message": message, "recoverable": recoverable},
+                session_id, "error", subtype, "system",
+                payload=payload,
                 priority_kind="urgent",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"_push_error failed: {e}")
 
     async def _push_tool_status(self, session_id: str, tool_call_id: str,
                                 tool_name: str, status: str, detail: dict = None) -> None:
@@ -213,8 +229,8 @@ class MainGraph:
                          "status": status, **(detail or {})},
                 priority_kind="normal" if status == "result" else "normal",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"push failed: {e}")
 
     async def _push_tool_execution(self, session_id: str, tool_call_id: str,
                                    todo_id: str, tool_name: str, status: str,
@@ -638,7 +654,13 @@ class MainGraph:
     # ═══════════════════════════════════════════════════════════
 
     async def _ops_confirm(self, state: MainState) -> dict:
-        """Check danger_level for ops. High-risk ops need human confirmation."""
+        """Ops path: danger check + generate free ReAct todo.
+
+        Unlike the research path, ops does NOT go through Plan. Instead it
+        generates a single free-form todo that gives the LLM access to ALL
+        registered tools. The LLM freely chooses tools, observes results,
+        and iterates until it outputs a final text message (no tool_calls).
+        """
         user = state.get("user_content", "")
         session_id = state.get("session_id", "main")
 
@@ -655,7 +677,6 @@ class MainGraph:
         )
 
         if is_high_risk:
-            # Push ask/confirm to user
             if self._push:
                 await self._push(
                     session_id, "ask", "", "assistant",
@@ -667,11 +688,31 @@ class MainGraph:
                     },
                     priority_kind="high",
                 )
-            # In a real impl, we'd wait for user reply via _get_user_fn
-            # For now, assume confirmed in non-interactive contexts
-            return {"ops_confirmed": True, "danger_level": "high"}
+            return {
+                "ops_confirmed": True,
+                "danger_level": "high",
+                "todos": [{
+                    "id": "ops-free",
+                    "label": f"运维: {user[:80]}",
+                    "tool_calls": [],        # Empty → triggers free ReAct mode
+                    "free_tools": True,
+                    "success_criterion": f"完成运维操作: {user[:200]}。完成后用 text 消息向用户报告结果。",
+                }],
+                "current_todo_index": 0,
+            }
 
-        return {"ops_confirmed": True, "danger_level": "low"}
+        return {
+            "ops_confirmed": True,
+            "danger_level": "low",
+            "todos": [{
+                "id": "ops-free",
+                "label": f"运维: {user[:80]}",
+                "tool_calls": [],            # Empty → triggers free ReAct mode
+                "free_tools": True,
+                "success_criterion": f"完成运维操作: {user[:200]}。完成后用 text 消息向用户报告结果。",
+            }],
+            "current_todo_index": 0,
+        }
 
     # ═══════════════════════════════════════════════════════════
     # Node: execute (ReAct loop)
@@ -801,10 +842,21 @@ class MainGraph:
                     node="execute_v31",
                 )
             except Exception as e:
+                import traceback as _tb
                 logger.error(f"execute LLM failed: {e}")
+                # 标记当前 todo 为 failed（不跑 checkpoint）
+                current_idx = current_todo_index
+                if current_idx < len(todos):
+                    todos[current_idx]["status"] = "failed"
+                    todos[current_idx]["error"] = f"LLM 调用失败 (第{round_count}轮): {e}"
+                    await self._push_plan_todo_update(
+                        session_id, state.get("plan_id", ""), todos, current_idx,
+                        message=f"任务 [{todo_label}] 执行异常，已停止",
+                    )
                 await self._push_error(
                     session_id,
                     f"执行 [{todo_label}] 时 LLM 调用失败 (第{round_count}轮): {e}",
+                    subtype="TASK_FAILED",
                 )
                 tool_results.append({"error": str(e), "todo_id": current_todo.get("id", "")})
                 # ── 关键: LLM 调用失败 → 停止，不再重试同一个 todo ──
@@ -821,10 +873,30 @@ class MainGraph:
 
             if not getattr(response, 'tool_calls', None):
                 # No tool calls — LLM considers this todo complete
+                text_content = getattr(response, 'content', '') or ""
                 messages.append({
                     "role": "assistant",
-                    "content": getattr(response, 'content', '') or "",
+                    "content": text_content,
+                    "thinking_blocks": getattr(response, 'thinking_blocks', []),
                 })
+
+                # ── Free ReAct mode: text IS the final reply → push and end ──
+                is_free_react = current_todo.get("free_tools") or not current_todo.get("tool_calls")
+                if is_free_react:
+                    logger.info("Free ReAct todo [%s] complete after %d rounds, pushing final reply",
+                                todo_label, round_count)
+                    await self._push(session_id, "message", "text", "assistant",
+                                     payload={"content": text_content},
+                                     priority_kind="high")
+                    return {
+                        "messages": messages,
+                        "tool_call_count": tool_call_count,
+                        "tool_results": tool_results,
+                        "current_todo_index": current_todo_index + 1,
+                        "all_satisfied": True,
+                        "final_reply": text_content,
+                    }
+
                 logger.info("Todo [%s] complete after %d rounds (no more tool calls)",
                             todo_label, round_count)
                 break
@@ -855,8 +927,9 @@ class MainGraph:
                 "tool_calls": [{
                     "id": getattr(tc, 'id', ''),
                     "name": getattr(tc, 'name', ''),
-                    "arguments": getattr(tc, 'arguments', {}),
+                    "args": getattr(tc, 'arguments', getattr(tc, 'args', {})),
                 } for tc in response.tool_calls],
+                "thinking_blocks": getattr(response, 'thinking_blocks', []),
             })
 
             # Dispatch tools (parallel within this round)
@@ -893,7 +966,11 @@ class MainGraph:
                     result_summary=result_summary, error=error_msg,
                 )
                 if error_msg:
-                    await self._push_error(session_id, f"工具 {tc_name} 失败: {error_msg}")
+                    await self._push_error(
+                        session_id,
+                        f"工具 [{tc_name}] 失败: {error_msg}",
+                        subtype="TASK_FAILED",
+                    )
 
             # Add tool results as tool role messages
             for tc in response.tool_calls:
@@ -907,15 +984,25 @@ class MainGraph:
                     "tool_call_id": getattr(tc, 'id', ''),
                 })
 
-            # ── 关键: 本轮所有工具全部失败 → 立即停止，不重试 ──
+            # ── 关键: 本轮所有工具全部失败 → 立即停止，不重试，不跑 checkpoint ──
             if failed_count > 0 and failed_count == len(response.tool_calls):
                 logger.warning(
                     "All %d tools failed in round %d for todo [%s], stopping",
                     failed_count, round_count, todo_label,
                 )
+                # 标记当前 todo 为 failed
+                current_idx = current_todo_index
+                if current_idx < len(todos):
+                    todos[current_idx]["status"] = "failed"
+                    todos[current_idx]["error"] = f"全部 {failed_count} 个工具调用失败"
+                    await self._push_plan_todo_update(
+                        session_id, state.get("plan_id", ""), todos, current_idx,
+                        message=f"任务 [{todo_label}] 全部工具失败，已停止",
+                    )
                 await self._push_error(
                     session_id,
                     f"任务 [{todo_label}] 本轮全部 {failed_count} 个工具调用失败，已停止",
+                    subtype="TASK_FAILED",
                 )
                 return {
                     "messages": messages,
@@ -975,21 +1062,57 @@ class MainGraph:
     def _build_tool_defs(self, todo: dict) -> list:
         """Build Anthropic-compatible tool definitions from todo's tool_calls.
 
-        Looks up each tool in the registry to get its description and input schema,
-        so the LLM knows what tools are available and how to call them.
+        Two modes:
+          - Free ReAct (free_tools=True or tool_calls empty): return ALL registered tools
+          - Constrained (Plan-specified tool_calls): return only the listed tools
+
+        Free ReAct mode is used for ops/运维 scenarios where the LLM should freely
+        choose tools, observe results, and iterate until done.
         """
         from ..llm_client_v2 import ToolDef
 
-        tool_defs = []
         todo_name = todo.get("label", "unknown")
-        for tc in todo.get("tool_calls", []):
+        tool_calls_spec = todo.get("tool_calls", [])
+
+        # ── Free ReAct mode: expose all registered tools ──
+        if todo.get("free_tools") or not tool_calls_spec:
+            tool_defs = []
+            if self.registry:
+                for tool in self.registry.to_langchain():
+                    schema = {"type": "object", "properties": {}, "additionalProperties": True}
+                    if hasattr(tool, 'args_schema') and tool.args_schema is not None:
+                        try:
+                            if hasattr(tool.args_schema, 'model_json_schema'):
+                                raw = tool.args_schema.model_json_schema()
+                            elif hasattr(tool.args_schema, 'schema'):
+                                raw = tool.args_schema.schema()
+                            else:
+                                raw = {"type": "object", "properties": {}}
+                            schema = {
+                                "type": "object",
+                                "properties": raw.get("properties", {}),
+                                "required": raw.get("required", []),
+                            }
+                        except Exception:
+                            pass
+                    tool_defs.append(ToolDef(
+                        name=tool.name,
+                        description=tool.description or f"Execute {tool.name}",
+                        input_schema=schema,
+                    ))
+            logger.info("Free ReAct mode for todo [%s]: %d tools available",
+                        todo_name, len(tool_defs))
+            return tool_defs
+
+        # ── Constrained mode: only Plan-specified tools ──
+        tool_defs = []
+        for tc in tool_calls_spec:
             tc_name = tc.get("name", "")
             if not tc_name:
                 continue
             tool = self.registry.get(tc_name) if self.registry else None
             if tool is None:
                 logger.warning("Tool %s not found in registry (todo: %s)", tc_name, todo_name)
-                # Build a best-effort definition so the LLM can at least try
                 tool_defs.append(ToolDef(
                     name=tc_name,
                     description=tc.get("description", f"Execute {tc_name}"),
@@ -997,7 +1120,6 @@ class MainGraph:
                 ))
                 continue
 
-            # Extract schema from the registry tool
             schema = {"type": "object", "properties": {}, "additionalProperties": True}
             if hasattr(tool, 'args_schema') and tool.args_schema is not None:
                 try:
@@ -1007,7 +1129,6 @@ class MainGraph:
                         raw = tool.args_schema.schema()
                     else:
                         raw = {"type": "object", "properties": {}}
-                    # Clean Pydantic noise: remove $defs, title, etc for Anthropic compat
                     schema = {
                         "type": "object",
                         "properties": raw.get("properties", {}),
@@ -1031,6 +1152,9 @@ class MainGraph:
 
     def _route_after_execute(self, state: MainState) -> str:
         if state.get("error"):
+            return "end"
+        # Free ReAct: text-only terminal response → skip checkpoint/evaluate, go to END
+        if state.get("all_satisfied"):
             return "end"
         return "todo_checkpoint"
 

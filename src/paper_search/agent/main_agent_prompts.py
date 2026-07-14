@@ -483,7 +483,25 @@ def build_plan_v31_prompt() -> str:
 
 
 def build_execute_v31_prompt(todo: dict, all_todos: list[dict]) -> str:
-    """构建 Execute ReAct 的系统提示词（注入当前 todo 上下文）。"""
+    """构建 Execute ReAct 的系统提示词（注入当前 todo 上下文）。
+
+    自由 ReAct 模式（free_tools=True 或 tool_calls 为空）:
+      - LLM 拥有全部已注册工具的访问权
+      - 自主选择工具 → 观察结果 → 循环
+      - 结束时输出纯文本消息（无 tool_calls），该文本即最终回复
+    """
+    is_free_react = todo.get("free_tools") or not todo.get("tool_calls")
+
+    if is_free_react:
+        return EXECUTE_SYSTEM_V31 + f"""
+
+当前任务: {todo.get('label', '未知')}
+目标: {todo.get('success_criterion', '完成任务并向用户报告结果')}
+
+⚡ 自由工具模式: 你可以使用所有已注册的工具。观察每个工具的结果，然后决定下一步。
+当任务完成时，输出一条纯文本消息（不要调用工具），向用户报告结果。
+如果遇到错误，尝试其他方法或向用户说明原因。"""
+
     remaining = [t for t in all_todos if t.get("id", "") >= todo.get("id", "")]
     return EXECUTE_SYSTEM_V31 + f"""
 

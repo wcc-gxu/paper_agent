@@ -1,20 +1,22 @@
-"""Reporter — Celery Worker → Agent 主线程进度通知。
+"""Reporter — Celery Worker → Agent 主线程进度通知 + 子Agent 错误上报。
 
-双通道:
+三通道:
   1. Redis LPUSH → agent:events:{agent_id}  (Daemon BRPOP 消费)
      - 用于 Celery 任务完成/错误通知
   2. Redis Pub/Sub → agent:reports:{task_id} (Daemon SUBSCRIBE 消费)
      - 用于子 Agent 实时进度报告 (每篇论文下载/转换/索引状态)
+  3. Redis Pub/Sub → agent:reports:{agent_id} (Daemon SUBSCRIBE 消费)
+     - 用于子 Agent 错误/重试上报 (AgentError)
 
 事件格式 (LPUSH):
   {"type": "celery_progress", "task_id": "...", "level": "normal|high", "data": {...}}
   {"type": "celery_done", "task_id": "...", "result": {...}}
   {"type": "celery_error", "task_id": "...", "error": "..."}
 
-报告格式 (Pub/Sub):
-  {"task_id": "...", "agent_type": "ingest", "stage": "download",
-   "paper_index": 5, "paper_total": 50, "paper_id": "...",
-   "status": "done", "timestamp": "2026-06-18T10:30:00Z"}
+AgentError 格式 (Pub/Sub → agent:reports:{agent_id}):
+  {"type": "agent_error", "error": {AgentError.to_dict()}}
+  {"type": "agent_retry", "agent": "...", "node": "...",
+   "retry_count": 1, "max_retries": 3, "reason": "..."}
 """
 
 from __future__ import annotations
@@ -184,6 +186,79 @@ class Reporter:
             logger.info(f"[LIFECYCLE] task={task_id} agent={agent_type} {lifecycle}")
         except Exception as e:
             logger.warning(f"Failed to publish lifecycle to {channel}: {e}")
+
+    # ── AgentError 上报 (Pub/Sub → agent:reports:{agent_id}) ────
+
+    def publish_agent_error(self, error) -> None:
+        """发布 AgentError 到主 agent (Pub/Sub → agent:reports:{agent_id})。
+
+        所有子 agent / tool 内部发生异常时都应调用此方法，
+        主 agent daemon 订阅此 channel，消费后终止 turn 并透传给用户。
+
+        Args:
+            error: AgentError 实例
+        """
+        channel = f"agent:reports:{self._agent_id}"
+        message = {
+            "type": "agent_error",
+            "error": error.to_dict() if hasattr(error, "to_dict") else error,
+            "timestamp": _now(),
+        }
+        try:
+            self.redis.publish(
+                channel,
+                json.dumps(message, ensure_ascii=False, default=str),
+            )
+            logger.error(
+                f"[AGENT ERROR] agent={error.agent if hasattr(error, 'agent') else '?'} "
+                f"node={error.node if hasattr(error, 'node') else '?'} "
+                f"type={error.error_type if hasattr(error, 'error_type') else '?'} "
+                f"message={(error.message if hasattr(error, 'message') else str(error))[:200]}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish agent_error to {channel}: {e}")
+
+    def publish_retry(
+        self,
+        agent: str,
+        node: str,
+        retry_count: int,
+        max_retries: int,
+        reason: str = "",
+    ) -> None:
+        """发布重试通知到主 agent (Pub/Sub → agent:reports:{agent_id})。
+
+        子 agent / tool 内部发生可恢复错误并决定重试时调用。
+        主 agent 可用于展示重试进度。
+
+        Args:
+            agent: agent 标识 (如 "KnowledgeAgent")
+            node: 节点/函数名 (如 "_search_node")
+            retry_count: 当前重试次数 (1-based)
+            max_retries: 最大允许重试次数
+            reason: 触发重试的原因
+        """
+        channel = f"agent:reports:{self._agent_id}"
+        message = {
+            "type": "agent_retry",
+            "agent": agent,
+            "node": node,
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "reason": reason,
+            "timestamp": _now(),
+        }
+        try:
+            self.redis.publish(
+                channel,
+                json.dumps(message, ensure_ascii=False, default=str),
+            )
+            logger.info(
+                f"[RETRY] agent={agent} node={node} "
+                f"retry={retry_count}/{max_retries} reason={reason[:100]}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish retry to {channel}: {e}")
 
     def publish_notification(self, notification: dict):
         """发布跨进程通知到 agent:notifications channel。

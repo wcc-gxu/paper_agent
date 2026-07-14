@@ -31,6 +31,65 @@ from langchain_core.tools import StructuredTool
 logger = logging.getLogger(__name__)
 
 
+# ── Tool Error Handler ──────────────────────────────────────────────
+# 统一包装所有 _make_* 工具函数的异常处理：
+#   1. 捕获异常 → 创建 AgentError（含 agent/node/type/message/traceback/context）
+#   2. 通过 Reporter Redis Pub/Sub 上报给主 agent
+#   3. 返回 JSON 格式错误字符串（含完整 AgentError 上下文）
+#
+# 用法:
+#   wrapped = tool_error_handler(agent="tool:agent_knowledge_ask", node="_search_node")(original_coro)
+
+
+def tool_error_handler(agent: str, node: str = ""):
+    """Decorator/factory: wraps an async tool function with AgentError reporting.
+
+    Args:
+        agent: agent identifier (e.g. "tool:agent_knowledge_ask")
+        node: node/function name (e.g. "_search_node")
+
+    Returns a decorator that wraps the coroutine function.
+    """
+    import traceback as _traceback
+
+    def decorator(coro_func):
+        async def wrapper(*args, **kwargs):
+            try:
+                return await coro_func(*args, **kwargs)
+            except Exception as e:
+                tb = _traceback.format_exc()
+                error_obj = {
+                    "agent": agent,
+                    "node": node or coro_func.__name__,
+                    "error_type": type(e).__name__,
+                    "message": str(e),
+                    "traceback": tb,
+                    "context": {
+                        "args": str(args)[:500],
+                        "kwargs": {k: str(v)[:200] for k, v in kwargs.items()},
+                    },
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "recoverable": False,
+                }
+
+                logger.error(
+                    "[ToolError] %s.%s %s: %s",
+                    agent, error_obj["node"], error_obj["error_type"], str(e)[:300],
+                )
+
+                # Try to publish to Redis via Reporter
+                try:
+                    from .reporter import Reporter
+                    reporter = Reporter()
+                    reporter.publish_agent_error(error_obj)
+                except Exception as pub_err:
+                    logger.debug(f"Failed to publish agent_error via Reporter: {pub_err}")
+
+                return json.dumps({"error": str(e), "agent_error": error_obj}, ensure_ascii=False, default=str)
+        return wrapper
+    return decorator
+
+
 # ═══════════════════════════════════════════════════════════════
 # 共享辅助函数（供子 Agent 工具使用）
 # ═══════════════════════════════════════════════════════════════
@@ -537,6 +596,18 @@ class ToolRegistry:
         self.register(
             name="bash_exec",
             description="执行 Shell 命令。参数: command (命令), timeout (超时秒数, 默认120), cwd (工作目录)",
+            func=bash_exec,
+            args_schema={
+                "command": {"type": "str", "description": "要执行的 Shell 命令"},
+                "timeout": {"type": "int", "description": "超时秒数", "required": False},
+                "cwd": {"type": "str", "description": "工作目录", "required": False},
+            },
+            metadata=ToolMetadata(category="system", is_long_running=True),
+        )
+        # Alias: LLM sometimes hallucinates "execute_command" (common in other agent frameworks)
+        self.register(
+            name="execute_command",
+            description="执行 Shell 命令（bash_exec 的别名）。参数: command (命令), timeout (超时秒数, 默认120), cwd (工作目录)",
             func=bash_exec,
             args_schema={
                 "command": {"type": "str", "description": "要执行的 Shell 命令"},
@@ -1769,6 +1840,7 @@ class ToolRegistry:
         return batch_search
 
     def _make_citation_chase(self):
+        @tool_error_handler(agent="tool:agent_citation_chase", node="CitationChaseAgent")
         async def citation_chase(paper_title: str = "", doi: str = "") -> str:
             """引用追溯 — 委托 CitationChaseAgent graph（resolve→fetch→filter→ingest→decide→summarize）。"""
             from ..engine import PaperSearchEngine
@@ -1787,15 +1859,11 @@ class ToolRegistry:
             # citation_chase 需要一个 project_id 来 link 入库论文
             project_id = db.create_project(user_query=f"citation_chase: {seed[:80]}")
             agent = CitationChaseAgent(db, llm, engine)
-            try:
-                graph = agent.compile()
-                result = await graph.ainvoke({
-                    "seed_title": paper_title, "seed_doi": doi,
-                    "project_id": project_id, "max_depth": 2, "direction": "both",
-                })
-            except Exception as e:
-                return json.dumps({"paper_title": paper_title, "project_id": project_id,
-                                   "error": f"Citation chase failed: {e}"}, ensure_ascii=False)
+            graph = agent.compile()
+            result = await graph.ainvoke({
+                "seed_title": paper_title, "seed_doi": doi,
+                "project_id": project_id, "max_depth": 2, "direction": "both",
+            })
             out = result.get("result", result) if isinstance(result, dict) else {"result": str(result)}
             out.setdefault("paper_title", paper_title)
             out.setdefault("project_id", project_id)
@@ -1998,6 +2066,7 @@ class ToolRegistry:
         )
 
     def _make_literature_search(self):
+        @tool_error_handler(agent="tool:agent_literature_search", node="LiteratureAgent")
         async def literature_search(user_query: str, sources: str = "arxiv,semantic_scholar",
                                       year_from: int = 2022, max_results: int = 20) -> str:
             from .graphs.literature_graph import LiteratureAgent
@@ -2005,20 +2074,17 @@ class ToolRegistry:
             from .db import AgentDB
             db = AgentDB()
             project_id = db.create_project(user_query=user_query)
-            try:
-                runner = PipelineRunner(None, db, None, None, None, None)
-                agent = LiteratureAgent(runner)
-                graph = agent.compile()
-                result = await graph.ainvoke({
-                    "project_id": project_id,
-                    "user_query": user_query,
-                    "sources": [s.strip() for s in sources.split(",") if s.strip()],
-                    "year_from": year_from,
-                    "max_results": max_results,
-                })
-                return json.dumps(result.get("result", {}), ensure_ascii=False, default=str)
-            except Exception as e:
-                return json.dumps({"error": str(e), "project_id": project_id}, ensure_ascii=False)
+            runner = PipelineRunner(None, db, None, None, None, None)
+            agent = LiteratureAgent(runner)
+            graph = agent.compile()
+            result = await graph.ainvoke({
+                "project_id": project_id,
+                "user_query": user_query,
+                "sources": [s.strip() for s in sources.split(",") if s.strip()],
+                "year_from": year_from,
+                "max_results": max_results,
+            })
+            return json.dumps(result.get("result", {}), ensure_ascii=False, default=str)
         return literature_search
 
     def _register_knowledge_agent_tools(self):
@@ -2037,30 +2103,26 @@ class ToolRegistry:
         )
 
     def _make_knowledge_ingest(self):
+        @tool_error_handler(agent="tool:agent_knowledge_ingest", node="KnowledgeAgent.run_ingest")
         async def knowledge_ingest(project_id: str) -> str:
             from .graphs.knowledge_graph import KnowledgeAgent
             from .db import AgentDB
             db = AgentDB()
             papers = db.get_project_papers(project_id)
-            try:
-                agent = KnowledgeAgent(db=db)
-                result = await agent.run_ingest(papers, project_id)
-                return json.dumps(result.get("result", {}), ensure_ascii=False, default=str)
-            except Exception as e:
-                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            agent = KnowledgeAgent(db=db)
+            result = await agent.run_ingest(papers, project_id)
+            return json.dumps(result.get("result", {}), ensure_ascii=False, default=str)
         return knowledge_ingest
 
     def _make_knowledge_ask(self):
+        @tool_error_handler(agent="tool:agent_knowledge_ask", node="KnowledgeAgent.ask")
         async def knowledge_ask(question: str, project_id: str = "", top_k: int = 5) -> str:
             from .graphs.knowledge_graph import KnowledgeAgent
             from .chroma_store import ChromaStoreV2
-            try:
-                chroma = ChromaStoreV2()
-                agent = KnowledgeAgent(vector_store=chroma)
-                result = await agent.ask(question, project_id=project_id or None, top_k=top_k)
-                return json.dumps(result, ensure_ascii=False, default=str)
-            except Exception as e:
-                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            chroma = ChromaStoreV2()
+            agent = KnowledgeAgent(vector_store=chroma)
+            result = await agent.ask(question, project_id=project_id or None, top_k=top_k)
+            return json.dumps(result, ensure_ascii=False, default=str)
         return knowledge_ask
 
     def _register_writing_agent_tools(self):
@@ -2079,6 +2141,7 @@ class ToolRegistry:
         )
 
     def _make_generate_survey_v2(self):
+        @tool_error_handler(agent="tool:agent_generate_survey_v2", node="WritingAgent.generate_survey")
         async def generate_survey_v2(project_id: str, template: str = "arxiv") -> str:
             from .graphs.writing_graph import WritingAgent
             from .db import AgentDB
@@ -2133,14 +2196,12 @@ class ToolRegistry:
         )
 
     def _make_capture_video(self):
+        @tool_error_handler(agent="tool:agent_capture_video", node="VideoAgent.process")
         async def capture_video(url: str) -> str:
             from .graphs.video_graph import VideoAgent
-            try:
-                agent = VideoAgent()
-                result = await agent.process(url)
-                return json.dumps(result, ensure_ascii=False, default=str)
-            except Exception as e:
-                return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
+            agent = VideoAgent()
+            result = await agent.process(url)
+            return json.dumps(result, ensure_ascii=False, default=str)
         return capture_video
 
     def _register_user_preference_tool(self):
