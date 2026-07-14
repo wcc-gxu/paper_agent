@@ -185,8 +185,10 @@ CREATE TABLE message_embeddings (
 
 CREATE INDEX idx_msg_emb_session ON message_embeddings(session_id);
 CREATE INDEX idx_msg_emb_user ON message_embeddings(user_id);
-CREATE INDEX idx_msg_emb_ivf ON message_embeddings
-    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
+-- [DISABLED] IVFFlat 近似索引在数据量 < 1000 条时会因 probes 不足返回 0 结果。
+-- 待 paper_chunks 超过 5000 条后再启用，并设置 ivfflat.probes = 20。
+-- CREATE INDEX idx_msg_emb_ivf ON message_embeddings
+--     USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
 
 CREATE TABLE conversation_archive (
     id              TEXT PRIMARY KEY,
@@ -507,17 +509,19 @@ CREATE INDEX idx_topic_user ON topic_embeddings(user_id);
 -- pgvector 索引 (迁移后统一创建，先迁数据再建索引)
 -- ============================================================
 
--- 论文切片向量索引 (IVFFlat: 适合 < 100万 条)
-CREATE INDEX idx_chunks_embedding_ivf
-    ON paper_chunks
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- [DISABLED] IVFFlat 近似索引在数据量 < 1000 条时会因 probes 不足返回 0 结果。
+-- 待 paper_chunks 超过 5000 条后再启用，并在每次搜索前执行:
+--   SET ivfflat.probes = 20;
+-- CREATE INDEX idx_chunks_embedding_ivf
+--     ON paper_chunks
+--     USING ivfflat (embedding vector_cosine_ops)
+--     WITH (lists = 100);
 
--- 术语 vector 索引
-CREATE INDEX idx_gle_embedding_ivf
-    ON glossary_embeddings
-    USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 50);
+-- [DISABLED] 同上，数据量不足时禁用。
+-- CREATE INDEX idx_gle_embedding_ivf
+--     ON glossary_embeddings
+--     USING ivfflat (embedding vector_cosine_ops)
+--     WITH (lists = 50);
 
 -- ============================================================
 -- pgvector 检索函数

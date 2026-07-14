@@ -58,7 +58,7 @@ def _get_embedding(texts: list[str], model: str | None = None) -> list[list[floa
                 "input": texts,
                 "dimensions": EMBEDDING_DIMENSIONS,
             },
-            timeout=30,
+            timeout=60,
         )
         if resp.status_code == 200:
             data = resp.json()
@@ -305,6 +305,10 @@ class PgVectorStore:
             ]
         except Exception as e:
             logger.warning(f"PgVectorStore search_abstract 失败: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return []
 
     # ── 向后兼容 ChromaStore (旧版) ─────────────────────
@@ -344,6 +348,10 @@ class PgVectorStore:
             ]
         except Exception as e:
             logger.warning(f"PgVectorStore search_similar 失败: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return []
 
     # ── 全文分块索引 ────────────────────────────────────
@@ -454,6 +462,10 @@ class PgVectorStore:
             ]
         except Exception as e:
             logger.warning(f"PgVectorStore search_fulltext 失败: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return []
 
     # ── 术语词表 ────────────────────────────────────────
@@ -620,6 +632,10 @@ class PgVectorStore:
             return results
         except Exception as e:
             logger.warning(f"PgVectorStore search_similar_messages 失败: {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return []
 
     # ── 工具方法 ────────────────────────────────────────
@@ -651,6 +667,10 @@ class PgVectorStore:
             return None
         except Exception as e:
             logger.warning(f"PgVectorStore get_embedding 失败 ({paper_id}): {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             return None
 
     def count_abstract(self) -> int:
