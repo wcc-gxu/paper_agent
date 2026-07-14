@@ -151,7 +151,7 @@ class AgentBootstrap:
 
         # 3. ToolRegistry — inject DB singleton
         from ..agent.tool_registry import ToolRegistry, set_db
-        set_db(self._db)  # 替代 66 处惰性 AgentDB() 调用
+        set_db(self._db, user_id=self.user_id)  # 替代 66 处惰性 AgentDB() 调用
         self._tools = ToolRegistry.get_instance()
         logger.info(f"ToolRegistry: {len(self._tools.tool_names)} tools")
 

@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 # ── DB Singleton（替代 66 处惰性 AgentDB() 实例化） ──────────────
 
 _db_instance: Any = None
+_user_id: str = "user-default"
 
 
 def _get_db():
@@ -44,10 +45,17 @@ def _get_db():
     return _db_instance
 
 
-def set_db(db):
-    """在应用启动时注入 PostgresAgentDB 实例（Bootstrap 调）。"""
-    global _db_instance
+def _get_user_id() -> str:
+    """返回当前用户 ID（用于 PgVectorStore 数据隔离）。"""
+    global _user_id
+    return _user_id
+
+
+def set_db(db, user_id: str = "user-default"):
+    """在应用启动时注入 PostgresAgentDB 实例 + user_id（Bootstrap 调）。"""
+    global _db_instance, _user_id
     _db_instance = db
+    _user_id = user_id
 
 
 # ── Tool Error Handler ──────────────────────────────────────────────
@@ -1145,7 +1153,7 @@ class ToolRegistry:
         def list_collections() -> str:
             try:
                 from ..agent.pgvector_store import PgVectorStore
-                chroma = PgVectorStore()
+                chroma = PgVectorStore(user_id=_get_user_id())
                 cols = chroma.list_collections() if hasattr(chroma, 'list_collections') else ["papers_abstract", "papers_fulltext"]
                 return json.dumps({"collections": cols})
             except Exception as e:
@@ -1572,7 +1580,7 @@ class ToolRegistry:
             from .pgvector_store import PgVectorStore
             from .chunker import SectionChunker
             db = _get_db()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             chunker = SectionChunker()
 
             if all and project_id:
@@ -1873,7 +1881,7 @@ class ToolRegistry:
         async def search_library(query: str, top_k: int = 5) -> str:
             try:
                 from ..agent.pgvector_store import PgVectorStore
-                chroma = PgVectorStore()
+                chroma = PgVectorStore(user_id=_get_user_id())
                 results = chroma.search_similar(query, n_results=top_k)
                 return json.dumps(results, ensure_ascii=False, default=str)
             except Exception as e:
@@ -1911,7 +1919,7 @@ class ToolRegistry:
             from .memory import KnowledgeEntry, MemoryManager
             db = _get_db()
             llm = LLMClientV2()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             kb = KnowledgeBase(db, chroma, llm)
             try:
                 ek = await kb.extract_knowledge(paper_id, deep=deep)
@@ -1952,7 +1960,7 @@ class ToolRegistry:
             from .knowledge import KnowledgeBase
             db = _get_db()
             llm = LLMClientV2()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             kb = KnowledgeBase(db, chroma, llm)
             try:
                 related = await kb.find_related(paper_id, top_k=top_k)
@@ -1988,7 +1996,7 @@ class ToolRegistry:
             from .knowledge import KnowledgeBase
             db = _get_db()
             llm = LLMClientV2()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             kb = KnowledgeBase(db, chroma, llm)
             try:
                 result = await kb.discover_gaps(domain=domain, project_id=project_id or None)
@@ -2014,7 +2022,7 @@ class ToolRegistry:
                                   ensure_ascii=False)
             db = _get_db()
             llm = LLMClientV2()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             agent = TranslationAgent(db, llm, chroma)
             try:
                 result = await agent.build_glossary(project_id)
@@ -2033,7 +2041,7 @@ class ToolRegistry:
                 return json.dumps({"error": "query is required"}, ensure_ascii=False)
             db = _get_db()
             llm = LLMClientV2()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             agent = TranslationAgent(db, llm, chroma)
             direction = "zh2en" if target_lang.lower().startswith("en") else "en2zh"
             try:
@@ -2111,7 +2119,7 @@ class ToolRegistry:
         async def knowledge_ask(question: str, project_id: str = "", top_k: int = 5) -> str:
             from .graphs.knowledge_graph import KnowledgeAgent
             from .pgvector_store import PgVectorStore
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             agent = KnowledgeAgent(vector_store=chroma)
             result = await agent.ask(question, project_id=project_id or None, top_k=top_k)
             return json.dumps(result, ensure_ascii=False, default=str)
@@ -2172,7 +2180,7 @@ class ToolRegistry:
             papers = db.get_project_papers(project_id)
             paper_ids = [p.get("paper_id", "") for p in papers]
             llm = LLMClientV2()
-            chroma = PgVectorStore()
+            chroma = PgVectorStore(user_id=_get_user_id())
             agent = GlossaryAgent(db=db, vector_store=chroma, llm_client=llm)
             result = await agent.collect_terms(paper_ids=paper_ids, domain=domain)
             return json.dumps(result, ensure_ascii=False, default=str)

@@ -176,6 +176,51 @@ class PgVectorStore:
             except Exception:
                 pass
 
+    def add_paper_chunk(self, paper_id: str, text: str, section: str = "",
+                         index: int = 0, metadata: dict = None) -> bool:
+        """添加单个论文文本块（兼容旧版 ChromaStore API）。
+
+        Args:
+            paper_id: 论文 ID。
+            text: 块文本内容。
+            section: 块所在的章节标题。
+            index: 块在论文中的序号。
+            metadata: 可选的额外元数据。
+
+        Returns:
+            True 如果成功。
+        """
+        if not text or not text.strip():
+            return False
+        try:
+            emb = self._embed_texts([text])[0]
+            meta = metadata or {}
+            meta["paper_id"] = paper_id
+            meta["section"] = section[:200]
+            chunk_id = f"chk-{paper_id}-{index:04d}"
+            cur = self.conn.cursor()
+            cur.execute(
+                """INSERT INTO paper_chunks (id, paper_id, user_id, chunk_text, chunk_type,
+                   section_title, section_level, chunk_order, embedding, token_count, metadata)
+                   VALUES (%s, %s, %s, %s, 'body', %s, 0, %s, %s::vector, %s, %s)
+                   ON CONFLICT (id) DO UPDATE SET
+                   chunk_text=EXCLUDED.chunk_text, embedding=EXCLUDED.embedding, metadata=EXCLUDED.metadata""",
+                (
+                    chunk_id, paper_id, self.user_id, text, section[:200], index,
+                    self._format_vector(emb), len(text.split()),
+                    json.dumps(meta, ensure_ascii=False),
+                ),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"PgVectorStore add_paper_chunk 失败 ({paper_id}): {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return False
+
     def add_abstracts_batch(self, items: list[dict]):
         """批量添加摘要索引。
 
@@ -261,6 +306,7 @@ class PgVectorStore:
         """语义检索与查询最相似的论文（兼容旧版 ChromaStore API）。
 
         搜索所有 chunk_type 的 paper_chunks，按 paper_id 去重后返回。
+        返回字段: paper_id, title, score (相似度 0~1), chunk_text, abstract
         """
         try:
             emb = self._embed_texts([query])[0]
@@ -269,6 +315,8 @@ class PgVectorStore:
             cur.execute(
                 """SELECT DISTINCT ON (pc.paper_id) pc.paper_id,
                    pc.metadata->>'title' AS title,
+                   pc.chunk_text,
+                   pc.metadata->>'abstract' AS abstract,
                    1 - (pc.embedding <=> %s::vector) AS similarity
                    FROM paper_chunks pc
                    WHERE pc.user_id = %s
@@ -281,7 +329,9 @@ class PgVectorStore:
                 {
                     "paper_id": r["paper_id"],
                     "title": r.get("title", ""),
-                    "distance": 1.0 - r["similarity"],
+                    "score": float(r["similarity"]),
+                    "chunk_text": r.get("chunk_text", ""),
+                    "abstract": r.get("abstract", ""),
                 }
                 for r in rows
             ]
