@@ -138,6 +138,11 @@ class MainState(TypedDict, total=False):
     todo_checkpoint_satisfied: bool
     todo_retry_count: int
 
+    # Internal: track whether the final reply was already pushed inside the graph
+    # (e.g., _inline_reply and Free ReAct _execute path push it inline).
+    # _run_turn uses this to decide whether to push final_reply from state.
+    _reply_pushed: bool
+
     # Plan Review (v3.1 plan approval flow)
     plan_id: str
     plan_approved: bool
@@ -895,6 +900,7 @@ class MainGraph:
                         "current_todo_index": current_todo_index + 1,
                         "all_satisfied": True,
                         "final_reply": text_content,
+                        "_reply_pushed": True,
                     }
 
                 logger.info("Todo [%s] complete after %d rounds (no more tool calls)",
@@ -1467,8 +1473,8 @@ class MainGraph:
                 priority_kind="high",
             )
 
-        await self._push_status(session_id, "done", "回复完成")
-        return {"final_reply": full_text.strip()}
+        # Note: status/done is pushed centrally in MainAgent._run_turn after graph.ainvoke
+        return {"final_reply": full_text.strip(), "_reply_pushed": True}
 
 
 # ═══════════════════════════════════════════════════════════════

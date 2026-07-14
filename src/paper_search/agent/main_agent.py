@@ -575,12 +575,25 @@ class MainAgent:
                     config={"configurable": {"thread_id": session_id}},
                 )
                 final_reply = final_state.get("final_reply", "")
+                reply_pushed = final_state.get("_reply_pushed", False)
                 error = final_state.get("error")
+
+                # Push final_reply if the graph generated one but didn't push it inline
+                # (e.g., evaluate→done path stores final_reply in state but never sends it)
+                if final_reply and not reply_pushed:
+                    await self._push(session_id, "message", "text", "assistant",
+                                     payload={"content": final_reply},
+                                     priority_kind="high")
+
                 if error:
                     await self._push(session_id, "error", "INTERNAL_ERROR", "system",
                                      payload={"message": str(error), "recoverable": True},
                                      priority_kind="urgent")
                     logger.error(f"Graph error: {error}")
+
+                # Always signal turn completion — client needs this to know the turn is done
+                await self._push_status(session_id, "done", "处理完成")
+
                 logger.info("✅ TURN done | corr=%s reply_len=%d",
                             self._correlation_id, len(final_reply or ""))
             except Exception as e:
@@ -588,6 +601,7 @@ class MainAgent:
                 await self._push(session_id, "error", "INTERNAL_ERROR", "system",
                                  payload={"message": f"Agent 处理失败: {e}", "recoverable": True},
                                  priority_kind="urgent")
+                await self._push_status(session_id, "done", "处理异常终止")
             return
 
         # Fallback: if no graph, use old inline_reply
