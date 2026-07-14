@@ -76,8 +76,8 @@ async def _main():
 
             # 清理 ChromaDB
             try:
-                from ..agent.chroma_store import ChromaStoreV2
-                store = ChromaStoreV2()
+                from ..agent.pgvector_store import PgVectorStore
+                store = PgVectorStore()
                 store.client.delete_collection("papers_abstract")
                 store.client.delete_collection("papers_fulltext")
                 console_print("[dim]   ChromaDB 索引已清理[/dim]")

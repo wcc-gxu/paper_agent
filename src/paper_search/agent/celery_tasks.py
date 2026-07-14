@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def _get_db():
-    from .db import AgentDB
-    return AgentDB()
+    from .pgdb import PostgresAgentDB
+    return PostgresAgentDB()
 
 
 def _get_reporter():
@@ -70,10 +70,10 @@ def download_task(self, paper_id: str, project_id: str,
         from ..engine import PaperSearchEngine
         from ..config import Config
         from ..models import Paper, SourceType
-        from .db import AgentDB
+        from .pgdb import PostgresAgentDB
 
         engine = PaperSearchEngine(Config())
-        db = AgentDB()
+        db = PostgresAgentDB()
 
         # 构建 Paper 对象
         source_type = SourceType(source) if source in [s.value for s in SourceType] else SourceType.ARXIV
@@ -151,7 +151,7 @@ def convert_task(self, paper_id: str, pdf_path: str,
 
     try:
         from .pdf_converter import PDFConverter
-        from .db import AgentDB
+        from .pgdb import PostgresAgentDB
         from ..config import get_markdown_dir
 
         pdf = Path(pdf_path)
@@ -170,7 +170,7 @@ def convert_task(self, paper_id: str, pdf_path: str,
             loop.close()
 
         if md_path:
-            db = AgentDB()
+            db = PostgresAgentDB()
             db.update_paper_meta(paper_id, markdown_path=str(md_path))
             task_logger.paper_progress(task_id, "convert", paper_id, title, "convert_done")
             reporter.report_progress(task_id, "normal", {
@@ -216,14 +216,14 @@ def index_task(self, paper_id: str, markdown_path: str,
     task_logger.paper_progress(task_id, "index", paper_id, title, "index_start")
 
     try:
-        from .chroma_store import ChromaStoreV2
-        from .db import AgentDB
+        from .pgvector_store import PgVectorStore
+        from .pgdb import PostgresAgentDB
 
         md_path = Path(markdown_path)
         if not md_path.exists():
             raise FileNotFoundError(f"Markdown not found: {markdown_path}")
 
-        chroma = ChromaStoreV2()
+        chroma = PgVectorStore()
         md_content = md_path.read_text(encoding="utf-8")
 
         # 索引摘要
@@ -242,7 +242,7 @@ def index_task(self, paper_id: str, markdown_path: str,
         chunks = chunker.chunk(md_content, paper_id)
         chunk_count = chroma.add_fulltext_chunks(chunks) if chunks else 0
 
-        db = AgentDB()
+        db = PostgresAgentDB()
         db.update_paper_meta(paper_id, embedding_id=f"idx:{paper_id}")
 
         task_logger.paper_progress(task_id, "index", paper_id, title, "index_done")
@@ -284,10 +284,10 @@ def survey_task(self, project_id: str, user_query: str) -> dict:
 
     try:
         from .llm_client_v2 import LLMClientV2
-        from .db import AgentDB
+        from .pgdb import PostgresAgentDB
         from ..config import get_outputs_dir
 
-        db = AgentDB()
+        db = PostgresAgentDB()
         papers_data = db.get_relevant_papers(project_id)
 
         if not papers_data:
@@ -676,9 +676,9 @@ async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
 
     # ── clustering (S6/S8) ──
     if agent_type == "clustering":
-        from .chroma_store import ChromaStoreV2
+        from .pgvector_store import PgVectorStore
         from .graphs.clustering_graph import ClusteringAgent
-        chroma = ChromaStoreV2()
+        chroma = PgVectorStore()
         agent = ClusteringAgent(db, chroma, llm, on_progress=on_progress)
         graph = agent.compile()
         state = {
@@ -711,9 +711,9 @@ async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
 
     # ── translation (S12) ──
     if agent_type == "translation":
-        from .chroma_store import ChromaStoreV2
+        from .pgvector_store import PgVectorStore
         from .graphs.translation_graph import TranslationAgent
-        chroma = ChromaStoreV2()
+        chroma = PgVectorStore()
         agent = TranslationAgent(db, llm, chroma, on_progress=on_progress)
         graph = agent.compile()
         state = {
@@ -747,10 +747,10 @@ async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
 
     # ── rad_query (S10) ──
     if agent_type == "rad_query":
-        from .chroma_store import ChromaStoreV2
+        from .pgvector_store import PgVectorStore
         from .knowledge import KnowledgeBase
         from .graphs.rad_query_graph import RADQueryAgent
-        chroma = ChromaStoreV2()
+        chroma = PgVectorStore()
         kb = KnowledgeBase(db, chroma, llm)
         agent = RADQueryAgent(kb, on_progress=on_progress)
         graph = agent.compile()

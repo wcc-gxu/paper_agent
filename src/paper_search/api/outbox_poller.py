@@ -1,9 +1,11 @@
-"""Outbox Poller — Redis outbox List → WebSocket / APNs 分发 (Phase 1)。
+"""Outbox Poller — Redis outbox List → WebSocket / APNs 分发。
 
 每个 agent_id 一个 poller 协程。从 outbox:{agent_id} BRPOP 取消息：
-  - 该 agent 有在线 WS session → 发送 + mark_delivered
+  - 该 agent 有在线 WS session → 发送
   - 该 agent 无在线 session → 按 priority_kind 决定是否 APNs
   - WS send 失败 → 重新 LPUSH 到队列头部（保留次序）
+
+历史消息拉取通过 REST API（GET /api/sessions/{id}/messages），不再通过 WS sync。
 
 启动时机:
   - 在 FastAPI lifespan 中为每个已知 agent_id 启动一个 poller
@@ -60,7 +62,7 @@ async def _poller_loop(agent_id: str, ws_manager: Any, db: Any, redis_url: str):
                 logger.warning("OutboxPoller: malformed envelope, dropping: %s", data[:200])
                 continue
 
-            await _dispatch_envelope(envelope, ws_manager, db, pusher, redis_client, key)
+            await _dispatch_envelope(envelope, ws_manager, pusher, redis_client, key)
 
     except asyncio.CancelledError:
         logger.info("OutboxPoller cancelled: agent=%s", agent_id)
@@ -72,9 +74,9 @@ async def _poller_loop(agent_id: str, ws_manager: Any, db: Any, redis_url: str):
             pass
 
 
-async def _dispatch_envelope(envelope: dict, ws_manager: Any, db: Any,
+async def _dispatch_envelope(envelope: dict, ws_manager: Any,
                               pusher: Any, redis_client: Any, key: str):
-    """分发一条 envelope: WS 在线 → 推送 + mark_delivered；离线 → APNs。"""
+    """分发一条 envelope: WS 在线 → 推送；离线 → APNs。"""
     agent_id = envelope.get("agentId", "")
     session_id = envelope.get("sessionId", "main")
     msg_id = envelope.get("msg_id", "")
@@ -107,12 +109,6 @@ async def _dispatch_envelope(envelope: dict, ws_manager: Any, db: Any,
                     "📤 OUTBOX→WS | agent=%s sess=%s type=%s/%s msg=%s",
                     agent_id, sess_id, msg_type, sub_type, msg_id[:8],
                 )
-                # 标记送达
-                if msg_id and db is not None and priority_kind != "silent":
-                    try:
-                        db.mark_message_delivered(msg_id, sess_id)
-                    except Exception:
-                        pass
             except Exception as e:
                 logger.warning("OutboxPoller WS send failed (sess=%s): %s; requeueing", sess_id, e)
                 # 重新塞回队列头（保留次序）

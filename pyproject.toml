@@ -33,7 +33,7 @@ rich = ["rich>=13"]
 # Agent Framework
 agent = [
     "langgraph>=0.6.0",
-    "langgraph-checkpoint-sqlite>=2.0.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
     "langchain-core>=0.3.0",
     "langmem>=0.0.10",
 ]
@@ -59,7 +59,7 @@ all = [
     "uvicorn[standard]>=0.27",
     "PyJWT>=2.8",
     "langgraph>=0.6.0",
-    "langgraph-checkpoint-sqlite>=2.0.0",
+    "langgraph-checkpoint-postgres>=2.0.0",
     "langchain-core>=0.3.0",
     "langmem>=0.0.10",
     "celery[redis]>=5.4",

@@ -1,12 +1,10 @@
-"""MessageStore — WebSocket 消息持久化层 (Phase 1 重写)。
+"""MessageStore — WebSocket 消息持久化层。
 
-旧版基于 priority(int)/seq 字段，Phase 1 改为基于 msg_id (UUID)/priority_kind/
-delivered_sessions 的新 schema。所有出站消息通过 outbox_publish 双写到
-ws_messages 表 + Redis outbox List；本模块提供查询 / 回放接口。
+所有出站消息通过 outbox_publish 双写到 ws_messages 表 + Redis outbox List；
+本模块提供查询接口。历史消息拉取通过 REST API（GET /api/sessions/{id}/messages）。
 
 主要 API:
   - get_recent_messages(): 获取最近 N 条历史（构造上下文用）
-  - get_undelivered_for_session(): iOS 重连同步用
   - get_unexpired_reviews(): plan / clarify 类待处理消息
 """
 
@@ -66,16 +64,6 @@ class MessageStore:
             })
         return out
 
-    async def get_undelivered_for_session(self, agent_id: str, session_id: str,
-                                           since_msg_id: str = "",
-                                           hours: int = 24,
-                                           limit: int = 500) -> list[dict]:
-        """获取 session 未送达的消息（sync_request 用，回放历史）。"""
-        return self._db.get_undelivered_messages(
-            agent_id, session_id,
-            since_msg_id=since_msg_id, hours=hours, limit=limit,
-        )
-
     async def get_unexpired_reviews(self, agent_id: str, session_id: str,
                                      window_minutes: int = 30) -> list[dict]:
         """获取未过期的待用户响应消息（ask_user_question / propose_plan）。
@@ -112,7 +100,3 @@ class MessageStore:
                 "payload": payload,
             })
         return out
-
-    async def mark_delivered(self, msg_id: str, session_id: str):
-        """标记某 msg 已送达某 session。"""
-        self._db.mark_message_delivered(msg_id, session_id)

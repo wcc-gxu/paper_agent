@@ -30,6 +30,25 @@ from langchain_core.tools import StructuredTool
 
 logger = logging.getLogger(__name__)
 
+# ── DB Singleton（替代 66 处惰性 AgentDB() 实例化） ──────────────
+
+_db_instance: Any = None
+
+
+def _get_db():
+    """返回共享的 PostgresAgentDB 单例。daemon 启动时通过 set_db() 初始化。"""
+    global _db_instance
+    if _db_instance is None:
+        from .pgdb import PostgresAgentDB
+        _db_instance = PostgresAgentDB()
+    return _db_instance
+
+
+def set_db(db):
+    """在应用启动时注入 PostgresAgentDB 实例（Bootstrap 调）。"""
+    global _db_instance
+    _db_instance = db
+
 
 # ── Tool Error Handler ──────────────────────────────────────────────
 # 统一包装所有 _make_* 工具函数的异常处理：
@@ -888,8 +907,7 @@ class ToolRegistry:
             except Exception:
                 pass
             try:
-                from ..agent.db import AgentDB
-                db = AgentDB()
+                db = _get_db()
                 db.conn.execute("SELECT 1")
                 checks["db"] = True
                 db.close()
@@ -905,9 +923,8 @@ class ToolRegistry:
     # ══════════════════════════════════════════════════════════
 
     def _get_memory_manager(self):
-        from ..agent.db import AgentDB
         from ..agent.memory import MemoryManager
-        db = AgentDB()
+        db = _get_db()
         return MemoryManager(db)
 
     def _register_search_memory(self):
@@ -1127,8 +1144,8 @@ class ToolRegistry:
     def _register_list_collections(self):
         def list_collections() -> str:
             try:
-                from ..agent.chroma_store import ChromaStoreV2
-                chroma = ChromaStoreV2()
+                from ..agent.pgvector_store import PgVectorStore
+                chroma = PgVectorStore()
                 cols = chroma.list_collections() if hasattr(chroma, 'list_collections') else ["papers_abstract", "papers_fulltext"]
                 return json.dumps({"collections": cols})
             except Exception as e:
@@ -1190,8 +1207,7 @@ class ToolRegistry:
 
     def _register_paper_status(self):
         def paper_status(project_id: str = "", paper_id: str = "") -> str:
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             if paper_id:
                 row = db.conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
                 if row:
@@ -1219,8 +1235,7 @@ class ToolRegistry:
 
     def _register_get_paper_abstract(self):
         def get_paper_abstract(paper_id: str) -> str:
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             row = db.conn.execute("SELECT title, abstract, year, venue FROM papers WHERE id=?", (paper_id,)).fetchone()
             if row:
                 return json.dumps(dict(row), ensure_ascii=False, default=str)
@@ -1252,7 +1267,6 @@ class ToolRegistry:
                                 sources: str = "",
                                 max_papers_per_check: int = 5) -> str:
             """创建一个前沿追踪订阅。Beat 周期任务会读取此表逐条检查新论文。"""
-            from ..agent.db import AgentDB
 
             query = (query or "").strip()
             if not query:
@@ -1269,7 +1283,7 @@ class ToolRegistry:
             except (TypeError, ValueError):
                 max_papers_per_check = 5
 
-            db = AgentDB()
+            db = _get_db()
             sub_id = db.create_subscription(
                 name=display_name,
                 keywords=query,
@@ -1308,8 +1322,7 @@ class ToolRegistry:
 
     def _register_list_subscriptions(self):
         def list_subscriptions(enabled_only: bool = False) -> str:
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             subs = db.list_subscriptions(enabled_only=bool(enabled_only))
             out = [{
                 "subscription_id": s["id"],
@@ -1335,11 +1348,10 @@ class ToolRegistry:
 
     def _register_delete_subscription(self):
         def delete_subscription(subscription_id: str) -> str:
-            from ..agent.db import AgentDB
             sub_id = (subscription_id or "").strip()
             if not sub_id:
                 return json.dumps({"error": "subscription_id 不能为空"}, ensure_ascii=False)
-            db = AgentDB()
+            db = _get_db()
             existing = db.get_subscription(sub_id)
             if not existing:
                 return json.dumps({"error": f"订阅不存在: {sub_id}"}, ensure_ascii=False)
@@ -1360,11 +1372,10 @@ class ToolRegistry:
 
     def _register_pause_subscription(self):
         def pause_subscription(subscription_id: str) -> str:
-            from ..agent.db import AgentDB
             sub_id = (subscription_id or "").strip()
             if not sub_id:
                 return json.dumps({"error": "subscription_id 不能为空"}, ensure_ascii=False)
-            db = AgentDB()
+            db = _get_db()
             if not db.get_subscription(sub_id):
                 return json.dumps({"error": f"订阅不存在: {sub_id}"}, ensure_ascii=False)
             db.set_subscription_active(sub_id, False)
@@ -1384,11 +1395,10 @@ class ToolRegistry:
 
     def _register_resume_subscription(self):
         def resume_subscription(subscription_id: str) -> str:
-            from ..agent.db import AgentDB
             sub_id = (subscription_id or "").strip()
             if not sub_id:
                 return json.dumps({"error": "subscription_id 不能为空"}, ensure_ascii=False)
-            db = AgentDB()
+            db = _get_db()
             if not db.get_subscription(sub_id):
                 return json.dumps({"error": f"订阅不存在: {sub_id}"}, ensure_ascii=False)
             db.set_subscription_active(sub_id, True)
@@ -1462,14 +1472,13 @@ class ToolRegistry:
             from ..models import SearchQuery, SourceType
             from ..engine import PaperSearchEngine
             from ..config import Config
-            from ..agent.db import AgentDB
             source_list = [SourceType(s.strip()) for s in sources.split(",") if s.strip()]
             if not source_list:
                 source_list = [SourceType.ARXIV, SourceType.SEMANTIC_SCHOLAR]
             query = SearchQuery(keywords=keywords, year_from=year_from, max_results=max_results, sources=source_list)
             engine = PaperSearchEngine(Config())
             result = await engine.search(query)
-            db = AgentDB()
+            db = _get_db()
             pid = db.create_project(user_query=keywords)
             papers_out = []
             for p in result.papers:
@@ -1488,8 +1497,7 @@ class ToolRegistry:
             """下载单篇论文 PDF → 落盘 + 写 DB（papers.pdf_path + project_papers.pdf_path）。"""
             from ..engine import PaperSearchEngine
             from ..config import Config
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             pid = paper_id
             row = None
             if pid:
@@ -1532,9 +1540,8 @@ class ToolRegistry:
     def _make_convert_paper(self):
         async def convert_paper(paper_id: str = "", pdf_path: str = "") -> str:
             """PDF → Markdown（pymupdf4llm）→ 写 papers.markdown_path。"""
-            from ..agent.db import AgentDB
             from .pdf_converter import PDFConverter
-            db = AgentDB()
+            db = _get_db()
             row = db.conn.execute(
                 "SELECT id, title, pdf_path FROM papers WHERE id=?", (paper_id,)
             ).fetchone()
@@ -1562,11 +1569,10 @@ class ToolRegistry:
     def _make_index_paper(self):
         async def index_paper(paper_id: str = "", project_id: str = "", all: bool = True) -> str:
             """Markdown → ChromaDB（摘要 + 章节分块）→ 写 papers.embedding_id。"""
-            from ..agent.db import AgentDB
-            from .chroma_store import ChromaStoreV2
+            from .pgvector_store import PgVectorStore
             from .chunker import SectionChunker
-            db = AgentDB()
-            chroma = ChromaStoreV2()
+            db = _get_db()
+            chroma = PgVectorStore()
             chunker = SectionChunker()
 
             if all and project_id:
@@ -1616,9 +1622,8 @@ class ToolRegistry:
     def _make_evaluate_papers(self):
         async def evaluate_papers(project_id: str = "", query: str = "", all: bool = True) -> str:
             """LLM 批量评估项目论文相关性 → 写 project_papers.relevance_score/reason。"""
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
-            db = AgentDB()
+            db = _get_db()
             rows = db.get_project_papers(project_id)
             if not rows:
                 return json.dumps({"error": "No papers in project", "project_id": project_id},
@@ -1659,9 +1664,8 @@ class ToolRegistry:
     def _make_rank_papers(self):
         async def rank_papers(project_id: str = "", all: bool = True) -> str:
             """期刊/会议等级评定（CCF+SCI → A+/A/B/C）→ 写 papers.unified_level + journal_ranks。"""
-            from ..agent.db import AgentDB
             from .journal_ranker import JournalRanker
-            db = AgentDB()
+            db = _get_db()
             ranker = JournalRanker()
             if project_id:
                 rows = db.get_project_papers(project_id)
@@ -1691,11 +1695,10 @@ class ToolRegistry:
     def _make_generate_survey(self):
         async def generate_survey(project_id: str = "") -> str:
             """生成文献综述 Markdown → 写 outputs/{project_id}/survey.md。"""
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
             from .llm_client import RelevanceJudgment
             from ..config import get_outputs_dir
-            db = AgentDB()
+            db = _get_db()
             project = db.get_project(project_id)
             if not project:
                 return json.dumps({"error": f"Project not found: {project_id}"}, ensure_ascii=False)
@@ -1739,9 +1742,8 @@ class ToolRegistry:
     def _make_paper_export(self):
         async def paper_export(project_id: str = "", format: str = "bibtex") -> str:
             """导出项目论文为 BibTeX/JSON → 写 outputs/{project_id}/papers.{bib|json}。"""
-            from ..agent.db import AgentDB
             from ..config import get_outputs_dir
-            db = AgentDB()
+            db = _get_db()
             papers = db.get_project_papers(project_id)
             if not papers:
                 return json.dumps({"error": "No papers in project", "project_id": project_id},
@@ -1778,8 +1780,7 @@ class ToolRegistry:
 
     def _make_paper_clean(self):
         async def paper_clean(project_id: str, keep_pdfs: bool = True) -> str:
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             db.conn.execute("DELETE FROM project_papers WHERE project_id=?", (project_id,))
             db.conn.commit()
             return json.dumps({"project_id": project_id, "cleaned": True})
@@ -1790,12 +1791,11 @@ class ToolRegistry:
             """从 JSON/CSV 批量搜索并入库（每个查询建一个 project）。委托 engine.batch_search_from_file。"""
             from ..engine import PaperSearchEngine
             from ..config import Config
-            from ..agent.db import AgentDB
             from ..models import SourceType
             if not Path(file_path).exists():
                 return json.dumps({"error": f"File not found: {file_path}"}, ensure_ascii=False)
             engine = PaperSearchEngine(Config())
-            db = AgentDB()
+            db = _get_db()
             try:
                 summary = await engine.batch_search_from_file(file_path, download=False)
             except Exception as e:
@@ -1845,10 +1845,9 @@ class ToolRegistry:
             """引用追溯 — 委托 CitationChaseAgent graph（resolve→fetch→filter→ingest→decide→summarize）。"""
             from ..engine import PaperSearchEngine
             from ..config import Config
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
             from .graphs.citation_chase_graph import CitationChaseAgent
-            db = AgentDB()
+            db = _get_db()
             llm = LLMClientV2()
             engine = PaperSearchEngine(Config())
 
@@ -1873,8 +1872,8 @@ class ToolRegistry:
     def _make_search_library(self):
         async def search_library(query: str, top_k: int = 5) -> str:
             try:
-                from ..agent.chroma_store import ChromaStoreV2
-                chroma = ChromaStoreV2()
+                from ..agent.pgvector_store import PgVectorStore
+                chroma = PgVectorStore()
                 results = chroma.search_similar(query, n_results=top_k)
                 return json.dumps(results, ensure_ascii=False, default=str)
             except Exception as e:
@@ -1883,8 +1882,7 @@ class ToolRegistry:
 
     def _make_search_knowledge(self):
         async def search_knowledge(query: str, top_k: int = 5) -> str:
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             like = f"%{query}%"
             rows = db.conn.execute(
                 "SELECT * FROM knowledge_entries WHERE title LIKE ? OR content LIKE ? LIMIT ?",
@@ -1895,8 +1893,7 @@ class ToolRegistry:
 
     def _make_read_paper(self):
         def read_paper(paper_id: str) -> str:
-            from ..agent.db import AgentDB
-            db = AgentDB()
+            db = _get_db()
             row = db.conn.execute("SELECT markdown_path, title FROM papers WHERE id=?", (paper_id,)).fetchone()
             if row and row["markdown_path"]:
                 path = Path(row["markdown_path"])
@@ -1908,14 +1905,13 @@ class ToolRegistry:
     def _make_extract_knowledge(self):
         async def extract_knowledge(paper_id: str = "", deep: bool = False) -> str:
             """从论文提取结构化知识（贡献/方法/数据集/局限）→ 存长期记忆 knowledge_entries。委托 KnowledgeBase。"""
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
-            from .chroma_store import ChromaStoreV2
+            from .pgvector_store import PgVectorStore
             from .knowledge import KnowledgeBase
             from .memory import KnowledgeEntry, MemoryManager
-            db = AgentDB()
+            db = _get_db()
             llm = LLMClientV2()
-            chroma = ChromaStoreV2()
+            chroma = PgVectorStore()
             kb = KnowledgeBase(db, chroma, llm)
             try:
                 ek = await kb.extract_knowledge(paper_id, deep=deep)
@@ -1951,13 +1947,12 @@ class ToolRegistry:
     def _make_find_related(self):
         async def find_related(paper_id: str = "", top_k: int = 10) -> str:
             """发现相关论文（语义相似度 + 引用关系）。委托 KnowledgeBase.find_related。"""
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
-            from .chroma_store import ChromaStoreV2
+            from .pgvector_store import PgVectorStore
             from .knowledge import KnowledgeBase
-            db = AgentDB()
+            db = _get_db()
             llm = LLMClientV2()
-            chroma = ChromaStoreV2()
+            chroma = PgVectorStore()
             kb = KnowledgeBase(db, chroma, llm)
             try:
                 related = await kb.find_related(paper_id, top_k=top_k)
@@ -1988,13 +1983,12 @@ class ToolRegistry:
             无法在进程内运行；KnowledgeBase.discover_gaps 是完整的 LLM 分析实现，
             直接产出 gaps/contradictions/trends/emerging_topics，故委托之。
             """
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
-            from .chroma_store import ChromaStoreV2
+            from .pgvector_store import PgVectorStore
             from .knowledge import KnowledgeBase
-            db = AgentDB()
+            db = _get_db()
             llm = LLMClientV2()
-            chroma = ChromaStoreV2()
+            chroma = PgVectorStore()
             kb = KnowledgeBase(db, chroma, llm)
             try:
                 result = await kb.discover_gaps(domain=domain, project_id=project_id or None)
@@ -2012,16 +2006,15 @@ class ToolRegistry:
     def _make_build_glossary(self):
         async def build_glossary(project_id: str = "") -> str:
             """构建中英学术术语表 — 委托 TranslationAgent.build_glossary。"""
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
-            from .chroma_store import ChromaStoreV2
+            from .pgvector_store import PgVectorStore
             from .graphs.translation_graph import TranslationAgent
             if not project_id:
                 return json.dumps({"error": "project_id is required to build glossary"},
                                   ensure_ascii=False)
-            db = AgentDB()
+            db = _get_db()
             llm = LLMClientV2()
-            chroma = ChromaStoreV2()
+            chroma = PgVectorStore()
             agent = TranslationAgent(db, llm, chroma)
             try:
                 result = await agent.build_glossary(project_id)
@@ -2033,15 +2026,14 @@ class ToolRegistry:
     def _make_translate_query(self):
         async def translate_query(query: str = "", target_lang: str = "en") -> str:
             """中文查询 → 学术英文关键词 — 委托 TranslationAgent.translate_query。"""
-            from ..agent.db import AgentDB
             from .llm_client_v2 import LLMClientV2
-            from .chroma_store import ChromaStoreV2
+            from .pgvector_store import PgVectorStore
             from .graphs.translation_graph import TranslationAgent
             if not query:
                 return json.dumps({"error": "query is required"}, ensure_ascii=False)
-            db = AgentDB()
+            db = _get_db()
             llm = LLMClientV2()
-            chroma = ChromaStoreV2()
+            chroma = PgVectorStore()
             agent = TranslationAgent(db, llm, chroma)
             direction = "zh2en" if target_lang.lower().startswith("en") else "en2zh"
             try:
@@ -2071,8 +2063,8 @@ class ToolRegistry:
                                       year_from: int = 2022, max_results: int = 20) -> str:
             from .graphs.literature_graph import LiteratureAgent
             from .sub_agent import PipelineRunner
-            from .db import AgentDB
-            db = AgentDB()
+            from .pgdb import PostgresAgentDB
+            db = _get_db()
             project_id = db.create_project(user_query=user_query)
             runner = PipelineRunner(None, db, None, None, None, None)
             agent = LiteratureAgent(runner)
@@ -2106,8 +2098,8 @@ class ToolRegistry:
         @tool_error_handler(agent="tool:agent_knowledge_ingest", node="KnowledgeAgent.run_ingest")
         async def knowledge_ingest(project_id: str) -> str:
             from .graphs.knowledge_graph import KnowledgeAgent
-            from .db import AgentDB
-            db = AgentDB()
+            from .pgdb import PostgresAgentDB
+            db = _get_db()
             papers = db.get_project_papers(project_id)
             agent = KnowledgeAgent(db=db)
             result = await agent.run_ingest(papers, project_id)
@@ -2118,8 +2110,8 @@ class ToolRegistry:
         @tool_error_handler(agent="tool:agent_knowledge_ask", node="KnowledgeAgent.ask")
         async def knowledge_ask(question: str, project_id: str = "", top_k: int = 5) -> str:
             from .graphs.knowledge_graph import KnowledgeAgent
-            from .chroma_store import ChromaStoreV2
-            chroma = ChromaStoreV2()
+            from .pgvector_store import PgVectorStore
+            chroma = PgVectorStore()
             agent = KnowledgeAgent(vector_store=chroma)
             result = await agent.ask(question, project_id=project_id or None, top_k=top_k)
             return json.dumps(result, ensure_ascii=False, default=str)
@@ -2144,9 +2136,9 @@ class ToolRegistry:
         @tool_error_handler(agent="tool:agent_generate_survey_v2", node="WritingAgent.generate_survey")
         async def generate_survey_v2(project_id: str, template: str = "arxiv") -> str:
             from .graphs.writing_graph import WritingAgent
-            from .db import AgentDB
+            from .pgdb import PostgresAgentDB
             from .llm_client_v2 import LLMClientV2
-            db = AgentDB()
+            db = _get_db()
             papers = db.get_project_papers(project_id)
             llm = LLMClientV2()
             agent = WritingAgent(db=db, llm_client=llm)
@@ -2173,14 +2165,14 @@ class ToolRegistry:
     def _make_build_glossary_v2(self):
         async def build_glossary_v2(project_id: str, domain: str = "") -> str:
             from .graphs.glossary_graph import GlossaryAgent
-            from .db import AgentDB
+            from .pgdb import PostgresAgentDB
             from .llm_client_v2 import LLMClientV2
-            from .chroma_store import ChromaStoreV2
-            db = AgentDB()
+            from .pgvector_store import PgVectorStore
+            db = _get_db()
             papers = db.get_project_papers(project_id)
             paper_ids = [p.get("paper_id", "") for p in papers]
             llm = LLMClientV2()
-            chroma = ChromaStoreV2()
+            chroma = PgVectorStore()
             agent = GlossaryAgent(db=db, vector_store=chroma, llm_client=llm)
             result = await agent.collect_terms(paper_ids=paper_ids, domain=domain)
             return json.dumps(result, ensure_ascii=False, default=str)
@@ -2215,13 +2207,12 @@ class ToolRegistry:
 
     def _make_update_preference(self):
         async def update_preference(key: str, value: str) -> str:
-            from .store import DualBackendStore
-            import aiosqlite
-            from langgraph.store.sqlite.aio import AsyncSqliteStore
-            from ..config import get_db_path
-            store = AsyncSqliteStore.from_path(str(get_db_path()))
-            dual = DualBackendStore(store)
-            await dual.aput(
+            import os
+            from langgraph.store.postgres.aio import AsyncPostgresStore
+            dsn = os.environ.get("DATABASE_URL", "")
+            store = AsyncPostgresStore.from_conn_string(dsn)
+            await store.setup()
+            await store.aput(
                 ("user-default", "preferences"), key,
                 {"value": value, "updated_at": ""},
             )
@@ -2249,9 +2240,8 @@ class ToolRegistry:
     def _make_zotero_export(self):
         async def zotero_export(project_id: str, format: str = "bibtex",
                                   output_path: str = "") -> str:
-            from ..agent.db import AgentDB
             from pathlib import Path
-            db = AgentDB()
+            db = _get_db()
             papers = db.get_project_papers(project_id)
             if not papers:
                 return json.dumps({"error": f"No papers in project {project_id}"})
@@ -2292,13 +2282,12 @@ class ToolRegistry:
         async def zotero_import(file_path: str, project_id: str = "") -> str:
             import re as _re
             from pathlib import Path
-            from ..agent.db import AgentDB
             path = Path(file_path)
             if not path.exists():
                 return json.dumps({"error": f"File not found: {file_path}"})
 
             text = path.read_text(encoding="utf-8")
-            db = AgentDB()
+            db = _get_db()
             pid = project_id or db.create_project(user_query=f"Zotero import: {path.name}")
 
             # Parse BibTeX entries

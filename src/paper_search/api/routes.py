@@ -113,13 +113,8 @@ async def api_refresh(body: RefreshRequest):
 @router.get("/auth/me")
 async def api_me(user_id: str = Depends(verify_api_key)):
     """获取当前用户信息（需要 Bearer Token）。"""
-    from ..config import use_postgresql
-    if use_postgresql():
-        from ..agent.pgdb import PostgresAgentDB
-        db = PostgresAgentDB()
-    else:
-        from ..agent.db import AgentDB
-        db = AgentDB()
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
     user = db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -128,6 +123,43 @@ async def api_me(user_id: str = Depends(verify_api_key)):
         "username": user.get("username", ""),
         "display_name": user.get("display_name", ""),
         "role": user.get("role", "researcher"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Session Messages (REST API — 替代 WS sync)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/sessions/{session_id}/messages")
+async def get_session_messages(
+    session_id: str,
+    since: Optional[str] = Query(None, description="ISO 8601 timestamp; only return messages after this"),
+    limit: int = Query(200, le=1000, description="Max messages to return"),
+    user_id: str = Depends(verify_api_key),
+):
+    """获取 session 的最终状态消息（去重后的历史消息）。
+
+    替代 WebSocket sync_request/sync_complete 协议。
+    返回的消息已去重：同一 tool_call_id 只保留最新状态，
+    同一 plan_id 只保留最新 plan_todo_update，silent 消息（status/thinking）已排除。
+
+    示例:
+        GET /api/sessions/main/messages
+        GET /api/sessions/main/messages?since=2026-07-01T00:00:00Z&limit=100
+    """
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    try:
+        messages = db.get_final_state_messages(
+            session_id, since_ts=since or "", limit=limit,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch messages: {e}")
+    # has_more: if we got exactly `limit` results, there might be more
+    return {
+        "messages": messages,
+        "has_more": len(messages) >= limit,
     }
 
 
@@ -535,7 +567,7 @@ async def _run_ingest(task_id: str, project_id: str, user_query: str,
         from ..agent.graphs.ingest_graph import IngestAgent
         from ..agent.pdf_converter import PDFConverter
         from ..agent.journal_ranker import JournalRanker
-        from ..agent.chroma_store import ChromaStoreV2
+        from ..agent.pgvector_store import PgVectorStore
         from ..engine import PaperSearchEngine
         from ..config import Config
         from .app import get_db, get_llm
@@ -546,7 +578,7 @@ async def _run_ingest(task_id: str, project_id: str, user_query: str,
 
         runner = PipelineRunner(
             engine=engine, db=db, llm=llm,
-            chroma=ChromaStoreV2(),
+            chroma=PgVectorStore(),
             converter=PDFConverter(max_concurrent=2),
             ranker=JournalRanker(),
         )

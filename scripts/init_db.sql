@@ -162,6 +162,32 @@ CREATE INDEX idx_ws_user ON ws_messages(user_id);
 CREATE INDEX idx_ws_created ON ws_messages(created_at);
 CREATE INDEX idx_ws_session_seq ON ws_messages(session_id, seq);
 
+-- 消息去重: 同一 session + tool_call_id 只保留最新状态
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ws_tool_dedup
+    ON ws_messages (session_id, (payload->>'tool_call_id'))
+    WHERE msg_type = 'tool' AND payload->>'tool_call_id' IS NOT NULL;
+
+-- 消息去重: 同一 session + plan_id 只保留最新 plan_todo_update
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ws_plan_dedup
+    ON ws_messages (session_id, (payload->>'plan_id'))
+    WHERE msg_type = 'plan_todo_update' AND payload->>'plan_id' IS NOT NULL;
+
+-- 消息向量嵌入 (Phase 4)
+CREATE TABLE message_embeddings (
+    id           TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL REFERENCES sessions(id),
+    msg_id       TEXT NOT NULL,
+    user_id      TEXT NOT NULL REFERENCES users(id),
+    content_text TEXT NOT NULL,
+    embedding    vector(1024),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_msg_emb_session ON message_embeddings(session_id);
+CREATE INDEX idx_msg_emb_user ON message_embeddings(user_id);
+CREATE INDEX idx_msg_emb_ivf ON message_embeddings
+    USING ivfflat (embedding vector_cosine_ops) WITH (lists = 50);
+
 CREATE TABLE conversation_archive (
     id              TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL REFERENCES sessions(id),

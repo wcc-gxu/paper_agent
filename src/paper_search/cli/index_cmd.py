@@ -53,8 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _get_chroma_store():
     """获取双 Collection ChromaStore 实例。"""
-    from ..agent.chroma_store import ChromaStoreV2
-    return ChromaStoreV2()
+    from ..agent.pgvector_store import PgVectorStore
+    return PgVectorStore()
 
 
 async def _index_single(store, db, paper_id: str, index_type: str) -> dict:

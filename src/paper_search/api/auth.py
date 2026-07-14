@@ -128,13 +128,8 @@ async def verify_api_key(
             return "user-default"
         if API_KEY:
             try:
-                from ..config import use_postgresql
-                if use_postgresql():
-                    from ..agent.pgdb import PostgresAgentDB
-                    db = PostgresAgentDB()
-                else:
-                    from ..agent.db import AgentDB
-                    db = AgentDB()
+                from ..agent.pgdb import PostgresAgentDB
+                db = PostgresAgentDB()
                 user = db.get_user_by_token(token)
                 if user:
                     return user["id"]
@@ -225,13 +220,8 @@ def auth_register(username: str, password: str, display_name: str = "") -> dict:
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="password must be >= 6 chars")
 
-    from ..config import use_postgresql
-    if use_postgresql():
-        from ..agent.pgdb import PostgresAgentDB
-        db = PostgresAgentDB()
-    else:
-        from ..agent.db import AgentDB
-        db = AgentDB()
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
 
     # 检查用户名是否已存在
     existing = db.get_user_by_username(username)
@@ -263,13 +253,8 @@ def auth_login(username: str, password: str) -> dict:
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
 
-    from ..config import use_postgresql
-    if use_postgresql():
-        from ..agent.pgdb import PostgresAgentDB
-        db = PostgresAgentDB()
-    else:
-        from ..agent.db import AgentDB
-        db = AgentDB()
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
 
     user = db.get_user_by_username(username)
     if not user:

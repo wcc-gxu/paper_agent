@@ -9,6 +9,7 @@ Graph 内部: fast_triage → chat/ops/research → plan(todos) → execute(ReAc
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -380,6 +381,7 @@ class MainAgent:
         self._error_queue: asyncio.Queue[dict] = asyncio.Queue()
         # 当前 turn 内累积的 AgentError（在 _run_turn 开始时清空）
         self._pending_agent_errors: list[dict] = []
+        self._vector_store = None  # Lazy: PgVectorStore for message embedding
         # Debug mode: wire LLM raw events → WS debug status messages
         self._wire_llm_debug()
 
@@ -390,6 +392,53 @@ class MainAgent:
         if self._redis is None:
             import redis.asyncio as aioredis
             self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
+
+    # ── Vector Store (惰性) ──────────────────────────────
+
+    @property
+    def vector_store(self):
+        """PgVectorStore 惰性初始化（用于 message embedding / recall）。"""
+        if self._vector_store is None:
+            from .pgvector_store import PgVectorStore
+            self._vector_store = PgVectorStore(user_id=self._user_id)
+        return self._vector_store
+
+    def _embed_reply_async(self, session_id: str, content: str):
+        """Fire-and-forget: 将 assistant reply 嵌入向量数据库。"""
+        import asyncio
+        async def _do():
+            try:
+                vs = self.vector_store
+                # 生成一个简单的 msg_id 标识（实际 msg_id 在 outbox_publish 已生成）
+                msg_id = f"reply-{hashlib.md5(content[:200].encode()).hexdigest()[:16]}"
+                vs.add_message_embedding(session_id, msg_id, content, self._user_id)
+            except Exception:
+                pass  # 静默失败，不影响主流程
+        try:
+            asyncio.create_task(_do())
+        except Exception:
+            pass
+
+    def _recall_history_async(self, session_id: str, query_text: str):
+        """Fire-and-forget: 检索与用户消息相关的历史对话。"""
+        import asyncio
+        async def _do():
+            try:
+                vs = self.vector_store
+                threshold = float(os.environ.get("VECTOR_SIMILARITY_THRESHOLD", "0.75"))
+                results = vs.search_similar_messages(
+                    query_text, self._user_id, threshold=threshold, limit=5,
+                )
+                if results:
+                    logger.info("📚 向量召回 %d 条相关历史 | threshold=%.2f",
+                                len(results), threshold)
+                    # TODO: 将召回结果注入到后续 LLM 上下文（Store / system prompt）
+            except Exception:
+                pass
+        try:
+            asyncio.create_task(_do())
+        except Exception:
+            pass
         return self._redis
 
     # ── AgentError 处理 ─────────────────────────────────
@@ -543,6 +592,9 @@ class MainAgent:
 
         # 收到消息后立即推 status{received}（协议 v10 要求 <200ms ack）
         await self._push_status(session_id, "received", "收到，正在分析...", level="user")
+
+        # ── Phase 4: fire-and-forget 向量召回相关历史 ──
+        self._recall_history_async(session_id, user_content)
 
         # C1 安全前置过滤（regex 兜底 + 命中时 LLM 二次确认）
         safety = await self._node_safety_filter(session_id, user_content)
@@ -711,10 +763,16 @@ class MainAgent:
             "priorityKind": priority_kind,
         }
         try:
-            return await outbox_publish(
+            result = await outbox_publish(
                 self.redis, self._db, envelope,
                 correlation_id=self._correlation_id,
             )
+            # ── Phase 4: fire-and-forget embed assistant replies ──
+            if new_type == "message" and new_sub == "reply":
+                content = new_payload.get("content", "") if isinstance(new_payload, dict) else ""
+                if content:
+                    self._embed_reply_async(session_id, content)
+            return result
         except Exception as e:
             logger.warning(f"_push outbox failed: {e}")
             return ""

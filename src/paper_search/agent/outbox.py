@@ -54,7 +54,6 @@ PRIORITY_DEFAULTS: dict[tuple[str, str], str] = {
     ("error", "MAX_ROUNDS"):       "high",
     ("error", "PERMISSION_DENIED"): "high",
     ("pong", ""):                  "silent",
-    ("sync_complete", ""):         "silent",
     # ── v9 兼容（少数仍走 v9 路径的调用方）──
     ("message", "thinking"):       "silent",
     ("message", "text"):           "high",

@@ -359,7 +359,7 @@ class LongTermMemory:
 
     def __init__(self, db, chroma_store=None):
         self._db = db
-        self._chroma = chroma_store  # ChromaStoreV2 实例 (可选)
+        self._chroma = chroma_store  # PgVectorStore 实例 (可选)
         self._ensure_table()
 
     def _ensure_table(self):

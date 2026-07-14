@@ -140,7 +140,7 @@ def format_duration(seconds: float) -> str:
 
 def create_db(db_path: Optional[Path] = None):
     """创建 AgentDB 实例。"""
-    from ..agent.db import AgentDB
+    from ..agent.pgdb import PostgresAgentDB
     return AgentDB(db_path)
 
 

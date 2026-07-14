@@ -30,7 +30,7 @@ from langchain_core.messages import BaseMessage, SystemMessage
 from .message_trim import estimate_tokens
 
 if TYPE_CHECKING:
-    from .db import AgentDB
+    from .pgdb import PostgresAgentDB
     from .llm_client_v2 import LLMClientV2
 
 logger = logging.getLogger(__name__)

@@ -450,6 +450,121 @@ class PgVectorStore:
                 pass
             return 0
 
+    # ── 消息向量召回 (Phase 4) ──────────────────────────
+
+    def add_message_embedding(self, session_id: str, msg_id: str,
+                               text: str, user_id: str) -> bool:
+        """将 message/reply 文本嵌入并存入 message_embeddings 表。
+
+        Args:
+            session_id: 会话 ID
+            msg_id: ws_messages 中的消息 ID
+            text: message/reply 的 payload.content 原始文本
+            user_id: 用户 ID
+
+        Returns:
+            True 如果成功，False 如果失败
+        """
+        if not text or not text.strip():
+            return False
+
+        text = text.strip()[:4000]  # 截断过长的消息文本
+        try:
+            emb = self._embed_texts([text])[0]
+            emb_id = f"meb-{msg_id}"
+            cur = self.conn.cursor()
+            cur.execute(
+                """INSERT INTO message_embeddings (id, session_id, msg_id, user_id, content_text, embedding)
+                   VALUES (%s, %s, %s, %s, %s, %s::vector)
+                   ON CONFLICT (id) DO UPDATE SET
+                   content_text=EXCLUDED.content_text, embedding=EXCLUDED.embedding""",
+                (emb_id, session_id, msg_id, user_id, text, self._format_vector(emb)),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"PgVectorStore add_message_embedding 失败 ({msg_id[:8]}): {e}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return False
+
+    def search_similar_messages(self, query_text: str, user_id: str,
+                                 threshold: float = 0.75, limit: int = 5) -> list[dict]:
+        """语义检索与查询文本相似的历史消息。
+
+        使用余弦相似度（1 - cosine_distance）。
+        可选 Redis 缓存避免重复的 embedding API 调用。
+
+        Args:
+            query_text: 用户当前消息文本
+            user_id: 用户 ID（数据隔离）
+            threshold: 相似度阈值（默认 0.75），只返回 >= threshold 的结果
+            limit: 最大返回数量
+
+        Returns:
+            [{"msg_id": "...", "content_text": "...", "similarity": 0.85, "session_id": "..."}, ...]
+        """
+        if not query_text or not query_text.strip():
+            return []
+
+        # ── Redis 缓存（可选） ──
+        cache_key = f"vec:cache:{user_id}:{hashlib.md5(query_text.encode()).hexdigest()}"
+        cache_ttl = int(os.environ.get("VECTOR_CACHE_TTL", "900"))  # 默认 15 分钟
+        redis_url = os.environ.get("REDIS_URL", "")
+
+        if redis_url:
+            try:
+                import redis
+                r = redis.from_url(redis_url, decode_responses=True)
+                cached = r.get(cache_key)
+                if cached:
+                    return json.loads(cached)
+            except Exception:
+                pass  # Redis 不可用时降级到直接查 PG
+
+        # ── 查询 PG ──
+        try:
+            emb = self._embed_texts([query_text])[0]
+            cur = self.conn.cursor(cursor_factory=self._extras.RealDictCursor)
+            similarity_expr = f"1 - (embedding <=> %s::vector)"
+            cur.execute(
+                f"""SELECT msg_id, session_id, content_text,
+                       {similarity_expr} AS similarity
+                   FROM message_embeddings
+                   WHERE user_id = %s
+                     AND 1 - (embedding <=> %s::vector) >= %s
+                   ORDER BY embedding <=> %s::vector
+                   LIMIT %s""",
+                (self._format_vector(emb), user_id, self._format_vector(emb),
+                 threshold, self._format_vector(emb), limit),
+            )
+            rows = cur.fetchall()
+            results = [
+                {
+                    "msg_id": r["msg_id"],
+                    "session_id": r["session_id"],
+                    "content_text": r["content_text"],
+                    "similarity": round(float(r["similarity"]), 4),
+                }
+                for r in rows
+            ]
+
+            # ── 写缓存 ──
+            if redis_url and results:
+                try:
+                    import redis
+                    r = redis.from_url(redis_url, decode_responses=True)
+                    r.setex(cache_key, cache_ttl, json.dumps(results, ensure_ascii=False))
+                except Exception:
+                    pass
+
+            return results
+        except Exception as e:
+            logger.warning(f"PgVectorStore search_similar_messages 失败: {e}")
+            return []
+
     # ── 工具方法 ────────────────────────────────────────
 
     def get_embedding(self, paper_id: str) -> Optional[list[float]]:

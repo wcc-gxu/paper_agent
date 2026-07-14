@@ -138,28 +138,20 @@ class AgentBootstrap:
 
     async def _build_core(self, manifest_data: dict, llm_provider: str = "deepseek"):
         """统一构建 db / llm / tools / memory，避免 _create/_resume 重复代码。"""
-        from ..config import use_postgresql
 
-        # 1. DB: PostgreSQL 或 SQLite
-        if use_postgresql():
-            from ..agent.pgdb import PostgresAgentDB
-            self._db = PostgresAgentDB()
-            logger.info("Database: PostgreSQL")
-        else:
-            from ..agent.db import AgentDB
-            db_path = self.data_dir / "agent.db"
-            self._db = AgentDB(db_path)
-            # 触发 schema + migrations
-            _ = self._db.conn
-            logger.info(f"Database: SQLite ({db_path})")
+        # 1. DB: PostgreSQL (DATABASE_URL 必须设置)
+        from ..agent.pgdb import PostgresAgentDB
+        self._db = PostgresAgentDB()
+        logger.info("Database: PostgreSQL")
 
         # 2. LLMClientV2
         from ..agent.llm_client_v2 import LLMClientV2
         self._llm = LLMClientV2(provider=llm_provider)
         logger.info("LLM client initialized")
 
-        # 3. ToolRegistry
-        from ..agent.tool_registry import ToolRegistry
+        # 3. ToolRegistry — inject DB singleton
+        from ..agent.tool_registry import ToolRegistry, set_db
+        set_db(self._db)  # 替代 66 处惰性 AgentDB() 调用
         self._tools = ToolRegistry.get_instance()
         logger.info(f"ToolRegistry: {len(self._tools.tool_names)} tools")
 
@@ -167,14 +159,9 @@ class AgentBootstrap:
         from ..agent.memory import MemoryManager
         chroma = None
         try:
-            if use_postgresql():
-                from ..agent.pgvector_store import PgVectorStore
-                chroma = PgVectorStore(user_id=self.user_id)
-                logger.info("PgVectorStore initialized")
-            else:
-                from ..agent.chroma_store import ChromaStoreV2
-                chroma = ChromaStoreV2()
-                logger.info("ChromaDB initialized")
+            from ..agent.pgvector_store import PgVectorStore
+            chroma = PgVectorStore(user_id=self.user_id)
+            logger.info("PgVectorStore initialized")
         except Exception as e:
             logger.warning(f"Vector store unavailable (knowledge tools degrade): {e}")
         self._memory = MemoryManager(self._db, chroma)

@@ -51,13 +51,8 @@ _capabilities_cache: dict = {}  # (agent_id, session_id) → list[str]
 def get_db():
     global _db
     if _db is None:
-        from ..config import use_postgresql
-        if use_postgresql():
-            from ..agent.pgdb import PostgresAgentDB
-            _db = PostgresAgentDB()
-        else:
-            from ..agent.db import AgentDB
-            _db = AgentDB()
+        from ..agent.pgdb import PostgresAgentDB
+        _db = PostgresAgentDB()
     return _db
 
 
@@ -82,13 +77,8 @@ def get_llm():
 def get_chroma():
     global _chroma
     if _chroma is None:
-        from ..config import use_postgresql
-        if use_postgresql():
-            from ..agent.pgvector_store import PgVectorStore
-            _chroma = PgVectorStore()
-        else:
-            from ..agent.chroma_store import ChromaStoreV2
-            _chroma = ChromaStoreV2()
+        from ..agent.pgvector_store import PgVectorStore
+        _chroma = PgVectorStore()
     return _chroma
 
 
@@ -228,18 +218,15 @@ if _docs_dir.exists():
 @app.websocket("/ws/chat/{agent_id}/{session_id}")
 async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
                   token: str = Query(None)):
-    """WebSocket 中继 — v10.1 协议 + JWT 认证 + Phase 1 outbox 模式。
+    """WebSocket 中继 — v10.2 协议 + JWT 认证 + outbox 模式。
 
     - 连接: ws://host/ws/chat/{agent_id}/{session_id}?token=<jwt>
     - JWT 验证: token 无效则拒绝连接 (code 4001)
-    - 连接即用，不需要额外握手
     - 收消息 → LPUSH agent:ws:{agent_id} → Daemon 消费
     - Daemon 通过 outbox_publish 写消息 → API 进程的 outbox_poller
       从 outbox:{agent_id} BRPOP → 这里 send_text
-    - sync_request: 客户端发 sync_request → 拉取未送达的历史消息回放
+    - 历史消息通过 REST API 拉取: GET /api/sessions/{id}/messages
     - 永不主动断开连接
-
-    v3 Phase 1: JWT 验证后 user_id 来自 token payload。
     """
     import json as _json
     import os
@@ -298,50 +285,6 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
                 logger.warning(f"Redis LPUSH attempt {attempt+1}/3: {e}")
                 await _asyncio.sleep(0.5)
         return False
-
-    # ── Phase 1: sync_request 处理（拉历史消息） ──────────
-    async def _handle_sync_request(msg: dict):
-        """iOS 重连后请求拉取未送达的历史消息。
-
-        请求格式: {type: "sync_request", payload: {last_msg_id?: "..."}}
-        响应: 多条历史 envelope + {type: "sync_complete", payload: {synced_count: N}}
-        """
-        payload = msg.get("payload", {}) or {}
-        last_msg_id = payload.get("last_msg_id", "")
-        try:
-            history = db.get_undelivered_messages(
-                agent_id, session_id, since_msg_id=last_msg_id,
-            )
-        except Exception as e:
-            logger.warning(f"sync_request: get_undelivered failed: {e}")
-            history = []
-
-        synced = 0
-        for env in history:
-            try:
-                await websocket.send_text(_json.dumps(env, ensure_ascii=False, default=str))
-                mid = env.get("msg_id", "")
-                if mid:
-                    try:
-                        db.mark_message_delivered(mid, session_id)
-                    except Exception:
-                        pass
-                synced += 1
-            except Exception as e:
-                logger.warning(f"sync_request: send failed at #{synced}: {e}")
-                break
-
-        try:
-            await websocket.send_text(_json.dumps({
-                "type": "sync_complete",
-                "role": "assistant",
-                "agentId": agent_id,
-                "sessionId": session_id,
-                "payload": {"synced_count": synced},
-            }, ensure_ascii=False))
-        except Exception:
-            pass
-        logger.info("🔄 SYNC | agent=%s sess=%s replayed=%d", agent_id, session_id, synced)
 
     # ── 主消息循环 (永不主动断开) ──────────────────────
     while True:
@@ -417,11 +360,6 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
                 }, ensure_ascii=False))
             except Exception:
                 pass
-            continue
-
-        # v10: sync (新名) + v9: sync_request (旧名) → 回放未送达历史
-        if msg_type in ("sync", "sync_request"):
-            await _handle_sync_request(msg)
             continue
 
         # v10 入站类型 → 转写为 main_agent 期望的 v9 形态再 LPUSH

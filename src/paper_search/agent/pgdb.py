@@ -5,7 +5,7 @@ API 完全兼容 AgentDB（db.py），调用方只需更换导入路径即可切
 
 连接:
     DATABASE_URL 环境变量 → PostgreSQL 连接字符串
-    未设置时回退到 SQLite（通过 config.use_postgresql() 判断）
+    DATABASE_URL 必须设置
 
 使用示例:
     db = PostgresAgentDB()
@@ -632,18 +632,94 @@ class PostgresAgentDB:
         direction = "inbound" if envelope.get("role") == "user" else "outbound"
         msg_type = envelope.get("type", "message")
         subtype = envelope.get("subType", "")
-        payload = envelope.get("payload", {})
-        if isinstance(payload, dict):
-            payload = json.dumps(payload, ensure_ascii=False)
+        payload_raw = envelope.get("payload", {})
+        if isinstance(payload_raw, dict):
+            payload_str = json.dumps(payload_raw, ensure_ascii=False)
+        else:
+            payload_str = str(payload_raw)
+            payload_raw = {}
         priority = envelope.get("priorityKind") or envelope.get("priority", "normal")
         seq = envelope.get("seq", 0)
+
+        # ── Upsert dedup: keep only the latest state per entity ──
+        # Tool messages: same session + tool_call_id → replace old state
+        tool_call_id = payload_raw.get("tool_call_id", "") if isinstance(payload_raw, dict) else ""
+        if msg_type == "tool" and tool_call_id:
+            self._execute(
+                "DELETE FROM ws_messages WHERE session_id = %s AND msg_type = 'tool' AND payload->>'tool_call_id' = %s",
+                (session_id, tool_call_id),
+            )
+        # plan_todo_update: same session + plan_id → replace old state
+        plan_id = payload_raw.get("plan_id", "") if isinstance(payload_raw, dict) else ""
+        if msg_type == "plan_todo_update" and plan_id:
+            self._execute(
+                "DELETE FROM ws_messages WHERE session_id = %s AND msg_type = 'plan_todo_update' AND payload->>'plan_id' = %s",
+                (session_id, plan_id),
+            )
 
         self._execute(
             """INSERT INTO ws_messages (id, session_id, user_id, seq, direction, msg_type, subtype, payload, priority_kind, correlation_id)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)""",
-            (msg_id, session_id, user_id, seq, direction, msg_type, subtype, payload, priority, correlation_id),
+            (msg_id, session_id, user_id, seq, direction, msg_type, subtype, payload_str, priority, correlation_id),
         )
         return msg_id
+
+    def get_final_state_messages(self, session_id: str, since_ts: str = "",
+                                  limit: int = 200) -> list[dict]:
+        """获取 session 的最终状态消息（去重，REST API 用）。
+
+        去重规则:
+          - tool/* 消息: 同一 tool_call_id 只保留最新一条
+          - plan_todo_update: 同一 plan_id 只保留最新一条
+          - 其他: 按 msg_id 保留（不重复）
+          - priority_kind='silent' 的消息始终排除
+        """
+        sql = """
+            SELECT * FROM (
+                SELECT DISTINCT ON (dedup_key) *,
+                    CASE
+                        WHEN msg_type = 'tool'
+                             AND payload->>'tool_call_id' IS NOT NULL
+                            THEN 'tool:' || (payload->>'tool_call_id')
+                        WHEN msg_type = 'plan_todo_update'
+                             AND payload->>'plan_id' IS NOT NULL
+                            THEN 'plan:' || (payload->>'plan_id')
+                        ELSE 'msg:' || COALESCE(id, '')
+                    END AS dedup_key
+                FROM ws_messages
+                WHERE session_id = %s
+                  AND priority_kind != 'silent'
+            """
+        params: list = [session_id]
+        if since_ts:
+            sql += " AND created_at > %s"
+            params.append(since_ts)
+        sql += """
+                ORDER BY dedup_key, created_at DESC
+            ) sub
+            ORDER BY created_at ASC
+            LIMIT %s
+        """
+        params.append(limit)
+        rows = self._fetchall(sql, tuple(params))
+        # Convert to envelope format
+        out = []
+        for r in rows:
+            try:
+                payload = json.loads(r.get("payload", "{}")) if isinstance(r.get("payload"), str) else (r.get("payload") or {})
+            except (ValueError, TypeError):
+                payload = {}
+            out.append({
+                "msg_id": r.get("id", ""),
+                "type": r.get("msg_type", ""),
+                "subType": r.get("subtype", ""),
+                "sessionId": r.get("session_id", ""),
+                "timestamp": str(r.get("created_at", "")),
+                "payload": payload,
+                "priority": r.get("priority_kind", "normal"),
+                "priorityKind": r.get("priority_kind", "normal"),
+            })
+        return out
 
     def mark_message_delivered(self, msg_id: str, session_id: str):
         self._execute(
