@@ -213,6 +213,24 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-pro")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek")
 
 # ═══════════════════════════════════════════════════════════════
+# Embedding API 配置 (独立于 LLM chat API)
+# ═══════════════════════════════════════════════════════════════
+
+EMBEDDING_API_KEY = os.environ.get(
+    "EMBEDDING_API_KEY",
+    "your-embedding-api-key",
+)
+EMBEDDING_BASE_URL = os.environ.get(
+    "EMBEDDING_BASE_URL",
+    "https://ark.cn-beijing.volces.com/api/plan/v3",
+)
+EMBEDDING_MODEL = os.environ.get(
+    "EMBEDDING_MODEL",
+    "doubao-embedding-vision",
+)
+EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "1024"))
+
+# ═══════════════════════════════════════════════════════════════
 # Model Routing — 模型路由表 (全部走 DeepSeek API)
 # ═══════════════════════════════════════════════════════════════
 #

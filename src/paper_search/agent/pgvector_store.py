@@ -24,26 +24,26 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-def _get_embedding(texts: list[str], model: str = "doubao-embedding") -> list[list[float]]:
-    """调用 LLM embedding API 生成向量。
+def _get_embedding(texts: list[str], model: str | None = None) -> list[list[float]]:
+    """调用 Embedding API 生成向量。
 
-    使用 LLM_API_KEY + LLM_BASE_URL 配置，fallback 到 VOLCANO_API_KEY。
-    返回与输入 texts 等长的 embedding 列表。
+    使用独立的 EMBEDDING_* 环境变量配置，与 LLM chat API 完全分离。
+    当前配置为火山引擎 Agent Plan (doubao-embedding-vision, 1024 维)。
+
     如果 API 不可用，返回零向量作为占位（调用方应处理这种情况）。
     """
-    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("VOLCANO_API_KEY", "")
-    if not api_key:
-        logger.warning("LLM_API_KEY 未设置，embedding 返回零向量")
-        return [[0.0] * 1024 for _ in texts]
+    from paper_search.config import EMBEDDING_API_KEY, EMBEDDING_BASE_URL, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
 
-    base_url = os.environ.get("LLM_BASE_URL", "https://api.deepseek.com/anthropic")
-    # 从 anthropic-compatible URL 推导 embeddings URL
-    if "deepseek" in base_url:
-        emb_url = "https://api.deepseek.com/v1/embeddings"
-    elif "volces" in base_url:
-        emb_url = "https://ark.cn-beijing.volces.com/api/v3/embeddings"
-    else:
-        emb_url = base_url.rstrip("/") + "/../embeddings"
+    if not texts:
+        return []
+
+    api_key = EMBEDDING_API_KEY
+    if not api_key:
+        logger.warning("EMBEDDING_API_KEY 未设置，embedding 返回零向量")
+        return [[0.0] * EMBEDDING_DIMENSIONS for _ in texts]
+
+    model_name = model or EMBEDDING_MODEL
+    emb_url = EMBEDDING_BASE_URL.rstrip("/") + "/embeddings"
 
     try:
         import requests
@@ -54,20 +54,27 @@ def _get_embedding(texts: list[str], model: str = "doubao-embedding") -> list[li
                 "Content-Type": "application/json",
             },
             json={
-                "model": model,
+                "model": model_name,
                 "input": texts,
+                "dimensions": EMBEDDING_DIMENSIONS,
             },
             timeout=30,
         )
         if resp.status_code == 200:
             data = resp.json()
-            return [item["embedding"] for item in data["data"]]
+            embeddings = [item["embedding"] for item in data["data"]]
+            actual_dim = len(embeddings[0]) if embeddings else EMBEDDING_DIMENSIONS
+            if actual_dim != EMBEDDING_DIMENSIONS:
+                logger.warning(
+                    f"Embedding 维度不匹配: 期望 {EMBEDDING_DIMENSIONS}, 实际 {actual_dim}"
+                )
+            return embeddings
         else:
             logger.warning(f"Embedding API 返回 {resp.status_code}: {resp.text[:200]}")
-            return [[0.0] * 1024 for _ in texts]
+            return [[0.0] * EMBEDDING_DIMENSIONS for _ in texts]
     except Exception as e:
         logger.warning(f"Embedding API 调用失败: {e}")
-        return [[0.0] * 1024 for _ in texts]
+        return [[0.0] * EMBEDDING_DIMENSIONS for _ in texts]
 
 
 class PgVectorStore:
@@ -624,7 +631,7 @@ class PgVectorStore:
             paper_id: 论文 ID。
 
         Returns:
-            1024 维 embedding 列表，如果未找到则返回 None。
+            embedding 列表（维度由 EMBEDDING_DIMENSIONS 决定），如果未找到则返回 None。
         """
         try:
             cur = self.conn.cursor()
