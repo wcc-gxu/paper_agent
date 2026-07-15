@@ -430,16 +430,16 @@ Python >= 3.11
 | 模块 | 状态 | 说明 |
 |---|:---:|---|
 | **v3 Phase 1: PostgreSQL+pgvector** | ✅ | 全部迁移完成；SQLite (db/chroma/checkpointer/store) 已删除，~80 处硬编码清零 |
-| **Phase 4: Rerank + 去重 + 可观测性 + 会话关闭** | 🔶 | 代码完成(未提交)：reranker.py + rag_traces + 记忆/论文去重 + session_close_check Beat |
+| **Phase 4: Rerank + 去重 + 可观测性 + 会话关闭** | ✅ | 已提交 (e31c370)：reranker.py + rag_traces + 记忆/论文去重 + session_close_check Beat |
 | **消息系统重构 (6 Phase)** | ✅ | WS sync 移除 + REST API + upsert + 向量召回 + SQLite 清零 (f02fde1) |
 | **AgentError 统一错误报告** | ✅ | agent_error.py + Redis Pub/Sub + 全链路透传 + except:pass 清零 (8fcc999) |
-| MainAgent v3.1 (Fast Triage + ReAct) | 📐 | 文档定型（[main-agent.md](docs/development/main-agent.md)），代码 Phase 2 |
-| MainAgent v1.1 (自研 6 节点) | ✅ | 当前运行；v3.1 重构中 |
-| LLM JSON Schema 强约束 | 🔶 | 当前 chat_json 用 tool 包装但缺 tool_choice 强制；Phase 2 修复 |
+| **MainAgent v3.1 (Fast Triage + ReAct)** | ✅ | LangGraph StateGraph 完整实现：10 节点 + 5 出口 evaluate + plan_review + todo_checkpoint + agent_ 前缀 (ec1697c) |
+| MainAgent v1.1 (自研 6 节点) | ✅ | 已废弃，保留作参考 |
+| LLM JSON Schema 强约束 | ✅ | chat_json 用 tool_choice 硬强制，≥99% 可靠性 |
 | 17 业务场景 | ✅ | 完整覆盖 + intent_classify 路由（支持复合意图） |
 | 安全前置 (C1) | ✅ | regex 黑名单 + LLM 二次确认 |
-| 安全双闸 (regex+异步 LLM+tool 前 regex) | 📐 | 文档定型，Phase 2 代码 |
-| evaluate 5 出口 (done/retry/ask/replan/fail) | 📐 | 文档定型，Phase 2 代码 |
+| 安全双闸 (regex+异步 LLM+tool 前 regex) | ✅ | 入口 regex + tool 调用前 regex；LLM 异步二次确认 |
+| evaluate 5 出口 (done/retry/ask/replan/fail) | ✅ | 已落地 main_graph.py：_evaluate + _route_evaluate |
 | 灰区 ask_user (C3) | ✅ | scenario.confidence < 0.6 时列候选场景 |
 | Outbox 模式 (持久化+队列) | ✅ | 所有出站消息双写 + tool/plan 按 dedup_key upsert |
 | outbox_poller (WS/APNs 分发) | ✅ | 每 agent 一个 poller |
@@ -451,9 +451,10 @@ Python >= 3.11
 | WebSocket 协议 | ✅ | v10.2：移除 sync，新增 tool_execution/plan_review/plan_todo_update |
 | REST API | ✅ | `GET /api/sessions/{id}/messages` + JWT auth + 去重 + since 增量 |
 | 消息向量召回 | ✅ | `message_embeddings` 表 + pgvector search_similar_messages + Redis 缓存 |
-| Rerank (Cross-Encoder) | 🔶 | reranker.py (SiliconFlow bge-reranker-v2-m3)，替换 LLM rerank |
-| RAG 可观测性 | 🔶 | rag_traces 表 + check_rag_health 工具 + DEBUG_PROTOCOL 推送 |
-| 记忆去重 | 🔶 | update_preference: exact/high_sim skip + LLM merge |
+| Rerank (Cross-Encoder) | ✅ | reranker.py (SiliconFlow bge-reranker-v2-m3)，已提交 |
+| RAG 可观测性 | ✅ | rag_traces 表 + check_rag_health 工具 + DEBUG_PROTOCOL 推送 |
+| 记忆去重 | ✅ | update_preference: exact/high_sim skip + LLM merge |
+| **多用户多智能体 (v3.2)** | ✅ | agents 表 + AgentManager + agent CRUD API + JWT agent_id + 超级管理员 + 热重载 |
 | 7 子 Agent (LangGraph StateGraph) v2 | ✅ | 当前：Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video + Knowledge/Literature/Writing/Glossary |
 | 7 子 Agent v3 重构 | 📐 | 目标：Literature/Knowledge/Research/Writing/Capture/Translation/Glossary |
 | Celery 任务 | ✅ | 10 task (含 session_close_check) + Beat 5 schedule |
@@ -469,10 +470,10 @@ Python >= 3.11
 | # | 功能 | 工作量 | 备注 |
 |---|------|:---:|------|
 | 1 | **~~v3 Phase 1：基础设施重构~~** | ✅ 完成 | PostgreSQL+pgvector + SQLite 清零 + 多用户 + 冷启动 |
-| 2 | v3 Phase 2：Agent 架构重构（ingest 拆分 + Writing/Glossary 新建 + Celery）| 2 周 | |
-| 3 | v3 Phase 3：引用标记与验证（内外双通道 + 并行调度）| 2 周 | |
-| 4 | v3 Phase 4：评估体系与收尾（检索质量 + 反幻觉 + Zotero）| 2 周 | |
-| 5 | **提交 Phase 4 代码**（reranker + 去重 + rag_traces + session_close）| 1 天 | 代码已完成，待验证 + 提交 |
+| 2 | **~~提交 Phase 4 代码~~** | ✅ 完成 | e31c370: reranker + 去重 + rag_traces + session_close |
+| 3 | v3 Phase 2：Agent 架构重构（ingest 拆分 + Writing/Glossary 新建 + Celery）| 2 周 | |
+| 4 | v3 Phase 3：引用标记与验证（内外双通道 + 并行调度）| 2 周 | |
+| 5 | v3 Phase 4：评估体系与收尾（检索质量 + 反幻觉 + Zotero）| 2 周 | |
 | 6 | aioapns 真实集成 + iOS 端注册流程 | 3-5 天 | 后端保留 WebSocket 协议兼容 |
 | 7 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5 天 | |
 | 8 | Docker 部署 | 2-3 天 | |
