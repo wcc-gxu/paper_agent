@@ -499,6 +499,123 @@ class PostgresAgentDB:
         return [self._paper_from_row(r) for r in rows]
 
     # ═══════════════════════════════════════════════════════════════
+    # 精确元数据查找 (KnowledgeAgent local PDF ingest)
+    # ═══════════════════════════════════════════════════════════════
+
+    def find_paper_by_title_exact(self, title: str, user_id: str = None) -> Optional[dict]:
+        """标题精确匹配 — 小写去标点后比较。
+
+        用于快速去重：<1ms/篇。
+        """
+        # 标准化：小写 + 去标点 + 合并空白
+        import re
+        normalized = re.sub(r'[^\w\s]', '', title.lower())
+        normalized = re.sub(r'\s+', ' ', normalized).strip()
+        if len(normalized) < 5:
+            return None
+
+        params = [f"%{normalized}%"]  # LIKE fallback: 标题中可能含有多余前缀/后缀
+        if user_id:
+            sql = """SELECT * FROM papers
+                     WHERE user_id = %s
+                       AND LOWER(REGEXP_REPLACE(title, '[^\\w\\s]', '', 'g')) = %s
+                     LIMIT 1"""
+            params = [user_id, normalized]
+        else:
+            sql = """SELECT * FROM papers
+                     WHERE LOWER(REGEXP_REPLACE(title, '[^\\w\\s]', '', 'g')) = %s
+                     LIMIT 1"""
+
+        row = self._fetchone(sql, tuple(params))
+        return self._paper_from_row(row) if row else None
+
+    def find_papers_by_metadata(self, filters: dict, user_id: str = None,
+                                 limit: int = 50) -> list[dict]:
+        """多字段组合 AND 精确查询。
+
+        filters 支持: title (LIKE), author, year, doi, source, venue
+        """
+        conditions = []
+        params = []
+
+        if user_id:
+            conditions.append("user_id = %s")
+            params.append(user_id)
+
+        if "title" in filters:
+            conditions.append("LOWER(title) LIKE %s")
+            params.append(f"%{filters['title'].lower()}%")
+        if "author" in filters:
+            conditions.append("authors::text ILIKE %s")
+            params.append(f"%{filters['author']}%")
+        if "year" in filters:
+            conditions.append("year = %s")
+            params.append(int(filters["year"]))
+        if "doi" in filters:
+            conditions.append("LOWER(doi) = %s")
+            params.append(filters["doi"].lower())
+        if "source" in filters:
+            conditions.append("source = %s")
+            params.append(filters["source"])
+        if "venue" in filters:
+            conditions.append("venue ILIKE %s")
+            params.append(f"%{filters['venue']}%")
+
+        if not conditions:
+            return []
+
+        where = " AND ".join(conditions)
+        rows = self._fetchall(
+            f"SELECT * FROM papers WHERE {where} ORDER BY year DESC LIMIT %s",
+            tuple(params + [limit]),
+        )
+        return [self._paper_from_row(r) for r in rows]
+
+    # ═══════════════════════════════════════════════════════════════
+    # 论文图表 + 归档 (KnowledgeAgent local PDF ingest)
+    # ═══════════════════════════════════════════════════════════════
+
+    def save_paper_figure(self, figure: dict) -> str:
+        """写入 paper_figures 表。figure 含 id, paper_id, caption, figure_type,
+        local_path, oss_path, page_number, image_hash."""
+        self._execute(
+            """INSERT INTO paper_figures (id, paper_id, caption, figure_type,
+               local_path, oss_path, page_number, image_hash)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (id) DO UPDATE SET
+               caption = EXCLUDED.caption, oss_path = EXCLUDED.oss_path""",
+            (figure["id"], figure["paper_id"], figure.get("caption", ""),
+             figure.get("figure_type", "figure"), figure.get("local_path", ""),
+             figure.get("oss_path", ""), figure.get("page_number"), figure.get("image_hash", "")),
+        )
+        return figure["id"]
+
+    def get_paper_figures(self, paper_id: str) -> list[dict]:
+        """获取某篇论文的所有图表元数据."""
+        rows = self._fetchall(
+            "SELECT * FROM paper_figures WHERE paper_id = %s ORDER BY page_number",
+            (paper_id,),
+        )
+        return [dict(r) for r in rows]
+
+    def archive_pdf(self, paper_id: str, original_path: str, oss_path: str,
+                    file_size: int = 0, md5_hash: str = "") -> str:
+        """记录 PDF 归档信息."""
+        archive_id = _uuid("arc")
+        self._execute(
+            """INSERT INTO paper_archives (id, paper_id, original_pdf_path,
+               oss_pdf_path, file_size_bytes, md5_hash)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (archive_id, paper_id, original_path, oss_path, file_size, md5_hash),
+        )
+        # 更新 papers 表的 file_path 指向归档位置
+        self._execute(
+            "UPDATE papers SET file_path = %s, updated_at = %s WHERE id = %s",
+            (oss_path, _now(), paper_id),
+        )
+        return archive_id
+
+    # ═══════════════════════════════════════════════════════════════
     # 项目-论文关联
     # ═══════════════════════════════════════════════════════════════
 

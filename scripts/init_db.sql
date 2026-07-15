@@ -668,6 +668,37 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- ============================================================
+-- 12. 论文图表元数据 (KnowledgeAgent local PDF ingest)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS paper_figures (
+    id              TEXT PRIMARY KEY,                -- UUID
+    paper_id        TEXT NOT NULL,                   -- 所属论文
+    caption         TEXT,                            -- 图表标题/caption
+    figure_type     TEXT NOT NULL DEFAULT 'figure',  -- figure / table_image
+    local_path      TEXT,                            -- 本地临时路径
+    oss_path        TEXT,                            -- OSS 归档路径
+    page_number     INT,                             -- PDF 页码
+    image_hash      TEXT,                            -- MD5 去重
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_paper_figures_paper ON paper_figures(paper_id);
+
+-- ============================================================
+-- 13. PDF 归档记录
+-- ============================================================
+CREATE TABLE IF NOT EXISTS paper_archives (
+    id                  TEXT PRIMARY KEY,
+    paper_id            TEXT NOT NULL,
+    original_pdf_path   TEXT,                        -- 原始 PDF 路径
+    oss_pdf_path        TEXT,                        -- 归档后的 OSS 路径
+    file_size_bytes     BIGINT,
+    md5_hash            TEXT,
+    archived_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_paper_archives_paper ON paper_archives(paper_id);
+CREATE INDEX IF NOT EXISTS idx_paper_archives_date ON paper_archives(archived_at);
+
+-- ============================================================
 -- 默认数据：创建默认用户（存量数据归属）
 -- ============================================================
 INSERT INTO users (id, username, display_name, api_token, role)

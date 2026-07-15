@@ -23,7 +23,10 @@ LangGraph 双图结构:
 from __future__ import annotations
 
 import logging
+import os
+import re
 import time
+from pathlib import Path
 from typing import Annotated, Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -52,6 +55,51 @@ class KnowledgeIngestState(TypedDict, total=False):
     # 输出
     indexed_count: int
     ranked_count: int
+    result: Optional[dict]
+    error: Optional[str]
+
+
+class KnowledgeIngestLocalState(TypedDict, total=False):
+    """本地 PDF 入库 State — 从 PDF 目录出发，完整入库流程。"""
+    # 输入
+    pdf_dir: str
+    project_id: str
+    user_id: str
+
+    # Phase 1: 扫描
+    discovered_pdfs: list[str]
+    total_files: int
+
+    # Phase 2: 快速标题去重
+    fast_deduped: list[dict]
+    fast_dup_count: int
+
+    # Phase 3: PDF→MD 转换
+    converted: list[dict]
+    convert_failed: list[dict]
+
+    # Phase 4: 元数据提取
+    papers_meta: list[dict]
+    meta_quality: dict
+
+    # Phase 5: 图表提取
+    figures: list[dict]
+    tables: list[dict]
+
+    # Phase 6: 摘要向量去重
+    vector_deduped: list[dict]
+    vector_dup_count: int
+
+    # Phase 7: 分块索引
+    indexed: list[dict]
+    index_errors: list[dict]
+
+    # Phase 8: PDF 清理
+    cleaned_pdfs: list[str]
+
+    # 全局
+    current_phase: str
+    errors: list[dict]
     result: Optional[dict]
     error: Optional[str]
 
@@ -109,7 +157,7 @@ class KnowledgeAgent:
     DEFAULT_COLLECTIONS = ["papers_abstract", "papers_fulltext"]
 
     def __init__(self, db=None, vector_store=None, llm_client=None,
-                 runner=None, on_progress=None):
+                 runner=None, on_progress=None, oss_dir: str = ""):
         """
         Args:
             db: AgentDB / PostgresAgentDB 实例
@@ -117,6 +165,7 @@ class KnowledgeAgent:
             llm_client: LLMClientV2 实例
             runner: PipelineRunner 实例（有 runner 时走 runner 方法）
             on_progress: 进度回调
+            oss_dir: OSS 归档根目录 (local PDF ingest 用)
         """
         self.db = db
         self.vector_store = vector_store
@@ -125,6 +174,10 @@ class KnowledgeAgent:
         self._on_progress = on_progress
         self._ingest_graph = None
         self._query_graph = None
+        self._ingest_local_graph = None
+        self.oss_dir = oss_dir or os.path.join(
+            os.path.expanduser("~"), ".paper_search", "oss",
+        )
 
     # ═══════════════════════════════════════════════════════════
     # Ingest Graph: chunk → embed → dedup → rank
@@ -598,6 +651,592 @@ class KnowledgeAgent:
         except Exception as e:
             logger.error(f"find_related failed: {e}")
             return []
+
+    # ═══════════════════════════════════════════════════════════════
+    # Local PDF Ingest — 本地 PDF 入库 (8 Phase)
+    # ═══════════════════════════════════════════════════════════════
+
+    def compile_ingest_local(self, checkpointer=None):
+        """编译本地 PDF 入库子图（单节点，8 phase 内部串联）。"""
+        builder = StateGraph(KnowledgeIngestLocalState)
+        builder.add_node("ingest_local_pdfs", self._ingest_local_pdfs)
+        builder.add_edge(START, "ingest_local_pdfs")
+        builder.add_edge("ingest_local_pdfs", END)
+        self._ingest_local_graph = builder.compile(checkpointer=checkpointer)
+        return self._ingest_local_graph
+
+    async def run_ingest_local(self, pdf_dir: str, project_id: str,
+                                user_id: str = "user-default") -> dict:
+        """入口：本地 PDF 目录 → 全量入库。"""
+        if self._ingest_local_graph is None:
+            self.compile_ingest_local()
+        state = {
+            "pdf_dir": pdf_dir,
+            "project_id": project_id,
+            "user_id": user_id,
+            "errors": [],
+        }
+        result = await self._ingest_local_graph.ainvoke(state)
+        return result.get("result", {})
+
+    # ── 主节点: _ingest_local_pdfs ─────────────────────
+
+    async def _ingest_local_pdfs(self, state: KnowledgeIngestLocalState) -> dict:
+        """本地 PDF 入库主节点 — 8 Phase 串联。
+
+        Phase 1: 扫描发现 PDF 文件
+        Phase 2: 快速标题去重 (DB 精确匹配)
+        Phase 3: PDF→MD 批量转换
+        Phase 4: MD 元数据提取 + 质量评估
+        Phase 5: 图表提取 (figure→OSS, table→MD)
+        Phase 6: 摘要向量去重
+        Phase 7: 分块 + 向量索引 (复用已有 ingest 流程)
+        Phase 8: PDF 清理 (移动到 OSS 归档目录)
+        """
+        pdf_dir = state["pdf_dir"]
+        project_id = state.get("project_id", "proj-local-ingest")
+        user_id = state.get("user_id", "user-default")
+        errors: list[dict] = list(state.get("errors", []))
+
+        dp = Path(pdf_dir)
+        if not dp.exists():
+            return {"error": f"PDF 目录不存在: {pdf_dir}", "result": {"success": False}}
+
+        # ── P1: 扫描 ──
+        await self._notify("scan", 0, 1, "正在扫描 PDF 文件...", 0, 0)
+        pdfs = list(dp.rglob("*.pdf"))
+        total = len(pdfs)
+        await self._notify("scan", 0, 1, f"发现 {total} 个 PDF 文件", 0, total)
+        if not pdfs:
+            return {"result": {"success": True, "total": 0, "message": "没有找到 PDF 文件"}}
+
+        # ── P2: 快速标题去重 ──
+        fast_deduped, fast_dup_count = await self._phase2_fast_title_dedup(
+            pdfs, user_id, total,
+        )
+
+        # ── P3: PDF→MD 转换 ──
+        converted, convert_failed = await self._phase3_convert_pdfs(
+            fast_deduped, project_id, total,
+        )
+
+        # ── P4: 元数据提取 ──
+        papers_meta, meta_quality = await self._phase4_extract_metadata(
+            converted, total,
+        )
+
+        # ── P5: 图表提取 ──
+        figures, tables = await self._phase5_extract_figures(
+            converted, papers_meta, user_id,
+        )
+
+        # ── P6: 摘要向量去重 ──
+        vector_deduped, vector_dup_count = await self._phase6_vector_dedup(
+            papers_meta, user_id,
+        )
+
+        # ── P7: 入库 + 索引 ──
+        indexed, index_errors = await self._phase7_index_papers(
+            vector_deduped, project_id, user_id, figures,
+        )
+
+        # ── P8: PDF 清理 ──
+        cleaned_pdfs = await self._phase8_cleanup_pdfs(
+            vector_deduped, user_id,
+        )
+
+        result = {
+            "success": True,
+            "total_files": total,
+            "fast_dup_count": fast_dup_count,
+            "converted_count": len(converted),
+            "convert_failed": len(convert_failed),
+            "meta_quality": meta_quality,
+            "figures_count": len(figures),
+            "tables_count": len(tables),
+            "vector_dup_count": vector_dup_count,
+            "indexed_count": len(indexed),
+            "index_errors": len(index_errors),
+            "cleaned_pdfs": len(cleaned_pdfs),
+            "errors": errors,
+        }
+        return {
+            "result": result,
+            "discovered_pdfs": [str(p) for p in pdfs],
+            "total_files": total,
+            "fast_deduped": fast_deduped,
+            "fast_dup_count": fast_dup_count,
+            "converted": converted,
+            "convert_failed": convert_failed,
+            "papers_meta": papers_meta,
+            "meta_quality": meta_quality,
+            "figures": figures,
+            "tables": tables,
+            "vector_deduped": vector_deduped,
+            "vector_dup_count": vector_dup_count,
+            "indexed": indexed,
+            "index_errors": index_errors,
+            "cleaned_pdfs": cleaned_pdfs,
+            "current_phase": "done",
+            "errors": errors,
+        }
+
+    # ── Phase 2: 快速标题去重 ──────────────────────────
+
+    async def _phase2_fast_title_dedup(
+        self, pdfs: list[Path], user_id: str, total: int,
+    ) -> tuple[list[dict], int]:
+        """P2: 基于文件名的候选标题进行 DB 精确匹配去重。"""
+        candidates = []
+        for p in pdfs:
+            # 从文件名提取候选标题 (Author_Year_Title.pdf)
+            stem = p.stem
+            parts = stem.split("_", 2)
+            title_candidate = parts[2] if len(parts) >= 3 else stem
+            title_candidate = title_candidate.replace("_", " ").strip()
+            candidates.append({"pdf_path": str(p), "title_candidate": title_candidate})
+
+        fast_deduped = []
+        dup_count = 0
+        for i, c in enumerate(candidates):
+            title = c["title_candidate"]
+            existing = None
+            if self.db and title:
+                try:
+                    existing = self.db.find_paper_by_title_exact(title, user_id)
+                except Exception:
+                    pass
+
+            if existing:
+                c["is_duplicate"] = True
+                c["existing_paper_id"] = existing.get("id", "")
+                dup_count += 1
+                await self._notify(
+                    "fast_dedup", i + 1, total,
+                    f"⏭ 重复: {c['title_candidate'][:60]}", i + 1, total,
+                )
+            else:
+                c["is_duplicate"] = False
+                fast_deduped.append(c)
+                if (i + 1) % 10 == 0:
+                    await self._notify(
+                        "fast_dedup", i + 1, total,
+                        f"快速去重: {i + 1}/{total} ({dup_count} dup)",
+                        i + 1, total,
+                    )
+
+        return fast_deduped, dup_count
+
+    # ── Phase 3: PDF→MD 转换 ───────────────────────────
+
+    async def _phase3_convert_pdfs(
+        self, pdfs: list[dict], project_id: str, total: int,
+    ) -> tuple[list[dict], list[dict]]:
+        """P3: 批量 PDF→MD 转换。"""
+        from ..pdf_converter import PDFConverter
+
+        output_dir = Path(self.oss_dir) / "papers"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        converter = PDFConverter(max_concurrent=4)
+
+        converted, failed = [], []
+        for i, item in enumerate(pdfs):
+            pdf_path = Path(item["pdf_path"])
+            md_path = await converter.convert(pdf_path, output_dir)
+            if md_path:
+                item["md_path"] = str(md_path)
+                converted.append(item)
+                if (i + 1) % 10 == 0:
+                    await self._notify(
+                        "convert", i + 1, len(pdfs),
+                        f"PDF→MD: {i+1}/{len(pdfs)} (ok={len(converted)} fail={len(failed)})",
+                        i + 1, len(pdfs),
+                    )
+            else:
+                item["convert_error"] = "转换失败"
+                failed.append(item)
+
+        return converted, failed
+
+    # ── Phase 4: 元数据提取 ────────────────────────────
+
+    async def _phase4_extract_metadata(
+        self, papers: list[dict], total: int,
+    ) -> tuple[list[dict], dict]:
+        """P4: 从 MD 前 500 行提取标题/期刊/DOI/作者。"""
+        papers_meta = []
+        extracted, failed = 0, 0
+        for i, p in enumerate(papers):
+            md_path = p.get("md_path", "")
+            meta = {"pdf_path": p["pdf_path"], "md_path": md_path}
+
+            if md_path:
+                try:
+                    md_text = Path(md_path).read_text(encoding="utf-8")[:3000]
+                    meta.update(self._extract_metadata_from_md(md_text))
+                    if meta.get("title", "").strip():
+                        extracted += 1
+                    else:
+                        # Fallback: 用文件名作为 title
+                        meta["title"] = p.get("title_candidate", "")
+                        failed += 1
+                except Exception:
+                    meta["title"] = p.get("title_candidate", "")
+                    failed += 1
+            else:
+                meta["title"] = p.get("title_candidate", "")
+                failed += 1
+
+            papers_meta.append(meta)
+
+        accuracy = round(extracted / max(len(papers), 1), 3)
+
+        # 混合评估: LLM 抽样 5 篇
+        sample_results = []
+        if self.llm and len(papers_meta) >= 5:
+            sample_results = await self._evaluate_metadata_quality(papers_meta[:5])
+
+        meta_quality = {
+            "extracted": extracted, "failed": failed,
+            "accuracy": accuracy, "sample_results": sample_results,
+        }
+        await self._notify(
+            "metadata", len(papers), total,
+            f"元数据提取: {extracted}/{len(papers)} (准确率 {accuracy:.0%})",
+            len(papers), total,
+        )
+        return papers_meta, meta_quality
+
+    @staticmethod
+    def _extract_metadata_from_md(md_text: str) -> dict:
+        """从 MD 文本前段提取元数据（纯规则，无外部 API）。"""
+        result = {"title": "", "journal": "", "doi": "", "authors": "", "year": 0}
+
+        lines = md_text.split("\n")
+        # Rule 1: 第一行非空行 → 候选标题 (优先 heading, 其次普通文本)
+        for line in lines[:10]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # 优先取 # 开头的 heading（pymupdf4llm 通常第一行就是标题）
+            if stripped.startswith("#"):
+                result["title"] = re.sub(r'^#+\s*', '', stripped)[:500]
+                break
+        if not result["title"]:
+            # Fallback: 取第一个非空普通行
+            for line in lines[:10]:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    result["title"] = stripped[:500]
+                    break
+
+        # Rule 2: 匹配 DOI
+        doi_pat = re.compile(
+            r'(?:DOI|doi)\s*[:=]?\s*(10\.\d{4,}/[^\s]+)|'
+            r'https?://doi\.org/(10\.\d{4,}/[^\s]+)',
+        )
+        for line in lines[:100]:
+            m = doi_pat.search(line)
+            if m:
+                result["doi"] = (m.group(1) or m.group(2)).strip()
+                break
+
+        # Rule 3: 匹配期刊/会议
+        venue_pats = [
+            r'(?:Published\sin|Conference|Journal|Proceedings of)\s*[:=]?\s*(.+?)(?:\n|$)',
+            r'(?:In\s+Proceedings\s+of)\s+(.+?)(?:\n|$)',
+        ]
+        for pat in venue_pats:
+            for line in lines[:50]:
+                m = re.search(pat, line, re.IGNORECASE)
+                if m:
+                    result["journal"] = m.group(1).strip()[:200]
+                    break
+            if result["journal"]:
+                break
+
+        # Rule 4: 匹配作者行
+        for line in lines[:20]:
+            stripped = line.strip()
+            if re.match(r'^[A-Z][a-z]+ [A-Z][a-z]+', stripped) and len(stripped) > 10:
+                result["authors"] = stripped[:300]
+                break
+
+        # Rule 5: 提取年份
+        year_pat = re.search(r'\b(19|20)\d{2}\b', md_text[:500])
+        if year_pat:
+            result["year"] = int(year_pat.group())
+
+        return result
+
+    async def _evaluate_metadata_quality(self, samples: list[dict]) -> list[dict]:
+        """LLM 抽样评估元数据提取质量。"""
+        if not self.llm:
+            return []
+        try:
+            sample_texts = []
+            for s in samples:
+                md_path = s.get("md_path", "")
+                if md_path:
+                    t = Path(md_path).read_text(encoding="utf-8")[:1000]
+                else:
+                    t = s.get("title", "")
+                sample_texts.append(
+                    f"提取结果: title={s.get('title','')}, journal={s.get('journal','')}\n"
+                    f"原文前段: {t[:300]}",
+                )
+
+            prompt = (
+                "评估以下论文元数据提取的准确性。对每条记录判断 title 和 journal "
+                "是否正确 (correct/incorrect/partial)。返回 JSON。\n\n"
+                + "\n\n---\n\n".join(sample_texts)
+            )
+            data = await self.llm.chat_json(
+                messages=[{"role": "user", "content": prompt}],
+                schema=None,  # free-form
+                temperature=0.1,
+                node="eval_metadata",
+            )
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.warning(f"元数据质量评估 LLM 调用失败: {e}")
+            return []
+
+    # ── Phase 5: 图表提取 ──────────────────────────────
+
+    async def _phase5_extract_figures(
+        self, papers: list[dict], papers_meta: list[dict], user_id: str,
+    ) -> tuple[list[dict], list[dict]]:
+        """P5: 从 PDF 提取图表。Figures→OSS, Tables→MD。
+
+        注意: 为提高效率，跳过已有 figures 目录的论文（幂等）。
+        """
+        from ..pdf_converter import PDFConverter
+
+        all_figures, all_tables = [], []
+        converter = PDFConverter(max_concurrent=2)
+
+        for i, p in enumerate(papers):
+            pdf_path = Path(p["pdf_path"])
+            paper_title = p.get("title_candidate", pdf_path.stem)
+            meta = papers_meta[i] if i < len(papers_meta) else {}
+            paper_id = self._paper_id_from_title(meta.get("title", paper_title))
+
+            figures_dir = Path(self.oss_dir) / "figures" / paper_id
+            md_dir = Path(self.oss_dir) / "papers"
+
+            if figures_dir.exists() and any(figures_dir.iterdir()):
+                continue  # 已提取过，skip
+
+            md_path, figures = await converter.convert_with_figures(
+                pdf_path, md_dir, figures_dir,
+            )
+            if figures:
+                # 写入 paper_figures 表
+                for fig in figures:
+                    if self.db:
+                        try:
+                            self.db.save_paper_figure({
+                                "id": fig["id"],
+                                "paper_id": paper_id,
+                                "caption": fig.get("caption", ""),
+                                "figure_type": fig.get("figure_type", "figure"),
+                                "local_path": fig.get("local_path", ""),
+                                "oss_path": str(figures_dir / f"{fig['id']}.png"),
+                                "page_number": fig.get("page_number", 0),
+                                "image_hash": fig.get("image_hash", ""),
+                            })
+                        except Exception:
+                            pass
+                all_figures.extend(figures)
+
+            # 更新 md_path（convert_with_figures 可能生成新的 MD）
+            if md_path:
+                p["md_path"] = str(md_path)
+                meta["md_path"] = str(md_path)
+
+            # 提取表格（从 MD 文本）
+            if md_path and md_path.exists():
+                md_text = md_path.read_text(encoding="utf-8")[:10000]
+                tables = self._extract_tables_from_md(md_text, paper_id)
+                all_tables.extend(tables)
+
+            if (i + 1) % 20 == 0:
+                await self._notify(
+                    "figures", i + 1, len(papers),
+                    f"图表提取: {len(all_figures)} figures, {len(all_tables)} tables",
+                    i + 1, len(papers),
+                )
+
+        return all_figures, all_tables
+
+    @staticmethod
+    def _extract_tables_from_md(md_text: str, paper_id: str) -> list[dict]:
+        """从 MD 文本中提取表格。"""
+        tables = []
+        # 匹配 Markdown 表格 (|...|...|)
+        table_pattern = re.compile(r'(\|.+\|[\r\n]+\|[-:\s|]+\|[\r\n]+(?:\|.+\|[\r\n]*)+)')
+        for match in table_pattern.finditer(md_text):
+            table_text = match.group(1).strip()
+            tables.append({
+                "paper_id": paper_id,
+                "table_text_md": table_text,
+                "position": match.start(),
+            })
+        return tables
+
+    # ── Phase 6: 摘要向量去重 ──────────────────────────
+
+    async def _phase6_vector_dedup(
+        self, papers_meta: list[dict], user_id: str,
+    ) -> tuple[list[dict], int]:
+        """P6: 摘要 embedding → pgvector 余弦相似度去重。
+
+        阈值: cosine ≥ 0.90 视为重复。
+        """
+        if not self.vector_store:
+            return papers_meta, 0
+
+        vector_deduped, dup_count = [], 0
+        for i, meta in enumerate(papers_meta):
+            title = meta.get("title", "")
+            if not title:
+                vector_deduped.append(meta)
+                continue
+
+            try:
+                results = self.vector_store.search_abstract(title, n_results=3)
+                if results:
+                    best = results[0]
+                    similarity = 1 - best.get("distance", 0)
+                    if similarity >= 0.90:
+                        meta["is_duplicate"] = True
+                        meta["vector_dup_of"] = best.get("paper_id", "")
+                        dup_count += 1
+                        continue
+            except Exception:
+                pass
+
+            vector_deduped.append(meta)
+
+        return vector_deduped, dup_count
+
+    # ── Phase 7: 入库 + 向量索引 ───────────────────────
+
+    async def _phase7_index_papers(
+        self, papers_meta: list[dict], project_id: str, user_id: str,
+        figures: list[dict],
+    ) -> tuple[list[dict], list[dict]]:
+        """P7: 论文入库 (DB) + 分块 + 向量索引 (复用已有 ingest 流程)。"""
+        from ..chunker import SectionChunker
+
+        indexed, index_errors = [], []
+        chunker = SectionChunker()
+
+        for i, meta in enumerate(papers_meta):
+            paper_id = self._paper_id_from_title(meta.get("title", ""))
+            try:
+                # A. 入库 paper 元数据
+                if self.db:
+                    paper = {
+                        "id": paper_id,
+                        "title": meta.get("title", ""),
+                        "authors": [meta.get("authors", "")] if meta.get("authors") else [],
+                        "year": meta.get("year", 0),
+                        "abstract": "",
+                        "venue": meta.get("journal", ""),
+                        "doi": meta.get("doi", ""),
+                        "source": "local_pdf",
+                        "file_path": meta.get("pdf_path", ""),
+                        "md_path": meta.get("md_path", ""),
+                        "status": "indexed",
+                    }
+                    # 读 MD 提取 abstract（前 2000 字符）
+                    md_path = meta.get("md_path", "")
+                    if md_path and Path(md_path).exists():
+                        md_text = Path(md_path).read_text(encoding="utf-8")
+                        paper["abstract"] = md_text[:2000]
+
+                    self.db.upsert_paper(paper, user_id=user_id)
+                    self.db.link_paper_to_project(project_id, paper_id)
+
+                # B. 分块 + 向量索引
+                md_path = meta.get("md_path", "")
+                if md_path and Path(md_path).exists() and self.vector_store:
+                    md_text = Path(md_path).read_text(encoding="utf-8")
+                    chunks = chunker.chunk(md_text, paper_id)
+                    if chunks:
+                        self.vector_store.add_fulltext_chunks(chunks)
+
+                    # 摘要向量索引
+                    title = meta.get("title", "")
+                    abstract = paper.get("abstract", md_text[:2000]) if "paper" in dir() else md_text[:2000]
+                    self.vector_store.add_paper_abstract(
+                        paper_id=paper_id, title=title, abstract=abstract,
+                    )
+
+                indexed.append({**meta, "paper_id": paper_id, "status": "indexed"})
+
+                if (i + 1) % 10 == 0:
+                    await self._notify(
+                        "index", i + 1, len(papers_meta),
+                        f"索引入库: {i+1}/{len(papers_meta)}", i + 1, len(papers_meta),
+                    )
+
+            except Exception as e:
+                logger.error(f"索引失败 [{paper_id}]: {e}")
+                index_errors.append({
+                    "paper_id": paper_id, "title": meta.get("title", ""),
+                    "error": str(e),
+                })
+
+        return indexed, index_errors
+
+    # ── Phase 8: PDF 清理 ──────────────────────────────
+
+    async def _phase8_cleanup_pdfs(
+        self, papers_meta: list[dict], user_id: str,
+    ) -> list[str]:
+        """P8: 成功入库的 PDF → OSS archive 目录。"""
+        import shutil
+
+        archive_dir = Path(self.oss_dir) / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        cleaned = []
+        for meta in papers_meta:
+            pdf_path = Path(meta.get("pdf_path", ""))
+            if not pdf_path.exists():
+                continue
+
+            paper_id = self._paper_id_from_title(meta.get("title", ""))
+            oss_pdf_path = archive_dir / f"{paper_id}.pdf"
+
+            try:
+                file_size = pdf_path.stat().st_size
+                md5_hash = hashlib.md5(pdf_path.read_bytes()).hexdigest()
+
+                shutil.move(str(pdf_path), str(oss_pdf_path))
+
+                if self.db:
+                    self.db.archive_pdf(
+                        paper_id, str(pdf_path), str(oss_pdf_path),
+                        file_size=file_size, md5_hash=md5_hash,
+                    )
+                cleaned.append(str(oss_pdf_path))
+            except Exception as e:
+                logger.warning(f"PDF 归档失败 [{paper_id}]: {e}")
+
+        return cleaned
+
+    # ── 工具方法 ───────────────────────────────────────
+
+    @staticmethod
+    def _paper_id_from_title(title: str) -> str:
+        """从标题生成稳定 paper_id。"""
+        import hashlib
+        h = hashlib.md5(title.encode() if title else b"unknown").hexdigest()[:8]
+        return f"local:{h}"
 
     # ── 私有辅助方法 ─────────────────────────────────
 

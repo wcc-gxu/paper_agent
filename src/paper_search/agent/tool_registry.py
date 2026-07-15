@@ -2158,6 +2158,17 @@ class ToolRegistry:
             args_schema={"question": {"type": "str", "description": "学术问题"}, "project_id": {"type": "str", "description": "项目 ID", "required": False}, "top_k": {"type": "int", "description": "检索 top-k", "required": False}},
             metadata=ToolMetadata(category="knowledge"),
         )
+        self.register_direct(
+            "agent_knowledge_ingest_local",
+            "本地 PDF 入库: 扫描目录→去重→转换→元数据提取→图表提取→索引→清理 (8 Phase)",
+            self._make_knowledge_ingest_local(),
+            args_schema={
+                "pdf_dir": {"type": "str", "description": "PDF 源目录"},
+                "project_id": {"type": "str", "description": "目标项目 ID"},
+                "agent_id": {"type": "str", "description": "智能体 ID (一个智能体一个 project)", "required": False},
+            },
+            metadata=ToolMetadata(category="knowledge"),
+        )
 
     def _make_knowledge_ingest(self):
         @tool_error_handler(agent="tool:agent_knowledge_ingest", node="KnowledgeAgent.run_ingest")
@@ -2181,6 +2192,26 @@ class ToolRegistry:
             result = await agent.ask(question, project_id=project_id or None, top_k=top_k)
             return json.dumps(result, ensure_ascii=False, default=str)
         return knowledge_ask
+
+    def _make_knowledge_ingest_local(self):
+        @tool_error_handler(agent="tool:agent_knowledge_ingest_local",
+                            node="KnowledgeAgent.run_ingest_local")
+        async def knowledge_ingest_local(pdf_dir: str, project_id: str = "",
+                                          agent_id: str = "agent-001") -> str:
+            from .graphs.knowledge_graph import KnowledgeAgent
+            from .pgdb import PostgresAgentDB
+            from .pgvector_store import PgVectorStore
+            from .llm_client_v2 import get_llm_client
+
+            db = _get_db()
+            vector_store = PgVectorStore(user_id=_get_user_id())
+            llm = get_llm_client()
+            user_id = _get_user_id()
+
+            agent = KnowledgeAgent(db=db, vector_store=vector_store, llm_client=llm)
+            result = await agent.run_ingest_local(pdf_dir, project_id, user_id=user_id)
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return knowledge_ingest_local
 
     def _register_writing_agent_tools(self):
         """Writing Agent 工具 — 综述生成与 AI 味检测。"""
