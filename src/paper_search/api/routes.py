@@ -195,6 +195,20 @@ async def delete_agent(agent_id: str, user_id: str = Depends(verify_api_key)):
     return {"agent_id": agent_id, "status": "deactivated"}
 
 
+@router.post("/agents/{agent_id}/activate")
+async def activate_agent(agent_id: str, user_id: str = Depends(verify_api_key)):
+    """切换客户端当前活跃智能体。返回新的 JWT token 含 agent_id."""
+    from ..agent.pgdb import PostgresAgentDB
+    from .auth import _create_jwt
+    db = PostgresAgentDB()
+    if not db.agent_belongs_to_user(agent_id, user_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = db.get_agent(agent_id)
+    user = db.get_user(user_id)
+    new_token = _create_jwt(user_id, user.get("username", ""), "access", agent_id=agent_id)
+    return {"agent_id": agent_id, "token": new_token, "status": "activated"}
+
+
 # ═══════════════════════════════════════════════════════════════
 # User Preferences (v3.2)
 # ═══════════════════════════════════════════════════════════════
