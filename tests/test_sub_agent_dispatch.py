@@ -49,17 +49,29 @@ def _make_graph_ainvoke(result_dict):
 
 @pytest.fixture
 def common_mocks():
-    """所有 _run_graph_agent_async 测试共享: db / llm / reporter / logger。"""
+    """所有 _run_graph_agent_async 测试共享: db / llm / reporter / logger。
+
+    同时重置 LLMClientV2 单例缓存 (_llm_client)，确保 patch LLMClientV2
+    在每次测试中都能生效（不被已缓存的实例干扰）。
+    """
+    import paper_search.agent.llm_client_v2 as _llm_mod
+    _cached = getattr(_llm_mod, "_llm_client", None)
+    _llm_mod._llm_client = None
+
     db = MagicMock(name="AgentDB")
     llm = MagicMock(name="LLMClientV2")
     reporter = _make_reporter()
     task_logger = _make_task_logger()
-    return {
+
+    yield {
         "db": db,
         "llm": llm,
         "reporter": reporter,
         "task_logger": task_logger,
     }
+
+    # 恢复单例（避免影响其他可能依赖它的模块）
+    _llm_mod._llm_client = _cached
 
 
 # ════════════════════════════════════════════════════════════════
