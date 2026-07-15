@@ -1,8 +1,8 @@
 # Paper Agent v3 — 记忆系统设计
 
-> v2.0 | 2026-06-25 | LangGraph 三件套 + ChromaDB+SQLite 双层存储
+> v2.1 | 2026-07-15 | LangGraph 三件套 + PostgreSQL+pgvector 统一存储
 >
-> 替代 v1.0（MemGPT 4 层 ShortTerm/MidTerm/LongTerm/MetaMemory），对齐 LangGraph 官方记忆架构标准。
+> 替代 v1.0（MemGPT 4 层 ShortTerm/MidTerm/LongTerm/MetaMemory），对齐 LangGraph 官方记忆架构标准。v2.1 已从 ChromaDB+SQLite 双层迁移到 PostgreSQL+pgvector。
 
 ---
 
@@ -10,7 +10,7 @@
 
 **对外口径（简历版）**：
 
-> 基于 LangGraph Checkpointer/Store 实现短期与长期记忆管理，配合 ChromaDB+SQLite 双层存储完成 RAG 检索。
+> 基于 LangGraph Checkpointer/Store 实现短期与长期记忆管理，配合 PostgreSQL+pgvector 统一存储完成 RAG 检索。
 
 **三条核心目标**：
 
@@ -26,17 +26,15 @@
 ┌──────────────────────────────────────────────────────────────┐
 │ ① Checkpointer (短期 / thread-scoped)                         │
 │    接口：BaseCheckpointSaver                                   │
-│    实现：AsyncSqliteSaver(conn=AgentDB 同库)                   │
+│    实现：AsyncPostgresSaver (langgraph-checkpoint-postgres)    │
 │    存什么：graph state（messages / phase / tool_results 等）   │
 │    按 thread_id 索引（= WebSocket session_id）                 │
 │    生命周期：thread_id 字符串被使用的时长（跨进程死活）           │
 ├──────────────────────────────────────────────────────────────┤
 │ ② Store (长期 / cross-thread)                                 │
 │    接口：BaseStore                                             │
-│    实现：双后端                                                │
-│      • SqliteStore  —— preferences/profile/strategies/errors  │
-│      • ChromaStore  —— episodes/topics（带向量）/knowledge.*  │
-│    按 namespace 路由：路由表在 store.py                         │
+│    实现：AsyncPostgresStore (langgraph-checkpoint-postgres)    │
+│    向量检索：pgvector (替代 ChromaDB)                           │
 │    按 (agent_id, kind, entity_class?) 三层 8 个 kind 划分      │
 ├──────────────────────────────────────────────────────────────┤
 │ ③ 消息窗口管理 (Message Window Management)                     │
@@ -54,8 +52,8 @@
 | **不是** OS 线程、不是 Python `threading.Thread` | 是用户指定的字符串 ID |
 | **生命周期** | 由 `thread_id` 字符串被使用的时长决定，不绑定进程 |
 | **本项目 thread_id** | WebSocket `session_id`（每次 iOS 连接） |
-| **存储后端** | `AsyncSqliteSaver`，指向 AgentDB 同一个 SQLite 文件 |
-| **3 张标准表** | `checkpoints` / `checkpoint_blobs` / `checkpoint_writes`（langgraph 标准 schema，与业务表同库） |
+| **存储后端** | `AsyncPostgresSaver`（langgraph-checkpoint-postgres），与业务表同库 |
+| **3 张标准表** | `checkpoints` / `checkpoint_blobs` / `checkpoint_writes`（langgraph 标准 schema，PostgreSQL 同库） |
 | **graph.compile 注入** | `graph.compile(checkpointer=checkpointer, store=store)` 自动绑定 |
 | **配置传入** | 调用时 `config={"configurable": {"thread_id": session_id}}` |
 
@@ -82,14 +80,14 @@
 
 | Namespace | 后端 | 写入时机 | 读取场景 | 保留策略 | 例子 |
 |---|:---:|---|---|---|---|
-| `(aid, "preferences")` | SQLite | 显式工具 `update_preference` / langmem 后台抽取 | MainAgent 入口注入 system prompt | 永久；显式 update | `{"tone": "concise", "reading_level": "deep"}` |
-| `(aid, "profile")` | SQLite | langmem 后台抽取 | MainAgent 入口注入 system prompt | 永久；增量 update | `{"research_field": ["LLM", "多模态"], "institution": "..."}` |
-| `(aid, "episodes", sid)` | ChromaDB | session close / 档 3 抽取 | LLM 调 `search_memory(query)` | 按 session 保留；可查 archived | 单次会话摘要 |
-| `(aid, "topics", slug)` | ChromaDB | Beat 03:00 按粗粒度 topic 合并 | MainAgent 入口注入相关 topic 摘要 | 永久；按主题滚动合并 | `slug="transformer"` 下所有相关会话精华 |
-| `(aid, "strategies")` | SQLite | execute_plan 收尾 | scenario_plan 调 `get_best_strategy` | 永久；effectiveness 增量 | `"S2 综述时先 S1 调研更稳"` |
-| `(aid, "errors")` | SQLite | tool 异常 | scenario_plan 入口避坑 | 永久；重复模式自动聚合 | `{"tool": "arxiv_search", "pattern": "rate_limit_429"}` |
-| `(aid, "knowledge", "papers")` | ChromaDB | IngestAgent index 节点 | RAG search_library | 永久 | 论文 metadata + abstract embedding |
-| `(aid, "knowledge", "chunks")` | ChromaDB | IngestAgent index 节点 | RAG search_library 深度检索 | 永久 | section-aware chunks |
+| `(aid, "preferences")` | PG | 显式工具 `update_preference` + 去重 / langmem 后台抽取 | MainAgent 入口注入 system prompt | 永久；显式 update | `{"tone": "concise", "reading_level": "deep"}` |
+| `(aid, "profile")` | PG | langmem 后台抽取 | MainAgent 入口注入 system prompt | 永久；增量 update | `{"research_field": ["LLM", "多模态"], "institution": "..."}` |
+| `(aid, "episodes", sid)` | PG+pgvector | session close / 档 3 抽取 | LLM 调 `search_memory(query)` | 按 session 保留；可查 archived | 单次会话摘要 |
+| `(aid, "topics", slug)` | PG+pgvector | Beat 03:00 按粗粒度 topic 合并 | MainAgent 入口注入相关 topic 摘要 | 永久；按主题滚动合并 | `slug="transformer"` 下所有相关会话精华 |
+| `(aid, "strategies")` | PG | execute_plan 收尾 | scenario_plan 调 `get_best_strategy` | 永久；effectiveness 增量 | `"S2 综述时先 S1 调研更稳"` |
+| `(aid, "errors")` | PG | tool 异常 | scenario_plan 入口避坑 | 永久；重复模式自动聚合 | `{"tool": "arxiv_search", "pattern": "rate_limit_429"}` |
+| `(aid, "knowledge", "papers")` | PG+pgvector | IngestAgent index 节点 | RAG search_library | 永久 | 论文 metadata + abstract embedding |
+| `(aid, "knowledge", "chunks")` | PG+pgvector | IngestAgent index 节点 | RAG search_library 深度检索 | 永久 | section-aware chunks |
 
 **为什么不按 17 场景做 namespace**：
 
@@ -211,7 +209,7 @@ batch_summarize(messages):
 
 ## §4 与 RAG 的关系
 
-**Store 与 RAG 共用 ChromaDB+SQLite 双层存储**，**按 namespace 严格隔离语义**：
+**Store 与 RAG 共用 PostgreSQL+pgvector 统一存储**，**按 namespace 严格隔离语义**：
 
 | 维度 | Store（长期记忆） | RAG（论文知识库） |
 |---|---|---|
@@ -220,7 +218,7 @@ batch_summarize(messages):
 | **谁读** | MainAgent 入口注入 prompt | LLM 调 `search_library / search_papers` 工具 |
 | **namespace 例** | `(aid, "preferences")` | `(aid, "knowledge", "papers")` |
 | **作用** | 让 Agent "认识你" | 让 Agent "回答有依据" |
-| **后端选择** | SQLite（小数据）/ ChromaDB（带向量） | ChromaDB 主用 + SQLite 元数据 |
+| **后端选择** | PostgreSQL（主存储）+ pgvector（向量检索） | PostgreSQL+pgvector（统一） |
 
 两者**不混用 namespace**，避免概念污染：偏好不会出现在 `knowledge` 下，论文 chunk 不会出现在 `episodes` 下。
 
@@ -345,42 +343,48 @@ if tools:
 
 ---
 
-## §8 SQLite 关键表清单
+## §8 PostgreSQL 关键表清单
+
+> v2.1：全部迁移到 PostgreSQL+pgvector。Checkpointer/Store 三件套使用 langgraph-checkpoint-postgres。
 
 | 表 | 用途 | 来源 |
 |---|---|---|
-| `checkpoints` | LangGraph state 快照 | langgraph 标准 |
-| `checkpoint_blobs` | state 中大对象（messages 等） | langgraph 标准 |
-| `checkpoint_writes` | 单步写入记录 | langgraph 标准 |
-| `store_data` | LangGraph Store 数据（SQLite 后端 namespace） | langgraph 标准 |
-| **`conversation_archive`**（新增） | 档 2 摘要后归档的原始 messages | 项目新增 |
-| `ws_messages` | 出站消息持久化（保留） | 项目已有 |
-| `device_tokens` | iOS APNs 设备 token（保留） | 项目已有 |
-| `knowledge_entries` | extract_knowledge 抽取的 method/contribution/limitation（保留） | 项目已有 |
-| `journal_ranks` | CCF/SCI 期刊分级（保留） | 项目已有 |
+| `checkpoints` | LangGraph state 快照 | langgraph-checkpoint-postgres |
+| `checkpoint_blobs` | state 中大对象（messages 等） | langgraph-checkpoint-postgres |
+| `checkpoint_writes` | 单步写入记录 | langgraph-checkpoint-postgres |
+| `store_data` | LangGraph Store 数据（全部 namespace） | langgraph-checkpoint-postgres |
+| `conversation_archive` | 档 2 摘要后归档的原始 messages | 项目新增 |
+| `ws_messages` | 出站消息持久化 | 项目已有 |
+| `message_embeddings` | 历史消息向量化 (pgvector) | v10.2 新增 |
+| `session_summaries` | 会话摘要存储 | 项目新增 |
+| `topic_embeddings` | 研究主题向量 (pgvector) | 项目新增 |
+| `device_tokens` | iOS APNs 设备 token | 项目已有 |
+| `hallucination_events` | 反幻觉 telemetry | 项目已有 |
+| `journal_ranks` | CCF/SCI 期刊分级 | 项目已有 |
 
-**废弃表**（Phase 2 DB migration 移除）：
+**废弃表**（已从数据库删除）：
 
 - `agent_events` — 由 Checkpointer history 替代
-- `task_checkpoints` — 业务进度独立保留作 S7 "进度查看" 场景用，**不再作为 MidTerm 记忆层**
+- `task_checkpoints` — 业务进度功能已合并到 sessions/agent_tasks
+- `knowledge_entries` — 由 Store namespace `(aid, "knowledge", *)` 替代
+- `user_preferences` / `strategy_log` / `error_patterns` — 由 Store namespace 替代
 
 ### §8.1 conversation_archive schema
 
 ```sql
 CREATE TABLE conversation_archive (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    thread_id TEXT NOT NULL,
-    agent_id TEXT NOT NULL,
-    archived_at TEXT NOT NULL,                    -- ISO8601
-    summary_msg_id TEXT,                          -- 替换为哪条摘要消息（Checkpointer 中的 msg id）
-    original_messages_json TEXT NOT NULL,         -- 原始 messages 列表 JSON
-    original_count INTEGER NOT NULL,
-    token_count INTEGER,
-    reason TEXT                                   -- "trigger_count_30" / "trigger_tokens_16k"
+    id TEXT PRIMARY KEY,                          -- UUID
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    summary_text TEXT,
+    summary_type TEXT DEFAULT 'rolling',
+    start_msg_id TEXT,
+    end_msg_id TEXT,
+    metadata JSONB,                               -- 旧 schema 字段打包: thread_id, agent_id, original_count, token_count, reason
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_archive_thread ON conversation_archive(thread_id);
-CREATE INDEX idx_archive_time   ON conversation_archive(archived_at);
+CREATE INDEX idx_conv_archive_session ON conversation_archive(session_id);
 ```
 
 ---
@@ -391,37 +395,37 @@ CREATE INDEX idx_archive_time   ON conversation_archive(archived_at);
 
 | v1 MemGPT 4 层 | v2 LangGraph 三件套 | 后端 |
 |---|---|---|
-| ShortTerm.deque(8k) | Checkpointer.state.messages + trim_messages | SQLite (checkpoints) |
-| ShortTerm.summary | 档 2 SummarizationNode 输出 + conversation_archive | SQLite |
-| MidTerm.task_checkpoints | **业务进度独立保留**（不再算记忆层） | SQLite (task_checkpoints) |
-| LongTerm.knowledge_entries | Store namespace `(aid, "knowledge", "papers"/"chunks")` | ChromaDB + SQLite |
-| LongTerm.conversation_summary | Store namespace `(aid, "episodes"/"topics")` | ChromaDB |
-| MetaMemory.user_preferences | Store namespace `(aid, "preferences")` | SQLite |
-| MetaMemory.profile | Store namespace `(aid, "profile")` | SQLite |
-| MetaMemory.strategy_log | Store namespace `(aid, "strategies")` | SQLite |
-| MetaMemory.error_patterns | Store namespace `(aid, "errors")` | SQLite |
+| ShortTerm.deque(8k) | Checkpointer.state.messages + trim_messages | PostgreSQL (checkpoints) |
+| ShortTerm.summary | 档 2 SummarizationNode 输出 + conversation_archive | PostgreSQL |
+| MidTerm.task_checkpoints | **废弃**（业务进度并入 sessions/agent_tasks） | — |
+| LongTerm.knowledge_entries | Store namespace `(aid, "knowledge", "papers"/"chunks")` | PostgreSQL+pgvector |
+| LongTerm.conversation_summary | Store namespace `(aid, "episodes"/"topics")` | PostgreSQL+pgvector |
+| MetaMemory.user_preferences | Store namespace `(aid, "preferences")` | PostgreSQL |
+| MetaMemory.profile | Store namespace `(aid, "profile")` | PostgreSQL |
+| MetaMemory.strategy_log | Store namespace `(aid, "strategies")` | PostgreSQL |
+| MetaMemory.error_patterns | Store namespace `(aid, "errors")` | PostgreSQL |
 
-### §9.2 代码改造步骤（Phase 2）
+### §9.2 代码改造步骤（已完成 ✅）
 
 | # | 步骤 | 估算 |
 |:---:|---|:---:|
-| 1 | 新建 `src/paper_search/agent/checkpointer.py` — AsyncSqliteSaver 适配 + 同库连接 | 0.5 天 |
-| 2 | 新建 `src/paper_search/agent/store.py` — 双后端 Store（SQLite + ChromaDB 路由） | 2 天 |
-| 3 | 新建 `src/paper_search/agent/summarizer.py` — 档 2 SummarizationNode + map-reduce | 1 天 |
-| 4 | 新建 `src/paper_search/agent/message_trim.py` — 档 1 trim_messages 封装 | 0.5 天 |
-| 5 | 新建 Celery task `consolidate_long_term` — 档 3 langmem 抽取 | 1 天 |
-| 6 | MainAgent 重写为 StateGraph + `graph.compile(checkpointer=..., store=...)` | 3-5 天 |
-| 7 | `EvaluateCompletionResult` 加 `next_action` 5 出口 + 总轮数 8 守护 | 1 天 |
-| 8 | safety_filter 异步并行 + tool 调用前 regex 二次检测 | 1-2 天 |
-| 9 | `llm_client_v2._chat_once` 加 `tool_choice` 强制（3 行） | 0.5 天 |
-| 10 | DB migration：`conversation_archive` 表 + 废弃 `agent_events` | 1 天 |
-| 11 | IngestParams v2（21 字段）替换 IngestState；7 子 Agent 全部重写 | 5-7 天 |
-| 12 | 注入 system prompt 头部 + prompt caching（cache_control） | 0.5 天 |
-| 13 | 8 个 namespace 初始化 + `update_preference` 工具 + langmem 集成 | 1 天 |
-| 14 | 删除 `memory.py` / `_build_history_context` / `_replay` / `_resume_from_state` | 0.5 天 |
-| 15 | 测试：跨 session resume / 摘要触发 / 长期抽取 / namespace 检索 / IngestParams E2E | 3-5 天 |
+| 1 | 新建 `src/paper_search/agent/pg_checkpointer.py` — AsyncPostgresSaver 适配 | 0.5 天 | ✅ |
+| 2 | 新建 `src/paper_search/agent/pg_store.py` — AsyncPostgresStore（PostgreSQL 后端） | 2 天 | ✅ |
+| 3 | 新建 `src/paper_search/agent/summarizer.py` — 档 2 SummarizationNode + map-reduce | 1 天 | ✅ |
+| 4 | 新建 `src/paper_search/agent/message_trim.py` — 档 1 trim_messages 封装 | 0.5 天 | ✅ |
+| 5 | 新建 Celery task `consolidate_long_term` — 档 3 langmem 抽取 | 1 天 | ✅ |
+| 6 | MainAgent 重写为 StateGraph + `graph.compile(checkpointer=..., store=...)` | 3-5 天 | ✅ |
+| 7 | `EvaluateCompletionResult` 加 `next_action` 5 出口 + 总轮数 8 守护 | 1 天 | 🔶 |
+| 8 | safety_filter 异步并行 + tool 调用前 regex 二次检测 | 1-2 天 | 🔶 |
+| 9 | `llm_client_v2._chat_once` 加 `tool_choice` 强制（3 行） | 0.5 天 | 🔶 |
+| 10 | DB migration：`conversation_archive` 表 + 废弃 `agent_events` | 1 天 | ✅ |
+| 11 | IngestParams v2（21 字段）替换 IngestState；7 子 Agent 全部重写 | 5-7 天 | 📐 |
+| 12 | 注入 system prompt 头部 + prompt caching（cache_control） | 0.5 天 | 📐 |
+| 13 | 8 个 namespace 初始化 + `update_preference` 工具 + langmem 集成 | 1 天 | ✅ |
+| 14 | 删除 `db.py`/`chroma_store.py`/旧 `checkpointer.py`/旧 `store.py` | 0.5 天 | ✅ |
+| 15 | 测试：跨 session resume / 摘要触发 / 长期抽取 / namespace 检索 | 3-5 天 | 🔶 |
 
-总计约 20-30 人日，分多 PR 推进。
+总计约 20-30 人日。v2.1: 基础设施（Step 1-6, 10, 13-14）已全部完成并迁移到 PostgreSQL。
 
 ---
 
@@ -459,7 +463,7 @@ class IngestParams(BaseModel):
     # ── 处理层 ─────────────────────────────────
     download: bool = True
     convert_pdf: bool = True
-    index_to_chroma: bool = True
+    index_to_vector: bool = True          # pgvector 替代 ChromaDB
     rank_by_journal: bool = True
     extract_knowledge: bool = False                      # 抽 method/contribution/limitation
     enable_verify: bool = False                          # 反幻觉验证
@@ -529,41 +533,23 @@ replan 不限次数（靠总轮数 8 兜底）
 
 ---
 
-## 附录 C — Store 双后端路由表
+## 附录 C — Store 后端路由（v2.1 已迁移到 PostgreSQL+pgvector）
+
+> ⚠️ 以下为 v2.0 旧设计，仅供参考。v2.1 已统一使用 `AsyncPostgresStore`（langgraph-checkpoint-postgres），不再需要双后端路由。
 
 ```python
-# src/paper_search/agent/store.py
+# [v2.0 历史代码] src/paper_search/agent/store.py
+# v2.1 已替换为 pg_store.py → AsyncPostgresStore
 NAMESPACE_BACKEND_ROUTES = {
-    "preferences":  "sqlite",     # 小数据，无需向量
-    "profile":      "sqlite",
-    "strategies":   "sqlite",
-    "errors":       "sqlite",
-    "episodes":     "chromadb",   # 会话摘要带 embedding 检索
-    "topics":       "chromadb",   # 主题级带 embedding 检索
-    "knowledge":    "chromadb",   # 论文/chunk 大量向量
+    "preferences":  "postgresql",
+    "profile":      "postgresql",
+    "strategies":   "postgresql",
+    "errors":       "postgresql",
+    "episodes":     "postgresql",  # pgvector 替代 chromadb
+    "topics":       "postgresql",
+    "knowledge":    "postgresql",  # pgvector 替代 chromadb
 }
-
-class DualBackendStore(BaseStore):
-    """根据 namespace 第二层 kind 路由到对应后端。"""
-    def __init__(self, sqlite_store: BaseStore, chroma_store: BaseStore):
-        self.sqlite = sqlite_store
-        self.chroma = chroma_store
-    
-    def _route(self, namespace: tuple[str, ...]) -> BaseStore:
-        kind = namespace[1] if len(namespace) >= 2 else "preferences"
-        backend = NAMESPACE_BACKEND_ROUTES.get(kind, "sqlite")
-        return self.chroma if backend == "chromadb" else self.sqlite
-    
-    async def aput(self, namespace, key, value, index=None):
-        return await self._route(namespace).aput(namespace, key, value, index)
-    
-    async def aget(self, namespace, key):
-        return await self._route(namespace).aget(namespace, key)
-    
-    async def asearch(self, namespace_prefix, query=None, filter=None, limit=10):
-        return await self._route(namespace_prefix).asearch(
-            namespace_prefix, query=query, filter=filter, limit=limit
-        )
+# 实际实现：AsyncPostgresStore 统一后端，无需路由逻辑
 ```
 
 ---
@@ -571,15 +557,15 @@ class DualBackendStore(BaseStore):
 ## 附录 D — 依赖变更
 
 ```toml
-# pyproject.toml additions (Phase 2)
+# pyproject.toml (v2.1 已应用)
 [project.optional-dependencies]
 agent = [
-    "langgraph>=0.6",                       # 含 AsyncSqliteSaver
-    "langgraph-checkpoint-sqlite>=2.0",     # SQLite checkpointer
-    "langgraph-store-sqlite>=0.1",          # SQLite store（如启用）
-    "langmem>=0.0.10",                      # create_memory_manager / SummarizationNode
+    "langgraph>=0.6",                            # StateGraph + Checkpointer + Store
+    "langgraph-checkpoint-postgres>=2.0",         # PostgreSQL Checkpointer + Store 后端
+    "langmem>=0.0.10",                            # create_memory_manager / SummarizationNode
     # ... (其他保留)
 ]
+# 已移除: langgraph-checkpoint-sqlite, langgraph-store-sqlite, chromadb
 ```
 
 ---
@@ -605,7 +591,7 @@ agent = [
 
 | 维度 | v1 MemGPT 4 层 | v2 三件套 |
 |---|---|---|
-| 进程死了，对话上下文 | ShortTerm 进程内 deque → 全丢 | Checkpointer SQLite → 续上 |
+| 进程死了，对话上下文 | ShortTerm 进程内 deque → 全丢 | Checkpointer PostgreSQL → 续上 |
 | 跨 thread 共享偏好 | 手工 `session_id` 过滤 | Store namespace 原生隔离 |
 | 滑动窗口 | deque 自己实现 token 截断 | `trim_messages` 标准工具 |
 | 长期沉淀 | 5 个自定义工具 + 散落表 | `langmem.create_memory_manager` 统一封装 |
@@ -616,4 +602,4 @@ agent = [
 
 ---
 
-> 版本: v2.0 | 2026-06-25 | 替代 v1.0 (MemGPT 4 层)
+> 版本: v2.1 | 2026-07-15 | PostgreSQL+pgvector 统一存储 | 替代 v1.0 (MemGPT 4 层)

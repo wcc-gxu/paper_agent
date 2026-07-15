@@ -15,7 +15,7 @@ Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/
 - **消息链路**: Outbox 模式 (Redis List + PostgreSQL 持久化 + APNs 离线推送)
 - **记忆系统**: LangGraph 三件套（Checkpointer 短期 / Store 长期 / 消息窗口管理）+ pgvector 向量存储
 - **存储**: PostgreSQL+pgvector (业务表 + 向量) + Redis (队列) + 文件系统 (PDF/MD/Video)
-- **定时任务**: Celery Beat (订阅检查 + health_check + cleanup_logs + consolidate_long_term)
+- **定时任务**: Celery Beat (订阅检查 + health_check + cleanup_logs + consolidate_long_term + session_close_check)
 
 ## 启动方式
 
@@ -165,10 +165,12 @@ MainAgent → outbox_publish() ─┬─ PostgreSQL ws_messages (持久化)
 
 ```
 [iOS] WS connect → [Server] WS accept + outbox_poller 启动
-[iOS] send {type: "sync_request", payload: {last_msg_id?: "..."}}
-[Server] 拉 ws_messages 中本 session 未送达的消息 → 逐条 send_text
-         → send {type: "sync_complete", payload: {synced_count: N}}
+[iOS] GET /api/sessions/{session_id}/messages?since=<last_known_ts>
+[Server] 返回去重后的最终状态消息列表（按 dedup_key DISTINCT ON）
+         → REST 响应本身就是完成信号，无需 sync_complete
 ```
+
+> **v10.2 变更**：WS sync 协议（sync_request/sync_complete）已移除，离线消息改为 REST API 拉取。详见 [websocket-protocol.md](docs/development/websocket-protocol.md)。
 
 ### 记忆系统 — LangGraph 三件套 + pgvector
 
@@ -178,11 +180,11 @@ MainAgent → outbox_publish() ─┬─ PostgreSQL ws_messages (持久化)
 
 | 件 | 名称 | 作用域 | 实现 | 存什么 |
 |:---:|---|---|---|---|
-| ① | **Checkpointer** | thread-scoped（短期）| `AsyncSqliteSaver`（待迁移 PG） | graph state（messages / phase / tool_results） |
-| ② | **Store** | cross-thread（长期）| `DualBackendStore`（SQLite + ChromaDB，待迁移 PG） | 用户偏好/画像/会话摘要/topic/策略/错误/知识 |
+| ① | **Checkpointer** | thread-scoped（短期）| `AsyncPostgresSaver`（langgraph-checkpoint-postgres） | graph state（messages / phase / tool_results） |
+| ② | **Store** | cross-thread（长期）| `AsyncPostgresStore`（langgraph-checkpoint-postgres + pgvector） | 用户偏好/画像/会话摘要/topic/策略/错误/知识 |
 | ③ | **消息窗口管理** | 上下文窗口控制 | `trim_messages` + `SummarizationNode` + langmem | 滚动摘要 + 长期抽取 |
 
-**Store 三层 8 个 namespace**（当前仍走 SQLite+ChromaDB，PG 迁移中）：
+**Store 三层 8 个 namespace**（全部走 PostgreSQL + pgvector）：
 
 ```
 (agent_id, "preferences")            ─ 用户偏好
@@ -205,7 +207,7 @@ MainAgent → outbox_publish() ─┬─ PostgreSQL ws_messages (持久化)
 
 **用户偏好更新双轨**：显式工具 `update_preference` + langmem 后台抽取。注入位置：system prompt 顶部 + Anthropic prompt caching（cache_control: ephemeral）。
 
-`graph.compile(checkpointer=AsyncSqliteSaver, store=DualBackendStore)` 自动注入。摘要后原 messages 归档到 `conversation_archive` 表，可回溯。
+`graph.compile(checkpointer=AsyncPostgresSaver, store=AsyncPostgresStore)` 自动注入。摘要后原 messages 归档到 `conversation_archive` 表，可回溯。
 
 ### 跨进程 resume — Checkpointer history
 
@@ -262,27 +264,27 @@ src/paper_search/
 │   ├── daemon.py                   # 守护进程 + AgentBootstrap + graph.compile
 │   ├── main_agent.py               # MainAgent 节点函数 + state 类型
 │   ├── main_agent_prompts.py       # 17 scenario 定义 + 4 节点 Pydantic schema (Safety/Intent/Plan/Eval v2)
-│   ├── checkpointer.py             # [Phase 2 新增] AsyncSqliteSaver 适配
-│   ├── store.py                    # [Phase 2 新增] DualBackendStore（SQLite + ChromaDB 路由）
-│   ├── summarizer.py               # [Phase 2 新增] 档 2 SummarizationNode + map-reduce
-│   ├── message_trim.py             # [Phase 2 新增] 档 1 trim_messages 封装
+│   ├── agent_error.py              # AgentError 统一错误信封 + Redis Pub/Sub 上报
+│   ├── summarizer.py               # 档 2 SummarizationNode + map-reduce + conversation_archive 归档
+│   ├── message_trim.py             # 档 1 trim_messages 封装
 │   ├── outbox.py                   # 出站消息双写 (PostgreSQL + Redis List)
-│   ├── db.py                       # SQLite 持久化 (AgentDB) — [v3 Phase 1] 逐步切换到 pgdb
-│   ├── pgdb.py                     # [v3 Phase 1] PostgreSQL 持久化 (PostgresAgentDB)
-│   ├── memory.py                   # [Phase 2 废弃] MemGPT 4 层（迁移到 checkpointer + store）
-│   ├── llm_client_v2.py            # 多供应商 LLM（[Phase 2 修复] _chat_once 加 tool_choice）
-│   ├── tool_registry.py            # 56 工具 + update_preference（新增）
-│   ├── celery_app.py               # Celery 配置 + Beat (含 consolidate_long_term)
-│   ├── celery_tasks.py             # 9 异步 Task + 订阅 + health_check + cleanup_logs + 长期抽取
-│   ├── reporter.py                 # Celery → Agent 双通道上报
+│   ├── pgdb.py                     # PostgreSQL 持久化 (PostgresAgentDB)
+│   ├── memory.py                   # MemoryManager + KnowledgeEntry (checkpointer/store 已迁 PG)
+│   ├── llm_client_v2.py            # 多供应商 LLM（tool_choice 强制 + thinking 控制）
+│   ├── tool_registry.py            # 73+ 工具 + update_preference 去重 + check_rag_health
+│   ├── celery_app.py               # Celery 配置 + Beat (consolidate_long_term + session-close-check)
+│   ├── celery_tasks.py             # 10 异步 Task + session_close + 订阅 + health_check + cleanup + 长期抽取
+│   ├── reporter.py                 # Agent → 主 Agent 双通道上报 (Redis Pub/Sub agent:reports:{agent_id})
 │   ├── task_logger.py              # 任务 JSON 日志
 │   ├── sub_agent.py                # PipelineRunner 编排器
 │   ├── verifier.py                 # 引用三步校验
 │   ├── video_downloader.py         # yt-dlp 封装
 │   ├── video_browser.py            # CloakBrowser 封装
-│   ├── knowledge.py                # RAG 问答 + 知识提取
-│   ├── chroma_store.py             # ChromaDB 集合管理 — [v3 Phase 1] 逐步切换到 pgvector_store
-│   ├── pgvector_store.py           # [v3 Phase 1] pgvector 向量存储 (PgVectorStore)
+│   ├── knowledge.py                # RAG 问答 + Cross-Encoder Rerank + rag_traces
+│   ├── reranker.py                 # Cross-Encoder 重排序 (bge-reranker-v2-m3 via SiliconFlow)
+│   ├── pgvector_store.py           # pgvector 向量存储 (PgVectorStore + message embeddings)
+│   ├── pg_checkpointer.py          # LangGraph Checkpointer PostgreSQL 后端 (AsyncPostgresSaver)
+│   ├── pg_store.py                 # LangGraph Store PostgreSQL 后端 (AsyncPostgresStore)
 │   ├── pdf_converter.py            # PDF→Markdown
 │   ├── chunker.py                  # Section-aware 分块
 │   ├── journal_ranker.py           # CCF+SCI 期刊分级
@@ -321,30 +323,35 @@ src/paper_search/
 
 ---
 
-## PostgreSQL 关键表（v3 Phase 1 已迁移）
+## PostgreSQL 关键表（v3 Phase 1 迁移完成）
 
 > Schema: [scripts/init_db.sql](scripts/init_db.sql) · 迁移脚本: [scripts/migrate_to_postgres.py](scripts/migrate_to_postgres.py)
 >
-> **当前状态**：Daemon + API 已切 PostgreSQL；Checkpointer/Store/Celery/CLI/ToolRegistry 仍走 SQLite（代码残留 ~80 处，逐批迁移中）。
+> **当前状态**：全部模块已切 PostgreSQL（含 Checkpointer/Store/Celery/CLI/ToolRegistry）。SQLite 代码 (`db.py`/`chroma_store.py`/`checkpointer.py`/`store.py`) 已删除，`langgraph-checkpoint-sqlite`/`langgraph-store-sqlite`/`chromadb` 依赖已移除。`DATABASE_URL` 环境变量为必需项。
 >
-> **SQLite 兼容文件**（`agent.db`）：仍存在于 `~/.paper_search/agent.db`（~1MB），作为迁移源保留。PG 后端不可用时回退到 SQLite（`use_postgresql()` 检查 `DATABASE_URL` 环境变量）。
+> **SQLite 兼容文件**（`agent.db`）：迁移源（`~/.paper_search/agent.db` ~1MB），历史保留，不再使用。
 
 | 表 | 用途 | 迁移状态 |
 |---|---|---|
+| `users` | 多用户账户 + api_token | ✅ PG |
+| `sessions` | 会话管理 | ✅ PG |
 | `ws_messages` | 出站消息持久化 | ✅ PG |
-| `device_tokens` | iOS APNs 设备 token | ✅ PG |
-| `users` | 多用户账户 + api_token | ✅ PG (v3 新增) |
-| `sessions` | 会话管理 | ✅ PG (v3 新增) |
-| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | LangGraph Checkpointer 3 表 | 🔶 SQLite (待迁移) |
-| `store_data` | LangGraph Store 数据 | 🔶 SQLite (待迁移) |
-| `conversation_archive` | 档 2 摘要后归档 | 🔶 SQLite (待迁移) |
-| `hallucination_events` | 反幻觉 telemetry | 🔶 SQLite (待迁移) |
-| `task_checkpoints` | 业务任务进度 (S7) | 🔶 SQLite (待迁移) |
-| `knowledge_entries` | extract_knowledge 抽取 | 🔶 SQLite (待迁移) |
-| `journal_ranks` | CCF+SCI 期刊分级 | 🔶 SQLite (待迁移) |
+| `message_embeddings` | 历史消息向量化召回 | ✅ pgvector (v10.2 新增) |
+| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | LangGraph Checkpointer 3 表 | ✅ PG |
+| `store_data` | LangGraph Store 数据 | ✅ PG |
+| `conversation_archive` | 档 2 摘要后归档 | ✅ PG |
+| `hallucination_events` | 反幻觉 telemetry | ✅ PG |
+| `journal_ranks` | CCF+SCI 期刊分级 | ✅ PG |
 | `paper_chunks` | 论文向量 chunk | ✅ pgvector |
 | `glossary_embeddings` | 术语库向量 | ✅ pgvector |
-| ~~`agent_events`~~ | ~~主 Agent 状态变更事件~~ | ❌ 废弃 |
+| `session_summaries` | 会话摘要存储 | ✅ PG |
+| `topic_embeddings` | 研究主题向量 | ✅ pgvector |
+| `rag_traces` | RAG 检索可观测性 (延迟/错误) | ✅ PG (Phase 4 新增) |
+| `session_scan_markers` | Celery Beat 增量扫描水位线 | ✅ PG (Phase 4 新增) |
+| `device_tokens` | iOS APNs 设备 token | ✅ PG |
+| `agent_tasks` / `task_steps` | Agent 任务跟踪 | ✅ PG |
+| ~~`agent_events`~~ | ~~主 Agent 状态变更事件~~ | ❌ 废弃 (替换为 Checkpointer history) |
+| ~~`task_checkpoints` / `knowledge_entries`~~ | ~~旧 MemGPT 表~~ | ❌ 废弃 |
 | ~~`user_preferences` / `strategy_log` / `error_patterns`~~ | ~~MetaMemory 表~~ | ❌ 废弃 |
 
 ---
@@ -355,9 +362,10 @@ src/paper_search/
 |---|---|---|
 | `agent:ws:{agent_id}` | List | iOS → Agent 入站消息队列 |
 | `agent:ws:{agent_id}:parked` | List | _wait_ws_reply 暂存的不匹配消息（下轮重入） |
-| `outbox:{agent_id}` | List | **新** Agent → iOS 出站队列 (替代 agent:output Pub/Sub) |
-| `agent:reports:{task_id}` | Pub/Sub | 子 Agent → 主 Agent 进度 + lifecycle |
+| `outbox:{agent_id}` | List | Agent → iOS 出站队列 (替代 agent:output Pub/Sub) |
+| `agent:reports:{agent_id}` | Pub/Sub | 子 Agent → 主 Agent 进度 + lifecycle + AgentError 上报 |
 | `agent:notifications` | Pub/Sub | Celery Beat 订阅检查 → API |
+| `vec:cache:{user_id}:{md5(query)}` | String | 向量搜索结果缓存 (TTL 15min，可选) |
 
 ---
 
@@ -370,15 +378,20 @@ src/paper_search/
 | `ELSEVIER_API_KEY` | ScienceDirect |
 | `IEEE_API_KEY` | IEEE Xplore |
 | `WEB_SEARCH_API_KEY` | 火山引擎联网搜索 (500次/月) |
-| `DATABASE_URL` | PostgreSQL 连接 (设置后启用 PG 后端；不设则回退 SQLite) |
+| `DATABASE_URL` | PostgreSQL 连接 (必需，不再回退 SQLite) |
 | `REDIS_URL` | Redis 连接 (默认 `redis://localhost:6379/0`) |
+| `RERANK_API_KEY` | SiliconFlow Rerank API Key |
+| `RERANK_BASE_URL` | Rerank 端点 (默认 `https://api.siliconflow.cn/v1/rerank`) |
+| `RERANK_MODEL` | Rerank 模型 (默认 `BAAI/bge-reranker-v2-m3`) |
 | `WHISPER_MODEL_SIZE` | Whisper 模型大小 (默认 `small`) |
 | `CLOAKBROWSER_HEADLESS` | 浏览器无头模式 (默认 `1`) |
 | `SUBSCRIPTION_CHECK_INTERVAL_MINUTES` | 订阅检查间隔 (默认 `60`) |
-| `INTENT_ASK_THRESHOLD` | C3 灰区阈值 (默认 `0.6`)：所有 scenario.confidence < 此值时触发 ask_user 让用户挑选场景 |
-| `DEBUG_PROTOCOL` | `=1` 时服务端推 `status{level:debug}` 消息（含 LLM thinking 过程）；默认不推 |
+| `INTENT_ASK_THRESHOLD` | C3 灰区阈值 (默认 `0.6`)：所有 scenario.confidence < 此值时触发 ask_user |
+| `DEBUG_PROTOCOL` | `=1` 时服务端推 `status{level:debug}` 消息（含 LLM thinking + rag_trace）；默认不推 |
 | `API_KEY` | Bearer Token (REST API 认证，不设则禁用) |
 | `APNS_KEY_PATH` / `APNS_KEY_ID` / `APNS_TEAM_ID` / `APNS_TOPIC` / `APNS_USE_SANDBOX` | APNs 推送 (Phase 1 骨架就位，aioapns 后补) |
+| `VECTOR_CACHE_TTL` | 向量搜索结果 Redis 缓存 TTL 秒 (默认 `900` = 15min) |
+| `VECTOR_SIMILARITY_THRESHOLD` | 向量召回相似度阈值 (默认 `0.75`) |
 
 ---
 
@@ -386,17 +399,16 @@ src/paper_search/
 
 ```
 # Core
-langgraph>=0.6                          # StateGraph + AsyncSqliteSaver + Store
-langgraph-checkpoint-sqlite>=2.0        # [Phase 2] Checkpointer SQLite 后端 (待迁移 PG)
-langgraph-store-sqlite>=0.1             # [Phase 2] Store SQLite 后端 (待迁移 PG)
-langmem>=0.0.10                         # [Phase 2] create_memory_manager / SummarizationNode
+langgraph>=0.6                          # StateGraph + Checkpointer + Store
+langgraph-checkpoint-postgres>=2.0      # Checkpointer + Store PostgreSQL 后端
+langmem>=0.0.10                         # create_memory_manager / SummarizationNode
 fastapi>=0.110, uvicorn[standard]>=0.27
 celery[redis]>=5.4, redis>=5.0
-httpx>=0.27, pydantic>=2
+httpx>=0.27, pydantic>=2, requests>=2.28
 arxiv>=2.3, biopython, metapub
-pymupdf4llm, chromadb
-psycopg2-binary>=2.9                    # [v3 Phase 1] PostgreSQL 驱动
-pgvector>=0.3                            # [v3 Phase 1] pgvector Python 客户端
+pymupdf4llm
+psycopg2-binary>=2.9                    # PostgreSQL 驱动
+pgvector>=0.3                            # pgvector Python 客户端
 python-dotenv, rich>=13
 
 # Video (optional)
@@ -417,37 +429,37 @@ Python >= 3.11
 
 | 模块 | 状态 | 说明 |
 |---|:---:|---|
-| **v3 Phase 1: PostgreSQL+pgvector** | 🔶 | Daemon + API 已切 PG；Checkpointer/Store/Celery/CLI/ToolRegistry 残留 ~80 处 SQLite 硬编码 |
+| **v3 Phase 1: PostgreSQL+pgvector** | ✅ | 全部迁移完成；SQLite (db/chroma/checkpointer/store) 已删除，~80 处硬编码清零 |
+| **Phase 4: Rerank + 去重 + 可观测性 + 会话关闭** | 🔶 | 代码完成(未提交)：reranker.py + rag_traces + 记忆/论文去重 + session_close_check Beat |
+| **消息系统重构 (6 Phase)** | ✅ | WS sync 移除 + REST API + upsert + 向量召回 + SQLite 清零 (f02fde1) |
+| **AgentError 统一错误报告** | ✅ | agent_error.py + Redis Pub/Sub + 全链路透传 + except:pass 清零 (8fcc999) |
 | MainAgent v3.1 (Fast Triage + ReAct) | 📐 | 文档定型（[main-agent.md](docs/development/main-agent.md)），代码 Phase 2 |
 | MainAgent v1.1 (自研 6 节点) | ✅ | 当前运行；v3.1 重构中 |
 | LLM JSON Schema 强约束 | 🔶 | 当前 chat_json 用 tool 包装但缺 tool_choice 强制；Phase 2 修复 |
 | 17 业务场景 | ✅ | 完整覆盖 + intent_classify 路由（支持复合意图） |
 | 安全前置 (C1) | ✅ | regex 黑名单 + LLM 二次确认 |
 | 安全双闸 (regex+异步 LLM+tool 前 regex) | 📐 | 文档定型，Phase 2 代码 |
-| evaluate 5 出口 (done/retry/ask/replan/fail) | 📐 | 文档定型（[EvaluateCompletionResult v2](docs/development/memory-system.md)），Phase 2 代码 |
+| evaluate 5 出口 (done/retry/ask/replan/fail) | 📐 | 文档定型，Phase 2 代码 |
 | 灰区 ask_user (C3) | ✅ | scenario.confidence < 0.6 时列候选场景 |
-| Outbox 模式 (持久化+队列) | ✅ | 所有出站消息双写 |
+| Outbox 模式 (持久化+队列) | ✅ | 所有出站消息双写 + tool/plan 按 dedup_key upsert |
 | outbox_poller (WS/APNs 分发) | ✅ | 每 agent 一个 poller |
 | APNs 推送 | 🔶 | 骨架就位，aioapns 真实集成后补 |
-| 上线历史同步 | ✅ | sync_request/sync_complete 协议（v2 直接调 Checkpointer aget_state） |
-| **记忆系统 v1 (MemGPT 4 层)** | 🔶 | 当前实现；Phase 2 完整迁移到三件套 |
-| **记忆系统 v2 (LangGraph 三件套 + 双存储)** | 📐 | 文档定型（[memory-system.md](docs/development/memory-system.md)），代码 Phase 2 |
-| 8 个 namespace + Store 双后端路由 | 📐 | 文档定型，Phase 2 代码 |
-| 三档压缩 (trim/摘要/长期抽取) | 📐 | 文档定型，Phase 2 代码 |
-| Prompt Caching (Anthropic ephemeral) | 📐 | 文档定型，Phase 2 代码 |
-| 事件源 Checkpoint v1 (agent_events 自研) | ✅ | 当前；Phase 2 替换为 Checkpointer history |
-| Checkpointer v2 (LangGraph 原生 resume) | 📐 | 文档定型，Phase 2 代码 |
-| WebSocket 协议 v10.0 | ✅ | 5 卡片 / 12 消息 / 内部编排不可见 |
-| API Server (中继化) | ✅ | LPUSH→Agent + outbox_poller→WS |
-| 7 子 Agent (LangGraph StateGraph) v2 | ✅ | 当前：Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video |
-| 7 子 Agent v3 重构 | 📐 | 目标：Literature/Knowledge/Research/Writing/Capture/Translation/Glossary（[v3 方案](docs/product/智驭研_重构方案_v3.md)） |
-| 子 Agent lifecycle 上报 | ✅ | sub_agent_task 收尾发 agent_done/agent_failed |
-| IngestParams v2 (21 字段) | 📐 | 文档定型（[memory-system.md 附录 A](docs/development/memory-system.md)），Phase 2 代码 |
-| 7 子 Agent v2 重写 (吃 IngestParams) | 📐 | 文档定型，Phase 2 代码 |
-| Celery 任务 | ✅ | 9 task + Beat（Phase 2 加 consolidate_long_term）|
-| ToolRegistry | ✅ | 56 工具（Phase 2 加 update_preference）|
+| 上线历史同步 (v10.2) | ✅ | REST API `GET /api/sessions/{id}/messages` 替代 WS sync |
+| **记忆系统 v2 (LangGraph 三件套 + PostgreSQL)** | ✅ | Checkpointer/Store 迁 PG；memory.py 保留 MemoryManager 业务逻辑 |
+| 三档压缩 (trim/摘要/长期抽取) | ✅ | summarizer.py + message_trim.py + celery_tasks.py consolidate_long_term |
+| Checkpointer (LangGraph 原生 resume) | ✅ | `AsyncPostgresSaver`，跨进程 resume 可用 |
+| WebSocket 协议 | ✅ | v10.2：移除 sync，新增 tool_execution/plan_review/plan_todo_update |
+| REST API | ✅ | `GET /api/sessions/{id}/messages` + JWT auth + 去重 + since 增量 |
+| 消息向量召回 | ✅ | `message_embeddings` 表 + pgvector search_similar_messages + Redis 缓存 |
+| Rerank (Cross-Encoder) | 🔶 | reranker.py (SiliconFlow bge-reranker-v2-m3)，替换 LLM rerank |
+| RAG 可观测性 | 🔶 | rag_traces 表 + check_rag_health 工具 + DEBUG_PROTOCOL 推送 |
+| 记忆去重 | 🔶 | update_preference: exact/high_sim skip + LLM merge |
+| 7 子 Agent (LangGraph StateGraph) v2 | ✅ | 当前：Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video + Knowledge/Literature/Writing/Glossary |
+| 7 子 Agent v3 重构 | 📐 | 目标：Literature/Knowledge/Research/Writing/Capture/Translation/Glossary |
+| Celery 任务 | ✅ | 10 task (含 session_close_check) + Beat 5 schedule |
+| ToolRegistry | ✅ | 73+ 工具 (含 check_rag_health + update_preference 去重) |
 | 反幻觉策略 (4 层主线) | 🔶 | L1/L4 已落地，L2/L3 Phase B/C |
-| 文档 | ✅ | CLAUDE.md / main-agent.md / memory-system.md / agent-manifest.md / anti-hallucination.md 全套对齐 |
+| 文档 | ✅ | CLAUDE.md / main-agent.md / memory-system.md / websocket-protocol.md / anti-hallucination.md / api-reference.md |
 | 测试 | 🔶 | 各模块有单元/集成测试；端到端 LLM 测试需配 API key |
 
 > 状态图例：✅ 已落地 · 🔶 部分落地 · 📐 文档定型待 Phase 2 代码 · ❌ 废弃
@@ -456,13 +468,14 @@ Python >= 3.11
 
 | # | 功能 | 工作量 | 备注 |
 |---|------|:---:|------|
-| 1 | **v3 Phase 1：基础设施重构**（PostgreSQL+pgvector + 多用户 + 冷启动 + 数据迁移）| 2 周 | 🔶 Daemon/API 已切 PG；~80 处 SQLite 硬编码待迁移（celery_tasks/tool_registry/cli/checkpointer/store/tests） |
+| 1 | **~~v3 Phase 1：基础设施重构~~** | ✅ 完成 | PostgreSQL+pgvector + SQLite 清零 + 多用户 + 冷启动 |
 | 2 | v3 Phase 2：Agent 架构重构（ingest 拆分 + Writing/Glossary 新建 + Celery）| 2 周 | |
 | 3 | v3 Phase 3：引用标记与验证（内外双通道 + 并行调度）| 2 周 | |
 | 4 | v3 Phase 4：评估体系与收尾（检索质量 + 反幻觉 + Zotero）| 2 周 | |
-| 5 | aioapns 真实集成 + iOS 端注册流程 | 3-5 天 | 后端保留 WebSocket 协议兼容 |
-| 6 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5 天 | |
-| 7 | Docker 部署 | 2-3 天 | |
-| 8 | 测试覆盖率提升 | 持续 | |
+| 5 | **提交 Phase 4 代码**（reranker + 去重 + rag_traces + session_close）| 1 天 | 代码已完成，待验证 + 提交 |
+| 6 | aioapns 真实集成 + iOS 端注册流程 | 3-5 天 | 后端保留 WebSocket 协议兼容 |
+| 7 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5 天 | |
+| 8 | Docker 部署 | 2-3 天 | |
+| 9 | 测试覆盖率提升 | 持续 | |
 
 > **注意**：Vue 前端迁移不在本项目范围内，由独立前端项目负责。后端保持 WebSocket 协议兼容，同时支持现有 iOS 客户端和未来 Vue 前端。

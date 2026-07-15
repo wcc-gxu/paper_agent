@@ -299,7 +299,7 @@ class WritingAgent:
                     f"- Be critical and comparative, not just descriptive\n"
                     f"- Limit to 2000 words\n"
                 )
-                survey = await self.llm.chat(prompt)
+                survey = await self.llm.chat([{"role": "user", "content": prompt}])
             except Exception as e:
                 logger.warning(f"LLM survey generation failed: {e}")
                 survey = f"[Survey generation failed: {e}]"
@@ -500,7 +500,7 @@ class WritingAgent:
             "If none found, return empty list []."
         )
         try:
-            response = await self.llm.chat(prompt)
+            response = await self.llm.chat([{"role": "user", "content": prompt}])
             # 尝试解析 JSON
             json_match = re.search(r'\[.*\]', response, re.DOTALL)
             if json_match:

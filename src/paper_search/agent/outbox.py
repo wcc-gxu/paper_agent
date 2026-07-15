@@ -96,6 +96,7 @@ async def outbox_publish(
     db: Any,
     envelope: dict,
     correlation_id: str = "",
+    user_id: str = "",
 ) -> str:
     """发布一条出站消息到 outbox（持久化 + 排队）。
 
@@ -131,10 +132,11 @@ async def outbox_publish(
             # 持久化失败不应阻塞推送，仅 log
             logger.warning(f"outbox: SQLite write failed for {msg_id}: {e}")
 
-    # 2) LPUSH Redis outbox List
+    # 2) LPUSH Redis outbox List (v3.2: user-scoped if user_id provided)
     try:
         data = json.dumps(envelope, ensure_ascii=False, default=str)
-        await redis_client.lpush(outbox_key(agent_id), data)
+        queue_key = outbox_key(user_id) if user_id else outbox_key(agent_id)
+        await redis_client.lpush(queue_key, data)
     except Exception as e:
         logger.error(f"outbox: Redis LPUSH failed for {msg_id}: {e}")
         # Redis 失败仍返回 msg_id；如果 SQLite 写成功了，iOS 重连可拉取

@@ -122,15 +122,26 @@ class SummarizationNode:
         # 归档
         summary_msg_id = f"summary-{uuid.uuid4().hex[:12]}"
         try:
-            self._archive(
+            # 去重: 检查是否已有相同数量的归档
+            existing = self._check_archive_exists(
                 thread_id=thread_id,
-                agent_id=agent_id,
-                summary_msg_id=summary_msg_id,
-                original_messages=to_summarize,
-                reason=reason or f"trigger_count_{len(messages)}",
+                original_count=len(to_summarize),
             )
+            if existing:
+                logger.debug(
+                    f"Skipping archive for {thread_id}: "
+                    f"already archived (existing={existing})"
+                )
+            else:
+                self._archive(
+                    thread_id=thread_id,
+                    agent_id=agent_id,
+                    summary_msg_id=summary_msg_id,
+                    original_messages=to_summarize,
+                    reason=reason or f"trigger_count_{len(messages)}",
+                )
         except Exception as e:
-            logger.warning(f"conversation_archive write failed: {e}")
+            logger.warning(f"conversation_archive write/skip failed: {e}")
 
         # 拼回去
         summary_block = SystemMessage(
@@ -188,6 +199,21 @@ class SummarizationNode:
             # Fail-soft: 拼接 partial
             return "\n\n".join(partials)
 
+    def _check_archive_exists(
+        self, thread_id: str, original_count: int
+    ) -> Optional[str]:
+        """检查是否已有相同数量的归档记录（去重）."""
+        try:
+            row = self.db.conn.execute(
+                """SELECT id FROM conversation_archive
+                   WHERE session_id = %s AND original_count = %s
+                   ORDER BY created_at DESC LIMIT 1""",
+                (thread_id, original_count),
+            ).fetchone()
+            return row["id"] if row else None
+        except Exception:
+            return None
+
     def _archive(
         self,
         thread_id: str,
@@ -196,27 +222,52 @@ class SummarizationNode:
         original_messages: list[BaseMessage],
         reason: str,
     ) -> None:
-        """把原始 messages 写入 conversation_archive 表."""
+        """把原始 messages 写入 conversation_archive 表 (PostgreSQL schema).
+
+        兼容 init_db.sql DDL: id, session_id, user_id, summary_text, summary_type,
+        start_msg_id, end_msg_id, metadata (JSONB), thread_id, agent_id, 等.
+        """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         original_json = json.dumps(
             [_message_to_dict(m) for m in original_messages],
             ensure_ascii=False,
         )
         token_count = estimate_tokens(original_messages)
+        archive_id = f"arch-{summary_msg_id}"
+
+        # 元数据打包进 JSONB (含旧 schema 的扩展字段)
+        metadata = json.dumps({
+            "summary_msg_id": summary_msg_id,
+            "original_messages_json": original_json,
+            "agent_id": agent_id,
+            "reason": reason,
+        }, ensure_ascii=False)
+
         self.db.conn.execute(
             """INSERT INTO conversation_archive
-               (thread_id, agent_id, archived_at, summary_msg_id,
+               (id, session_id, user_id, summary_text, summary_type,
+                start_msg_id, end_msg_id, metadata,
+                thread_id, agent_id, archived_at, summary_msg_id,
                 original_messages_json, original_count, token_count, reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                       %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
-                thread_id,
-                agent_id,
-                now,
-                summary_msg_id,
-                original_json,
-                len(original_messages),
-                token_count,
-                reason,
+                archive_id,
+                thread_id,                      # session_id
+                "user-default",                 # user_id
+                "(see metadata)",               # summary_text
+                "rolling",                      # summary_type
+                None,                           # start_msg_id
+                summary_msg_id,                 # end_msg_id
+                metadata,                       # metadata (JSONB)
+                thread_id,                      # thread_id
+                agent_id,                       # agent_id
+                now,                            # archived_at
+                summary_msg_id,                 # summary_msg_id
+                original_json,                  # original_messages_json
+                len(original_messages),         # original_count
+                token_count,                    # token_count
+                reason,                         # reason
             ),
         )
         self.db.conn.commit()

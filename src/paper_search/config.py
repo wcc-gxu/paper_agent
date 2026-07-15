@@ -228,6 +228,20 @@ EMBEDDING_MODEL = os.environ.get(
 EMBEDDING_DIMENSIONS = int(os.environ.get("EMBEDDING_DIMENSIONS", "1024"))
 
 # ═══════════════════════════════════════════════════════════════
+# Rerank API 配置 (独立于 Embedding / LLM chat API)
+# ═══════════════════════════════════════════════════════════════
+
+RERANK_API_KEY = os.environ.get("RERANK_API_KEY", "")
+RERANK_BASE_URL = os.environ.get(
+    "RERANK_BASE_URL",
+    "https://api.siliconflow.cn/v1/rerank",
+)
+RERANK_MODEL = os.environ.get(
+    "RERANK_MODEL",
+    "BAAI/bge-reranker-v2-m3",
+)
+
+# ═══════════════════════════════════════════════════════════════
 # Model Routing — 模型路由表 (全部走 DeepSeek API)
 # ═══════════════════════════════════════════════════════════════
 #

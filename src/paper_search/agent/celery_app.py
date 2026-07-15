@@ -62,6 +62,12 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=0, minute=30),
         "options": {"queue": "default"},
     },
+    # Phase 4: 会话关闭检查 — 每 15 分钟扫描一次
+    "session-close-check": {
+        "task": "paper_search.agent.celery_tasks.session_close_check_task",
+        "schedule": crontab(minute="*/15"),
+        "options": {"queue": "default"},
+    },
 }
 
 # 自动发现 tasks

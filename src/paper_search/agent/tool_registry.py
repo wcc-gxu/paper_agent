@@ -58,6 +58,60 @@ def set_db(db, user_id: str = "user-default"):
     _user_id = user_id
 
 
+# ── Memory Dedup Helpers ──────────────────────────────────────────
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """字符 bigram Jaccard 相似度（轻量，无需外部依赖）."""
+    if not a or not b:
+        return 0.0
+
+    def _bigrams(s: str) -> set:
+        return {s[i : i + 2] for i in range(len(s) - 1)}
+
+    ba, bb = _bigrams(a), _bigrams(b)
+    if not ba or not bb:
+        return 0.0
+    return len(ba & bb) / len(ba | bb)
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def _llm_decide_merge(key: str, existing: str, incoming: str) -> dict:
+    """LLM 决定如何合并已存在的偏好和新偏好."""
+    from .llm_client_v2 import get_llm_client
+
+    llm = get_llm_client()
+    try:
+        result = await llm.chat_json(
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"偏好键: {key}\n"
+                    f"现有值: {existing}\n"
+                    f"新值: {incoming}\n\n"
+                    "请决定如何处理新偏好:\n"
+                    "- 'skip': 含义与现有相同，跳过\n"
+                    "- 'replace': 新值更准确，替换\n"
+                    "- 'merge': 两者各有价值，合并保留\n"
+                    "输出 JSON: "
+                    '{"action": "skip|replace|merge", '
+                    '"merged_value": "合并后的完整文本", '
+                    '"reason": "决策理由"}'
+                ),
+            }],
+            temperature=0.1,
+            node="topic_consolidate",
+        )
+        return result
+    except Exception:
+        return {"action": "replace", "merged_value": incoming}
+
+
 # ── Tool Error Handler ──────────────────────────────────────────────
 # 统一包装所有 _make_* 工具函数的异常处理：
 #   1. 捕获异常 → 创建 AgentError（含 agent/node/type/message/traceback/context）
@@ -458,6 +512,9 @@ class ToolRegistry:
 
         # ── v3 Phase 4: Zotero 集成 ──
         self._register_zotero_tools()
+
+        # ── v3 Phase 4: 系统健康工具 ──
+        self._register_system_health_tools()
 
     # ══════════════════════════════════════════════════════════
     # 通用工具
@@ -965,8 +1022,8 @@ class ToolRegistry:
 
             # 调用 LLMClientV2 压缩
             try:
-                from .llm_client_v2 import LLMClientV2
-                llm = LLMClientV2()
+                from .llm_client_v2 import get_llm_client
+                llm = get_llm_client()
                 resp = await llm.chat(
                     messages=[{"role": "user",
                                 "content": "请把以下对话压缩成 ≤200 字中文要点摘要（保留人物/决策/关键事实，去掉寒暄）：\n\n" + transcript}],
@@ -1630,7 +1687,7 @@ class ToolRegistry:
     def _make_evaluate_papers(self):
         async def evaluate_papers(project_id: str = "", query: str = "", all: bool = True) -> str:
             """LLM 批量评估项目论文相关性 → 写 project_papers.relevance_score/reason。"""
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             db = _get_db()
             rows = db.get_project_papers(project_id)
             if not rows:
@@ -1648,7 +1705,7 @@ class ToolRegistry:
                 user_query = project.get("user_query", "")
 
             papers = [_row_to_paper(r) for r in rows]
-            llm = LLMClientV2()
+            llm = get_llm_client()
             try:
                 judgments = await llm.evaluate_batch(papers, user_query, max_concurrent=5)
             except Exception as e:
@@ -1703,7 +1760,7 @@ class ToolRegistry:
     def _make_generate_survey(self):
         async def generate_survey(project_id: str = "") -> str:
             """生成文献综述 Markdown → 写 outputs/{project_id}/survey.md。"""
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .llm_client import RelevanceJudgment
             from ..config import get_outputs_dir
             db = _get_db()
@@ -1726,7 +1783,7 @@ class ToolRegistry:
                 is_relevant=(r.get("relevance_score") or 0.5) >= 0.5,
             ) for r in top]
 
-            llm = LLMClientV2()
+            llm = get_llm_client()
             try:
                 report = await llm.generate_report(
                     user_query, papers, judgments, db=db, project_id=project_id,
@@ -1853,10 +1910,10 @@ class ToolRegistry:
             """引用追溯 — 委托 CitationChaseAgent graph（resolve→fetch→filter→ingest→decide→summarize）。"""
             from ..engine import PaperSearchEngine
             from ..config import Config
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .graphs.citation_chase_graph import CitationChaseAgent
             db = _get_db()
-            llm = LLMClientV2()
+            llm = get_llm_client()
             engine = PaperSearchEngine(Config())
 
             seed = paper_title or doi
@@ -1913,12 +1970,12 @@ class ToolRegistry:
     def _make_extract_knowledge(self):
         async def extract_knowledge(paper_id: str = "", deep: bool = False) -> str:
             """从论文提取结构化知识（贡献/方法/数据集/局限）→ 存长期记忆 knowledge_entries。委托 KnowledgeBase。"""
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .pgvector_store import PgVectorStore
             from .knowledge import KnowledgeBase
             from .memory import KnowledgeEntry, MemoryManager
             db = _get_db()
-            llm = LLMClientV2()
+            llm = get_llm_client()
             chroma = PgVectorStore(user_id=_get_user_id())
             kb = KnowledgeBase(db, chroma, llm)
             try:
@@ -1955,11 +2012,11 @@ class ToolRegistry:
     def _make_find_related(self):
         async def find_related(paper_id: str = "", top_k: int = 10) -> str:
             """发现相关论文（语义相似度 + 引用关系）。委托 KnowledgeBase.find_related。"""
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .pgvector_store import PgVectorStore
             from .knowledge import KnowledgeBase
             db = _get_db()
-            llm = LLMClientV2()
+            llm = get_llm_client()
             chroma = PgVectorStore(user_id=_get_user_id())
             kb = KnowledgeBase(db, chroma, llm)
             try:
@@ -1991,11 +2048,11 @@ class ToolRegistry:
             无法在进程内运行；KnowledgeBase.discover_gaps 是完整的 LLM 分析实现，
             直接产出 gaps/contradictions/trends/emerging_topics，故委托之。
             """
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .pgvector_store import PgVectorStore
             from .knowledge import KnowledgeBase
             db = _get_db()
-            llm = LLMClientV2()
+            llm = get_llm_client()
             chroma = PgVectorStore(user_id=_get_user_id())
             kb = KnowledgeBase(db, chroma, llm)
             try:
@@ -2014,14 +2071,14 @@ class ToolRegistry:
     def _make_build_glossary(self):
         async def build_glossary(project_id: str = "") -> str:
             """构建中英学术术语表 — 委托 TranslationAgent.build_glossary。"""
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .pgvector_store import PgVectorStore
             from .graphs.translation_graph import TranslationAgent
             if not project_id:
                 return json.dumps({"error": "project_id is required to build glossary"},
                                   ensure_ascii=False)
             db = _get_db()
-            llm = LLMClientV2()
+            llm = get_llm_client()
             chroma = PgVectorStore(user_id=_get_user_id())
             agent = TranslationAgent(db, llm, chroma)
             try:
@@ -2034,13 +2091,13 @@ class ToolRegistry:
     def _make_translate_query(self):
         async def translate_query(query: str = "", target_lang: str = "en") -> str:
             """中文查询 → 学术英文关键词 — 委托 TranslationAgent.translate_query。"""
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .pgvector_store import PgVectorStore
             from .graphs.translation_graph import TranslationAgent
             if not query:
                 return json.dumps({"error": "query is required"}, ensure_ascii=False)
             db = _get_db()
-            llm = LLMClientV2()
+            llm = get_llm_client()
             chroma = PgVectorStore(user_id=_get_user_id())
             agent = TranslationAgent(db, llm, chroma)
             direction = "zh2en" if target_lang.lower().startswith("en") else "en2zh"
@@ -2145,10 +2202,10 @@ class ToolRegistry:
         async def generate_survey_v2(project_id: str, template: str = "arxiv") -> str:
             from .graphs.writing_graph import WritingAgent
             from .pgdb import PostgresAgentDB
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             db = _get_db()
             papers = db.get_project_papers(project_id)
-            llm = LLMClientV2()
+            llm = get_llm_client()
             agent = WritingAgent(db=db, llm_client=llm)
             result = await agent.generate_survey(project_id, template=template, papers=papers)
             return json.dumps(result, ensure_ascii=False, default=str)
@@ -2174,12 +2231,12 @@ class ToolRegistry:
         async def build_glossary_v2(project_id: str, domain: str = "") -> str:
             from .graphs.glossary_graph import GlossaryAgent
             from .pgdb import PostgresAgentDB
-            from .llm_client_v2 import LLMClientV2
+            from .llm_client_v2 import get_llm_client
             from .pgvector_store import PgVectorStore
             db = _get_db()
             papers = db.get_project_papers(project_id)
             paper_ids = [p.get("paper_id", "") for p in papers]
-            llm = LLMClientV2()
+            llm = get_llm_client()
             chroma = PgVectorStore(user_id=_get_user_id())
             agent = GlossaryAgent(db=db, vector_store=chroma, llm_client=llm)
             result = await agent.collect_terms(paper_ids=paper_ids, domain=domain)
@@ -2220,16 +2277,141 @@ class ToolRegistry:
             dsn = os.environ.get("DATABASE_URL", "")
             store = AsyncPostgresStore.from_conn_string(dsn)
             await store.setup()
+
+            # Step 1: 查已有值
+            try:
+                existing_item = await store.aget(("user-default", "preferences"), key)
+            except Exception:
+                existing_item = None
+
+            if existing_item is not None:
+                existing_value = existing_item.get("value", "")
+                if existing_value == value:
+                    return json.dumps({
+                        "success": True, "key": key, "value": value,
+                        "dedup": "exact_match_skipped",
+                    }, ensure_ascii=False)
+
+                # Step 2: 相似度检查
+                sim = _text_similarity(existing_value, value)
+                if sim >= 0.9:
+                    return json.dumps({
+                        "success": True, "key": key, "value": existing_value,
+                        "dedup": "high_similarity_skipped",
+                        "similarity": round(sim, 4),
+                    }, ensure_ascii=False)
+
+                if sim >= 0.6:
+                    # Step 3: LLM 决策 merge/skip/replace
+                    try:
+                        decision = await _llm_decide_merge(key, existing_value, value)
+                    except Exception:
+                        decision = {"action": "replace", "merged_value": value}
+                    action = decision.get("action", "replace")
+                    if action == "skip":
+                        return json.dumps({
+                            "success": True, "key": key, "value": existing_value,
+                            "dedup": "duplicate_skipped",
+                        }, ensure_ascii=False)
+                    elif action == "merge":
+                        merged = decision.get("merged_value", value)
+                        await store.aput(
+                            ("user-default", "preferences"), key,
+                            {"value": merged, "updated_at": _now_iso()},
+                        )
+                        return json.dumps({
+                            "success": True, "key": key, "value": merged,
+                            "dedup": "llm_merged",
+                        }, ensure_ascii=False)
+                    # else: replace → write through
+
+            # Step 4: 写入
             await store.aput(
                 ("user-default", "preferences"), key,
-                {"value": value, "updated_at": ""},
+                {"value": value, "updated_at": _now_iso()},
             )
-            return json.dumps({"success": True, "key": key, "value": value}, ensure_ascii=False)
+            return json.dumps({
+                "success": True, "key": key, "value": value,
+                "dedup": "written",
+            }, ensure_ascii=False)
         return update_preference
 
     # ══════════════════════════════════════════════════════════
     # v3 Phase 4: Zotero 导入导出
     # ══════════════════════════════════════════════════════════
+
+    def _register_system_health_tools(self):
+        """Phase 4: RAG 系统健康检查工具."""
+        self.register_direct(
+            "check_rag_health",
+            "检查 RAG 系统健康状态（最近 N 小时查询量/错误率/延迟）",
+            self._make_check_rag_health(),
+            args_schema={
+                "hours": {
+                    "type": "integer",
+                    "description": "回溯时间窗口（小时）",
+                    "default": 24,
+                },
+            },
+            metadata=ToolMetadata(category="system"),
+        )
+
+    def _make_check_rag_health(self):
+        async def check_rag_health(hours: int = 24) -> str:
+            db = _get_db()
+            try:
+                # 总查询量
+                total_row = db.conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM rag_traces "
+                    "WHERE created_at > NOW() - INTERVAL '%s hours'",
+                    (str(hours),),
+                ).fetchone()
+                total = total_row["cnt"] if total_row else 0
+
+                if total == 0:
+                    return json.dumps({
+                        "status": "no_data",
+                        "message": f"过去 {hours} 小时无 RAG 查询",
+                        "hours": hours,
+                    }, ensure_ascii=False)
+
+                # 错误率
+                error_row = db.conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM rag_traces "
+                    "WHERE created_at > NOW() - INTERVAL '%s hours' "
+                    "AND error_text IS NOT NULL AND error_text != ''",
+                    (str(hours),),
+                ).fetchone()
+                errors = error_row["cnt"] if error_row else 0
+                error_rate = round(errors / total, 4) if total > 0 else 0.0
+
+                # 延迟 (P50/P95)
+                lat_rows = db.conn.execute(
+                    "SELECT total_ms FROM rag_traces "
+                    "WHERE created_at > NOW() - INTERVAL '%s hours' "
+                    "AND total_ms IS NOT NULL "
+                    "ORDER BY total_ms",
+                    (str(hours),),
+                ).fetchall()
+                latencies = [r["total_ms"] for r in lat_rows if r["total_ms"]]
+                p50 = latencies[len(latencies) // 2] if latencies else 0
+                p95 = latencies[int(len(latencies) * 0.95)] if len(latencies) > 1 else p50
+
+                return json.dumps({
+                    "status": "ok" if error_rate < 0.1 else "degraded",
+                    "total_queries": total,
+                    "error_count": errors,
+                    "error_rate": error_rate,
+                    "latency_ms_p50": p50,
+                    "latency_ms_p95": p95,
+                    "hours": hours,
+                }, ensure_ascii=False)
+            except Exception as e:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"健康检查失败: {e}",
+                }, ensure_ascii=False)
+        return check_rag_health
 
     def _register_zotero_tools(self):
         self.register_direct(

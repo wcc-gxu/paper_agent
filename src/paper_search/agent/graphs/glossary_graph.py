@@ -389,7 +389,7 @@ class GlossaryAgent:
             )
 
             try:
-                response = await self.llm.chat(prompt)
+                response = await self.llm.chat([{"role": "user", "content": prompt}])
                 json_match = re.search(r'\[.*\]', response, re.DOTALL)
                 if json_match:
                     translations = json.loads(json_match.group())
@@ -466,7 +466,7 @@ class GlossaryAgent:
             f"\"issues\": [\"...\"]}}"
         )
         try:
-            response = await self.llm.chat(prompt)
+            response = await self.llm.chat([{"role": "user", "content": prompt}])
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())

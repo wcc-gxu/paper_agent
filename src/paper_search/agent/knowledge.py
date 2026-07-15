@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,6 +105,7 @@ class KnowledgeBase:
         Returns:
             RAGResult with answer and sources
         """
+        top_k = top_k or 5  # 防御 None 传入
         # Stage 1: 检索
         if use_fulltext and self._chroma:
             retrieved = self._chroma.search_fulltext(question, n_results=top_k * 2)
@@ -145,12 +147,27 @@ class KnowledgeBase:
                 confidence=0.0,
             )
 
-        # Rerank with LLM
+        # Stage 2: Cross-Encoder Rerank
+        t_rerank_start = time.monotonic()
         reranked = await self._rerank(question, candidates, top_k)
+        t_rerank_end = time.monotonic()
 
         # Stage 3: LLM 生成答案
         answer, confidence, follow_ups = await self._generate_answer(
             question, reranked
+        )
+        t_total = time.monotonic()
+
+        # 记录 RAG trace (fire-and-forget)
+        self._record_rag_trace(
+            session_id="knowledge",
+            query_text=question,
+            retrieved_count=len(candidates),
+            reranked_count=len(reranked),
+            retrieval_ms=0,
+            rerank_ms=int((t_rerank_end - t_rerank_start) * 1000),
+            total_ms=int((t_total - t_rerank_start) * 1000),
+            confidence=confidence,
         )
 
         return RAGResult(
@@ -164,49 +181,83 @@ class KnowledgeBase:
     async def _rerank(
         self, question: str, candidates: list[dict], top_k: int
     ) -> list[dict]:
-        """LLM 重排序 — 从候选论文中选出最相关的 top-k。
+        """Cross-Encoder 重排序 — BGE-reranker-v2-m3 (SiliconFlow).
 
-        注意: 当前用 LLM 重排序。Phase 4 将替换为 Cross-Encoder (bge-reranker-v2-m3)，
-        需要将输入截断到 512 tokens 以内。此处保留足够的上下文窗口。
+        替代原有 LLM 重排序。RerankError 时返回空列表（降级到无重排序结果）。
         """
-        # ── Bugfix: 增大截断窗口，给 LLM 足够信息判断相关性 ──
-        ABSTRACT_MAX = 500   # 从 200 提升，Cross-Encoder 时降回 300
-        SNIPPET_MAX = 300    # 从 150 提升
-        candidates_text = "\n\n".join(
-            f"[{i}] {c['title']} ({c.get('year', '?')})\n"
-            f"   摘要: {c['abstract'][:ABSTRACT_MAX]}\n"
-            f"   片段: {c.get('snippet', '')[:SNIPPET_MAX]}"
-            for i, c in enumerate(candidates)
-        )
+        import asyncio
+
+        from .reranker import RerankError, get_reranker
+
+        if not candidates:
+            return []
+
+        # 截断到 ~2000 chars (约 512 tokens) 以适配 Cross-Encoder 输入限制
+        RERANK_CHAR_LIMIT = 2000
+        documents = [
+            f"{c['title']} {c.get('abstract', '')[:RERANK_CHAR_LIMIT]}"
+            for c in candidates
+        ]
 
         try:
-            result = await self._llm.chat_json(
-                messages=[{"role": "user", "content": (
-                    f"问题: {question}\n\n候选论文:\n{candidates_text}\n\n"
-                    f"请选择最相关的 {top_k} 篇论文，返回它们的编号列表。"
-                )}],
-                system="""你是论文相关性排序器。根据问题选择最相关的论文。
-
-输出纯 JSON:
-{
-  "ranked_indices": [3, 7, 1, 5, 9],
-  "reasoning": "选择理由简述"
-}""",
-                node="rad_query_route",
+            reranker = get_reranker()
+            results = await asyncio.to_thread(
+                reranker.rerank, question, documents, top_k=top_k,
             )
-            indices = result.get("ranked_indices", list(range(min(top_k, len(candidates)))))
-        except Exception as e:
-            logger.warning(f"Rerank failed: {e}")
-            indices = list(range(min(top_k, len(candidates))))
+        except RerankError as e:
+            logger.error(f"Rerank 失败 (hard error): {e}")
+            return []
 
         reranked = []
-        for idx in indices:
+        for rr in results:
+            idx = rr.index
             if 0 <= idx < len(candidates):
-                c = candidates[idx]
-                c["relevance"] = 1.0 - (indices.index(idx) * 0.1)  # 衰减分数
+                c = dict(candidates[idx])
+                c["relevance"] = round(rr.score, 4)
                 reranked.append(c)
 
-        return reranked[:top_k]
+        return reranked
+
+    def _record_rag_trace(
+        self,
+        session_id: str,
+        query_text: str,
+        retrieved_count: int,
+        reranked_count: int,
+        retrieval_ms: int = 0,
+        rerank_ms: int = 0,
+        total_ms: int = 0,
+        confidence: float = 0.0,
+        error_text: str = "",
+    ) -> None:
+        """Fire-and-forget 写 rag_traces 表."""
+        try:
+            from .pgdb import _uuid
+
+            trace_id = _uuid("rag")
+            self._db.conn.execute(
+                """INSERT INTO rag_traces
+                   (id, session_id, user_id, query_text, retrieved_count,
+                    reranked_count, retrieval_ms, rerank_ms, total_ms,
+                    confidence, error_text)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    trace_id,
+                    session_id[:64] if session_id else "unknown",
+                    "user-default",
+                    (query_text or "")[:500],
+                    retrieved_count,
+                    reranked_count,
+                    retrieval_ms,
+                    rerank_ms,
+                    total_ms,
+                    confidence,
+                    (error_text or "")[:500],
+                ),
+            )
+            self._db.conn.commit()
+        except Exception as e:
+            logger.debug(f"Failed to record rag_trace: {e}")
 
     async def _generate_answer(
         self, question: str, sources: list[dict]

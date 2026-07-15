@@ -172,12 +172,14 @@ class MainGraph:
         db: Any = None,
         push_fn: Any = None,          # async fn(session_id, type, subtype, role, **kw) -> None
         get_user_fn: Any = None,       # async fn(session_id, ask_id, timeout) -> dict | None
+        agent_system_prompt: str = "", # custom agent system prompt (overrides defaults)
     ):
         self.llm = llm
         self.registry = registry
         self.db = db
         self._push = push_fn
         self._get_user = get_user_fn
+        self._agent_system_prompt = agent_system_prompt.strip() if agent_system_prompt else ""
 
     # ── Push Helpers ──────────────────────────────────────────
 
@@ -482,10 +484,13 @@ class MainGraph:
             await self._push_status(session_id, "planning", "正在制定研究计划...")
 
         try:
+            plan_system = build_plan_v31_prompt()
+            if self._agent_system_prompt:
+                plan_system = f"{self._agent_system_prompt}\n\n---\n\n{plan_system}"
             data = await self.llm.chat_json(
                 messages=[{"role": "user", "content": user}],
                 schema=PlanOutput,
-                system=build_plan_v31_prompt(),
+                system=plan_system,
                 temperature=0.2,
                 node="plan_v31",
             )
@@ -813,6 +818,8 @@ class MainGraph:
         current_todo = todos[current_todo_index]
         todo_label = current_todo.get("label", f"todo-{current_todo_index}")
         system = build_execute_v31_prompt(current_todo, todos)
+        if self._agent_system_prompt:
+            system = f"{self._agent_system_prompt}\n\n---\n\n{system}"
 
         # Build tool definitions for the LLM — without this it can't call tools at all
         available_tools = self._build_tool_defs(current_todo)
@@ -1440,11 +1447,14 @@ class MainGraph:
 
         await self._push_status(session_id, "responding", "正在生成回复...")
 
+        inline_system = self._agent_system_prompt or None
+
         full_text = ""
         try:
             if hasattr(self.llm, "chat_stream"):
                 async for chunk in self.llm.chat_stream(
                     messages=[{"role": "user", "content": user}],
+                    system=inline_system,
                     temperature=0.6,
                     node="inline_reply",
                 ):
@@ -1456,6 +1466,7 @@ class MainGraph:
             else:
                 resp = await self.llm.chat(
                     messages=[{"role": "user", "content": user}],
+                    system=inline_system,
                     temperature=0.6,
                     node="inline_reply",
                 )
@@ -1488,6 +1499,7 @@ def build_main_graph(
     push_fn: Any = None,
     get_user_fn: Any = None,
     checkpointer: Any = None,
+    agent_system_prompt: str = "",
 ) -> Any:
     """Build and compile the v3.1 MainGraph.
 
@@ -1498,6 +1510,7 @@ def build_main_graph(
         push_fn: async fn(session_id, type, subtype, role, **kw) for outbox push
         get_user_fn: async fn for waiting user replies (ask cards)
         checkpointer: LangGraph checkpointer (AsyncSqliteSaver or similar)
+        agent_system_prompt: optional custom agent system prompt (overrides defaults)
 
     Returns:
         Compiled LangGraph StateGraph
@@ -1505,5 +1518,6 @@ def build_main_graph(
     graph = MainGraph(
         llm=llm, registry=registry, db=db,
         push_fn=push_fn, get_user_fn=get_user_fn,
+        agent_system_prompt=agent_system_prompt,
     )
     return graph.compile(checkpointer=checkpointer)

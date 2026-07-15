@@ -283,7 +283,7 @@ def survey_task(self, project_id: str, user_query: str) -> dict:
     reporter = _get_reporter()
 
     try:
-        from .llm_client_v2 import LLMClientV2
+        from .llm_client_v2 import get_llm_client
         from .pgdb import PostgresAgentDB
         from ..config import get_outputs_dir
 
@@ -293,7 +293,7 @@ def survey_task(self, project_id: str, user_query: str) -> dict:
         if not papers_data:
             return {"project_id": project_id, "survey_path": "", "error": "No relevant papers found"}
 
-        llm = LLMClientV2()
+        llm = get_llm_client()
 
         # 构造论文列表
         papers = []
@@ -440,12 +440,12 @@ def evaluate_task(
 
     try:
         import asyncio
-        from .llm_client_v2 import LLMClientV2
+        from .llm_client_v2 import get_llm_client
 
         if not papers:
             return {"evaluations": [], "relevant_count": 0, "error": ""}
 
-        llm = LLMClientV2()
+        llm = get_llm_client()
 
         # Convert paper dicts for LLM evaluation
         eval_papers = [
@@ -658,10 +658,10 @@ async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
       - video:          query/user_query/url (含链接), project_id
       - rad_query:      question/query, project_id
     """
-    from .llm_client_v2 import LLMClientV2
+    from .llm_client_v2 import get_llm_client
 
     db = _get_db()
-    llm = LLMClientV2()
+    llm = get_llm_client()
 
     async def on_progress(stage, *args, **kwargs):
         """统一进度回调 — 兼容各 graph 的 _notify(stage, index, total, 0, 0) 签名。"""
@@ -1190,3 +1190,118 @@ def cleanup_logs_task(self) -> dict:
             logger.debug(f"[cleanup_logs] skip {f}: {e}")
     logger.info(f"[cleanup_logs] removed {removed} old log files")
     return {"removed": removed}
+
+
+# ── Phase 4: Session Close —————————————————————————————————
+
+
+@app.task(bind=True, max_retries=1, default_retry_delay=60)
+def session_close_check_task(self) -> dict:
+    """Celery Beat 定时任务: 扫描并关闭过期会话。
+
+    增量扫描策略:
+      1. 读取 session_scan_markers 中的扫描水位线
+      2. 扫描 updated_at > 水位线 且 updated_at < 1 小时前的活跃会话
+      3. 将符合条件的会话 status 切换为 'closed'
+      4. 更新水位线
+
+    Returns:
+        {"scanned": int, "closed": int, "error": str}
+    """
+    import json as _json
+
+    task_id = self.request.id or "unknown"
+    try:
+        from .pgdb import PostgresAgentDB
+        db = PostgresAgentDB()
+    except Exception as e:
+        logger.error(f"session_close_check_task: DB init failed: {e}")
+        return {"scanned": 0, "closed": 0, "error": str(e)}
+
+    reporter = _get_reporter()
+
+    try:
+        # 1) 读水位线
+        marker_row = db.conn.execute(
+            "SELECT last_scan_value FROM session_scan_markers "
+            "WHERE marker_type = %s",
+            ("session_close_last_scan",),
+        ).fetchone()
+        last_scan = (
+            marker_row["last_scan_value"]
+            if marker_row
+            else "2020-01-01T00:00:00Z"
+        )
+
+        now_iso = _now_iso()
+
+        # 2) 扫描 1 小时前有过活动但现在无连接的会话
+        active_sessions = db.conn.execute(
+            """SELECT id, user_id, title, updated_at
+               FROM sessions
+               WHERE status = 'active'
+                 AND updated_at > %s::timestamptz
+                 AND updated_at < NOW() - INTERVAL '1 hour'
+               ORDER BY updated_at ASC""",
+            (last_scan,),
+        ).fetchall()
+
+        closed_count = 0
+        skipped_count = 0
+
+        for sess in active_sessions:
+            sess_id = sess["id"]
+            try:
+                db.conn.execute(
+                    "UPDATE sessions SET status = %s, updated_at = %s WHERE id = %s",
+                    ("closed", now_iso, sess_id),
+                )
+                db.conn.commit()
+                closed_count += 1
+                logger.info(
+                    "Session closed: id=%s title=%s",
+                    sess_id, sess.get("title", ""),
+                )
+            except Exception as e:
+                skipped_count += 1
+                logger.warning(
+                    "Failed to close session %s: %s", sess_id, e,
+                )
+                try:
+                    db.conn.rollback()
+                except Exception:
+                    pass
+
+        # 3) 更新水位线
+        db.conn.execute(
+            """UPDATE session_scan_markers
+               SET last_scan_value = %s, updated_at = %s
+               WHERE marker_type = %s""",
+            (now_iso, now_iso, "session_close_last_scan"),
+        )
+        db.conn.commit()
+
+        reporter.report_done(task_id, {
+            "scanned": len(active_sessions),
+            "closed": closed_count,
+            "skipped": skipped_count,
+        })
+        return {
+            "scanned": len(active_sessions),
+            "closed": closed_count,
+            "skipped": skipped_count,
+        }
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"session_close_check_task failed: {error_str}")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        reporter.report_error(task_id, error_str)
+        return {"scanned": 0, "closed": 0, "error": error_str}
+
+
+def _now_iso() -> str:
+    """返回当前 UTC ISO 时间字符串."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

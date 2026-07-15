@@ -228,6 +228,122 @@ class PostgresAgentDB:
         return cur.fetchone()[0]
 
     # ═══════════════════════════════════════════════════════════════
+    # 智能体管理 (v3.2 多智能体)
+    # ═══════════════════════════════════════════════════════════════
+
+    def list_user_agents(self, user_id: str, include_inactive: bool = False) -> list[dict]:
+        """列出用户的所有智能体."""
+        extra = "" if include_inactive else " AND is_active = true"
+        return self._fetchall(
+            f"SELECT * FROM agents WHERE user_id = %s{extra} ORDER BY created_at",
+            (user_id,),
+        )
+
+    def get_agent(self, agent_id: str) -> Optional[dict]:
+        """获取单个智能体配置."""
+        return self._fetchone("SELECT * FROM agents WHERE id = %s", (agent_id,))
+
+    def get_default_agent(self, user_id: str) -> Optional[dict]:
+        """获取用户的默认智能体（最早创建的活跃 main 类型）。"""
+        return self._fetchone(
+            "SELECT * FROM agents WHERE user_id = %s AND agent_type = 'main' AND is_active = true ORDER BY created_at LIMIT 1",
+            (user_id,),
+        )
+
+    def create_agent(
+        self,
+        user_id: str,
+        name: str = "My Agent",
+        display_name: str = "Paper Agent",
+        system_prompt: str = "",
+        llm_provider: str = "deepseek",
+        agent_type: str = "main",
+    ) -> str:
+        """创建智能体，返回 agent_id."""
+        agent_id = _uuid("ag")
+        self._execute(
+            """INSERT INTO agents (id, user_id, name, display_name, agent_type, system_prompt, llm_provider)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            (agent_id, user_id, name, display_name, agent_type, system_prompt, llm_provider),
+        )
+        return agent_id
+
+    def update_agent(self, agent_id: str, user_id: str = None, **kwargs) -> bool:
+        """更新智能体配置。user_id 可选用于权限校验."""
+        if not kwargs:
+            return False
+        allowed = {"name", "display_name", "system_prompt", "llm_provider", "config", "is_active"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return False
+        updates["updated_at"] = "now()"
+        sets = [f"{k} = %s" for k in updates]
+        values = list(updates.values())
+        where = "id = %s"
+        params = values + [agent_id]
+        if user_id:
+            where += " AND user_id = %s"
+            params.append(user_id)
+        # Handle now() specially — pass as literal
+        self._execute(
+            f"UPDATE agents SET {', '.join(sets)} WHERE {where}".replace("'now()'", "now()"),
+            tuple(params),
+        )
+        return True
+
+    def deactivate_agent(self, agent_id: str, user_id: str = None) -> bool:
+        """软删除智能体."""
+        return self.update_agent(agent_id, user_id=user_id, is_active=False)
+
+    def agent_belongs_to_user(self, agent_id: str, user_id: str) -> bool:
+        """验证智能体是否属于该用户."""
+        row = self._fetchone(
+            "SELECT 1 FROM agents WHERE id = %s AND user_id = %s",
+            (agent_id, user_id),
+        )
+        return row is not None
+
+    # ═══════════════════════════════════════════════════════════════
+    # 用户偏好 (基于 user_configs 表)
+    # ═══════════════════════════════════════════════════════════════
+
+    def get_user_preferences(self, user_id: str) -> dict:
+        """获取用户所有偏好（返回 key→value dict）."""
+        rows = self._fetchall(
+            "SELECT config_key, config_value FROM user_configs WHERE user_id = %s",
+            (user_id,),
+        )
+        return {r["config_key"]: r["config_value"] for r in rows}
+
+    def get_user_preference(self, user_id: str, key: str) -> Optional[Any]:
+        """获取单个偏好值."""
+        row = self._fetchone(
+            "SELECT config_value FROM user_configs WHERE user_id = %s AND config_key = %s",
+            (user_id, key),
+        )
+        return row["config_value"] if row else None
+
+    def set_user_preference(self, user_id: str, key: str, value: Any) -> None:
+        """设置用户偏好（upsert）."""
+        import json as _json
+        val = _json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+        self._execute(
+            """INSERT INTO user_configs (id, user_id, config_key, config_value)
+               VALUES (%s, %s, %s, %s::jsonb)
+               ON CONFLICT (user_id, config_key) DO UPDATE SET config_value = EXCLUDED.config_value""",
+            (_uuid("cfg"), user_id, key, val),
+        )
+
+    def delete_user_preference(self, user_id: str, key: str) -> bool:
+        """删除用户偏好."""
+        cur = self._raw_conn.cursor()
+        cur.execute(
+            "DELETE FROM user_configs WHERE user_id = %s AND config_key = %s",
+            (user_id, key),
+        )
+        return cur.rowcount > 0
+
+    # ═══════════════════════════════════════════════════════════════
     # 项目管理
     # ═══════════════════════════════════════════════════════════════
 

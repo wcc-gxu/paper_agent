@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, ClassVar, Optional
 
 import httpx
+from pydantic import BaseModel, Field, field_validator
 
 from .llm_client import (
     ContinueDecision,
@@ -116,14 +117,15 @@ _PROVIDER_TEMPLATES: dict[str, ProviderConfig] = {
 # ═══════════════════════════════════════════════════════════════
 
 
-@dataclass
-class ToolDef:
-    """工具定义 — 符合 Anthropic tool_use 格式."""
+class ToolDef(BaseModel):
+    """工具定义 — 符合 Anthropic tool_use 格式 (Pydantic 校验)."""
 
     name: str
     description: str
     input_schema: dict[str, Any]  # JSON Schema
     handler: Optional[Callable] = None  # 实际执行函数 (可选, 用于本地执行)
+
+    model_config = {"arbitrary_types_allowed": True}  # handler 是 Callable
 
     def to_anthropic(self) -> dict:
         return {
@@ -143,38 +145,158 @@ class ToolDef:
         }
 
 
-@dataclass
-class ToolCall:
-    """LLM 返回的工具调用."""
+class ToolCall(BaseModel):
+    """LLM 返回的工具调用 (Pydantic 校验)."""
 
     id: str
     name: str
     arguments: dict[str, Any]
 
 
-@dataclass
-class ChatMessage:
-    """统一消息格式."""
+class ChatMessage(BaseModel):
+    """统一消息格式 (Pydantic 校验).
+
+    在构造时自动校验 role/content 非空，防止 None 值穿透到 API 调用导致 400。
+    """
 
     role: str  # system | user | assistant | tool
     content: str
     name: Optional[str] = None
-    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_calls: list[ToolCall] = Field(default_factory=list)
     tool_call_id: Optional[str] = None
-    thinking_blocks: list[dict] = field(default_factory=list)  # DeepSeek thinking blocks for multi-turn passthrough
+    thinking_blocks: list[dict] = Field(default_factory=list)
+
+    @field_validator("role")
+    @classmethod
+    def role_must_be_valid(cls, v: str) -> str:
+        allowed = {"system", "user", "assistant", "tool"}
+        if v not in allowed:
+            raise ValueError(f"role must be one of {allowed}, got '{v}'")
+        return v
+
+    @field_validator("content", mode="before")
+    @classmethod
+    def content_must_be_str(cls, v: Any) -> str:
+        if v is None:
+            raise ValueError("content must not be None — use '' for empty content")
+        if not isinstance(v, str):
+            return str(v)
+        return v
 
 
-@dataclass
-class ChatResponse:
-    """聊天响应."""
+class ChatResponse(BaseModel):
+    """聊天响应 (Pydantic 校验)."""
 
     content: str
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    thinking_blocks: list[dict] = field(default_factory=list)  # DeepSeek thinking blocks for multi-turn passthrough
+    tool_calls: list[ToolCall] = Field(default_factory=list)
+    thinking_blocks: list[dict] = Field(default_factory=list)
     stop_reason: str = "end_turn"  # end_turn | max_tokens | tool_use
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: dict[str, int] = Field(default_factory=dict)
     model: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Request Models — Anthropic Messages API 参数校验
+# ═══════════════════════════════════════════════════════════════
+
+class AnthropicMessageInput(BaseModel):
+    """单条消息 — 对应 Anthropic API messages[] 元素."""
+
+    role: str
+    content: str | list[dict]
+
+    @field_validator("role")
+    @classmethod
+    def role_must_be_valid(cls, v: str) -> str:
+        if v not in {"system", "user", "assistant", "tool"}:
+            raise ValueError(f"role must be system/user/assistant/tool, got '{v}'")
+        return v
+
+
+class AnthropicChatRequest(BaseModel):
+    """Anthropic Messages API 请求参数 (Pydantic 校验).
+
+    参考: https://docs.anthropic.com/en/api/messages
+    DeepSeek 兼容: https://api.deepseek.com/anthropic/v1/messages
+    """
+
+    messages: list[AnthropicMessageInput | dict] = Field(..., min_length=1)
+    model: str = ""
+    max_tokens: int = Field(default=4096, ge=1, le=65536)
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    system: str | None = Field(default=None, max_length=8000)
+    tools: list[dict] | None = Field(default=None)
+    tool_choice: dict | None = Field(default=None)
+    thinking: dict | None = Field(default=None)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    stop_sequences: list[str] | None = Field(default=None, max_length=16)
+
+    @field_validator("messages", mode="before")
+    @classmethod
+    def validate_messages_not_empty(cls, v: Any) -> Any:
+        if not v:
+            raise ValueError("messages must not be empty")
+        return v
+
+
+class AnthropicStructuredRequest(BaseModel):
+    """结构化 JSON 输出请求参数.
+
+    通过 tool_use + tool_choice 强制 LLM 输出符合 schema 的 JSON。
+    DeepSeek 限制: tool_choice 和 thinking 不能同时启用。
+    """
+
+    model_config = {"populate_by_name": True}
+
+    messages: list[AnthropicMessageInput | dict] = Field(..., min_length=1)
+    output_schema: dict = Field(..., alias="schema")  # JSON Schema — 用 alias 避免遮蔽 BaseModel.schema
+    model: str = ""
+    temperature: float = Field(default=0.1, ge=0.0, le=2.0)
+    system: str | None = Field(default=None, max_length=8000)
+    max_tokens: int = Field(default=4096, ge=1, le=65536)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Singleton — 全局 LLM 客户端
+# ═══════════════════════════════════════════════════════════════
+
+_llm_client: Optional["LLMClientV2"] = None
+_llm_client_lock = None
+
+
+def _get_lock():
+    global _llm_client_lock
+    if _llm_client_lock is None:
+        import threading
+        _llm_client_lock = threading.Lock()
+    return _llm_client_lock
+
+
+def get_llm_client(provider: str = "deepseek") -> "LLMClientV2":
+    """获取模块级 LLM 客户端单例。
+
+    替代分散在各处的 LLMClientV2() 惰性实例化。
+    所有 LLM 调用应通过此单例进行，确保共享连接池和限流器。
+
+    Usage:
+        from paper_search.agent.llm_client_v2 import get_llm_client
+        llm = get_llm_client()
+        result = await llm.chat_json(messages=..., schema=MyModel)
+    """
+    global _llm_client
+    if _llm_client is None:
+        with _get_lock():
+            if _llm_client is None:
+                _llm_client = LLMClientV2(provider=provider)
+                logger.info("LLM client singleton initialized (provider=%s)", provider)
+    return _llm_client
+
+
+def reset_llm_client() -> None:
+    """重置全局 LLM 客户端（测试用）."""
+    global _llm_client
+    _llm_client = None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -479,7 +601,37 @@ class LLMClientV2:
             headers=headers,
         )
 
-    # ── Message Conversion ─────────────────────────────────
+    # ── Message Validation & Conversion ────────────────────
+
+    @staticmethod
+    def _validate_messages(messages: list[ChatMessage | dict]) -> None:
+        """在 LLM 调用前校验消息格式，防止 None/空值导致 API 400。
+
+        抛出 ValueError，在调用方被捕获后转为用户可读的错误。
+        """
+        if not messages:
+            raise ValueError("messages must not be empty")
+        allowed_roles = {"system", "user", "assistant", "tool"}
+        for i, msg in enumerate(messages):
+            if isinstance(msg, dict):
+                role = msg.get("role")
+                content = msg.get("content")
+            elif hasattr(msg, "role"):
+                role = msg.role
+                content = msg.content
+            else:
+                raise ValueError(
+                    f"messages[{i}] is neither a dict nor ChatMessage: {type(msg).__name__}"
+                )
+            if role not in allowed_roles:
+                raise ValueError(
+                    f"messages[{i}].role must be one of {allowed_roles}, got '{role}'"
+                )
+            if content is None:
+                raise ValueError(
+                    f"messages[{i}].content is None (role={role}) — "
+                    f"use '' for empty assistant replies with tool_calls"
+                )
 
     def _to_anthropic_messages(
         self, messages: list[ChatMessage | dict]
@@ -629,6 +781,7 @@ class LLMClientV2:
         多模型降级: 传 node 时 primary 失败自动换 fallback 重试一次,
         两种模型都失败才抛异常。不传 node/model 时用 provider 默认模型 (向后兼容)。
         """
+        self._validate_messages(messages)
         primary, fallback = self._resolve_models(node, model)
         last_exc: Optional[Exception] = None
         for i, mdl in enumerate((primary, fallback)):
@@ -645,7 +798,10 @@ class LLMClientV2:
                 )
             except Exception as e:
                 last_exc = e
-                if fallback and i == 0:
+                # 4xx 是客户端错误(请求格式/参数不对)，换模型也救不了，直接抛
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+                    raise
+                if fallback and i == 0 and fallback != primary:
                     logger.warning(
                         f"chat: primary model '{primary}' failed "
                         f"({type(e).__name__}: {e}), trying fallback '{fallback}'"
@@ -738,17 +894,63 @@ class LLMClientV2:
                     raise
 
             except httpx.HTTPStatusError as e:
+                # ── 完整记录请求/响应便于排查 4xx/5xx ──
+                resp_text = ""
+                try:
+                    resp_text = e.response.text[:4000]
+                except Exception:
+                    resp_text = "(unable to read response body)"
+                req_snippet = self._trunc_payload_for_log(payload)
+
                 if e.response.status_code < 500:
+                    logger.error(
+                        f"LLM 4xx error | model={mdl} status={e.response.status_code} | "
+                        f"request_snippet={req_snippet} | response_body={resp_text}"
+                    )
                     raise  # 4xx 不重试
                 last_error = e
+                logger.warning(
+                    f"LLM 5xx error | model={mdl} status={e.response.status_code} | "
+                    f"response_body={resp_text} | retry {attempt+1}/{p.max_retries}"
+                )
                 if attempt < p.max_retries:
                     delay = p.retry_base_delay * (2 ** attempt)
-                    logger.warning(f"HTTP {e.response.status_code}, retry {attempt+1}/{p.max_retries}")
                     await asyncio.sleep(delay)
                 else:
                     raise
 
         raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    def _trunc_payload_for_log(payload: dict, max_len: int = 3000) -> str:
+        """截断 payload 用于日志，避免日志爆炸。
+
+        保留 model/max_tokens/temperature 等元信息，
+        messages 按 content 截断到 ~200 字符/条。
+        """
+        import copy
+        safe = {}
+        for k in ("model", "max_tokens", "temperature", "system", "tools"):
+            if k in payload:
+                safe[k] = payload[k]
+        msgs = payload.get("messages", [])
+        truncated = []
+        for m in msgs[-20:]:  # 只保留最后 20 条
+            if isinstance(m, dict):
+                cm = copy.copy(m)
+                content = cm.get("content", "")
+                if isinstance(content, str) and len(content) > 200:
+                    cm["content"] = content[:200] + f"...[{len(content)} total]"
+                elif isinstance(content, list):
+                    # content 可能是 list of blocks (Anthropic)
+                    cm["content"] = f"[{len(content)} content blocks]"
+                truncated.append(cm)
+            else:
+                truncated.append(str(m)[:200])
+        safe["messages_truncated"] = truncated
+        if "tool_choice" in payload:
+            safe["tool_choice"] = payload["tool_choice"]
+        return str(safe)[:max_len]
 
     def _parse_response(self, data: dict) -> ChatResponse:
         """解析 Anthropic/兼容 API 响应."""
@@ -819,6 +1021,7 @@ class LLMClientV2:
         (网络/超时/5xx 重试耗尽), 自动切 fallback 重试一次。一旦 primary
         已产出有效 delta, 后续错误不再切换 (避免拼接错乱)。
         """
+        self._validate_messages(messages)
         primary, fallback = self._resolve_models(node, model)
         models_to_try = [m for m in (primary, fallback) if m]
 
@@ -853,6 +1056,10 @@ class LLMClientV2:
                     produced_output = True
                     yield chunk
             except Exception as e:
+                # 4xx 客户端错误 — 换模型也救不了
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+                    yield {"type": "error", "message": f"Stream HTTP {e.response.status_code}: {e}"}
+                    return
                 if not produced_output and not is_last:
                     had_early_error = True
                     last_error_msg = str(e)
@@ -1009,10 +1216,24 @@ class LLMClientV2:
                     yield {"type": "error", "message": f"Stream failed after {p.max_retries} retries: {e}"}
 
             except httpx.HTTPStatusError as e:
+                resp_text = ""
+                try:
+                    resp_text = e.response.text[:4000]
+                except Exception:
+                    resp_text = "(unable to read response body)"
+                req_snippet = self._trunc_payload_for_log(payload)
                 if e.response.status_code < 500:
+                    logger.error(
+                        f"LLM stream 4xx error | model={mdl} status={e.response.status_code} | "
+                        f"request_snippet={req_snippet} | response_body={resp_text}"
+                    )
                     yield {"type": "error", "message": f"Stream HTTP {e.response.status_code}: {e}"}
                     return
                 last_error = e
+                logger.warning(
+                    f"LLM stream 5xx error | model={mdl} status={e.response.status_code} | "
+                    f"response_body={resp_text} | retry {attempt+1}"
+                )
                 if attempt < p.max_retries:
                     delay = p.retry_base_delay * (2 ** attempt)
                     await asyncio.sleep(delay)
@@ -1050,6 +1271,7 @@ class LLMClientV2:
         自动切 fallback 重试一次。JSON 校验失败指返回 {"error": ...} (parse
         失败或重试耗尽)。两种模型都失败才放弃 (返回最后一个 error dict 或抛异常)。
         """
+        self._validate_messages(messages)
         primary, fallback = self._resolve_models(node, model)
         last_exc: Optional[Exception] = None
         last_result: Optional[dict] = None
@@ -1081,7 +1303,10 @@ class LLMClientV2:
                 return result
             except Exception as e:
                 last_exc = e
-                if fallback and i == 0:
+                # 4xx 是客户端错误，换模型救不了
+                if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+                    raise
+                if fallback and i == 0 and fallback != primary:
                     logger.warning(
                         f"chat_json: primary model '{primary}' failed "
                         f"({type(e).__name__}: {e}), trying fallback '{fallback}'"
@@ -1158,9 +1383,23 @@ class LLMClientV2:
                         logger.error(f"chat_json failed after {p.max_retries} retries: {e}")
 
                 except httpx.HTTPStatusError as e:
+                    resp_text = ""
+                    try:
+                        resp_text = e.response.text[:4000]
+                    except Exception:
+                        resp_text = "(unable to read response body)"
+                    req_snippet = self._trunc_payload_for_log(payload)
                     if e.response.status_code < 500:
+                        logger.error(
+                            f"LLM chat_json 4xx error | model={mdl} status={e.response.status_code} | "
+                            f"request_snippet={req_snippet} | response_body={resp_text}"
+                        )
                         raise
                     last_error = e
+                    logger.warning(
+                        f"LLM chat_json 5xx error | model={mdl} status={e.response.status_code} | "
+                        f"response_body={resp_text} | retry {attempt+1}"
+                    )
                     if attempt < p.max_retries:
                         delay = p.retry_base_delay * (2 ** attempt)
                         await asyncio.sleep(delay)

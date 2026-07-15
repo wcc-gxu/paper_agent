@@ -121,7 +121,25 @@ CREATE TABLE citations (
 CREATE INDEX idx_citations_paper ON citations(paper_id);
 CREATE INDEX idx_citations_cited ON citations(cited_paper_id) WHERE cited_paper_id IS NOT NULL;
 
--- 2.5 会话与消息
+-- 2.5 智能体
+CREATE TABLE agents (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    name            TEXT NOT NULL DEFAULT 'My Agent',
+    display_name    TEXT NOT NULL DEFAULT 'Paper Agent',
+    agent_type      TEXT NOT NULL DEFAULT 'main',
+    system_prompt   TEXT NOT NULL DEFAULT '',
+    llm_provider    TEXT NOT NULL DEFAULT 'deepseek',
+    config          JSONB NOT NULL DEFAULT '{}',
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_agents_user ON agents(user_id);
+CREATE INDEX idx_agents_active ON agents(user_id, is_active);
+
+-- 2.6 会话与消息
 CREATE TABLE sessions (
     id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id),
@@ -419,6 +437,57 @@ CREATE TABLE agent_events (
 CREATE INDEX idx_ae_agent ON agent_events(agent_id);
 CREATE INDEX idx_ae_created ON agent_events(created_at);
 
+-- 2.15 RAG 检索追踪 (Phase 4)
+CREATE TABLE rag_traces (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    user_id         TEXT NOT NULL DEFAULT 'user-default',
+    query_text      TEXT NOT NULL,
+    retrieved_count INTEGER NOT NULL DEFAULT 0,
+    reranked_count  INTEGER NOT NULL DEFAULT 0,
+    retrieval_ms    INTEGER,
+    rerank_ms       INTEGER,
+    total_ms        INTEGER,
+    rerank_strategy TEXT NOT NULL DEFAULT 'bge-reranker-v2-m3',
+    confidence      REAL,
+    error_text      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_rag_traces_session ON rag_traces(session_id);
+CREATE INDEX idx_rag_traces_user ON rag_traces(user_id);
+CREATE INDEX idx_rag_traces_created ON rag_traces(created_at);
+
+-- 2.16 会话扫描水位线 (Phase 4 — Celery Beat 增量扫描)
+CREATE TABLE session_scan_markers (
+    id              TEXT PRIMARY KEY,
+    marker_type     TEXT UNIQUE NOT NULL,
+    last_scan_value TEXT NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO session_scan_markers (id, marker_type, last_scan_value)
+VALUES ('marker-close', 'session_close_last_scan', '2020-01-01T00:00:00Z')
+ON CONFLICT (marker_type) DO NOTHING;
+
+-- 2.17 conversation_archive 列补全 (Phase 4 — 兼容 summarizer.py 旧写入)
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS thread_id TEXT;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS agent_id TEXT;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS archived_at TEXT;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS summary_msg_id TEXT;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS original_messages_json TEXT;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS original_count INTEGER DEFAULT 0;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS token_count INTEGER DEFAULT 0;
+ALTER TABLE conversation_archive
+    ADD COLUMN IF NOT EXISTS reason TEXT;
+
 -- 课题组共享 (预留 Phase 2)
 CREATE TABLE research_groups (
     id          TEXT PRIMARY KEY,
@@ -522,6 +591,19 @@ CREATE INDEX idx_topic_user ON topic_embeddings(user_id);
 --     ON glossary_embeddings
 --     USING ivfflat (embedding vector_cosine_ops)
 --     WITH (lists = 50);
+
+-- ============================================================
+-- 多用户多智能体 migration (v3.2)
+-- ============================================================
+
+-- 为已有用户创建默认智能体
+INSERT INTO agents (id, user_id, name, display_name, agent_type, system_prompt, llm_provider)
+SELECT 'agent-' || id, id, 'Default Agent', 'Paper Agent', 'main', '', 'deepseek'
+FROM users
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE agents.user_id = users.id);
+
+-- 将 user-default 设为超级管理员
+UPDATE users SET role = 'super_admin' WHERE id = 'user-default';
 
 -- ============================================================
 -- pgvector 检索函数

@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -69,8 +69,8 @@ def get_engine():
 def get_llm():
     global _llm
     if _llm is None:
-        from ..agent.llm_client_v2 import LLMClientV2
-        _llm = LLMClientV2()
+        from ..agent.llm_client_v2 import get_llm_client
+        _llm = get_llm_client()
     return _llm
 
 
@@ -234,15 +234,19 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
 
     # ── JWT 验证 (优先) ──────────────────────────────────
     from .auth import verify_ws_token
+    _resolved_agent_id = agent_id  # fallback
     try:
-        _user_id = await verify_ws_token(websocket, agent_id, token)
+        _user_id, _resolved_agent_id = await verify_ws_token(websocket, agent_id, token)
     except HTTPException:
         # verify_ws_token 已经关闭了 WebSocket
         return
 
     await websocket.accept()
-    await ws_manager.connect(agent_id, session_id, websocket)
-    logger.info(f"WS connected: agent={agent_id}, session={session_id}, user={_user_id}")
+    await ws_manager.connect(_resolved_agent_id, session_id, websocket)
+
+    # v3.2: Redis 队列改为 user-scoped (agent:ws:{user_id})
+    _ws_queue_key = f"agent:ws:{_user_id}"
+    logger.info(f"WS connected: agent={_resolved_agent_id}, session={session_id}, user={_user_id}")
 
     # ── Redis 连接 (带重试) ────────────────────────────
     _redis = None
@@ -262,24 +266,23 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
         await websocket.close(code=1011, reason="Redis unavailable")
         return
 
-    ws_queue = f"agent:ws:{agent_id}"
-
-    # ── Phase 1: 启动 outbox_poller (每个 agent 一个，幂等) ──────
+    # ── Phase 1: 启动 outbox_poller (v3.2: per-user) ──────
     from .outbox_poller import start_poller
     db = get_db()
-    poller_task = start_poller(agent_id, ws_manager, db,
+    poller_task = start_poller(_user_id, ws_manager, db,
                                 redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
-    logger.info("📡 OutboxPoller running for agent=%s", agent_id)
+    logger.info("📡 OutboxPoller running for user=%s", _user_id)
 
-    # ── Redis LPUSH helper ──────────────────────────────
+    # ── Redis LPUSH helper (v3.2: user-scoped queue) ──────
     async def _push_to_redis(msg: dict):
         """推送消息到 Redis 队列，失败重试 3 次。"""
         msg["_session_id"] = session_id
-        msg["_agent_id"] = agent_id
+        msg["_agent_id"] = _resolved_agent_id
+        msg["target_agent_id"] = _resolved_agent_id  # v3.2: daemon 路由用
         data = _json.dumps(msg, ensure_ascii=False, default=str)
         for attempt in range(3):
             try:
-                await _redis.lpush(ws_queue, data)
+                await _redis.lpush(_ws_queue_key, data)
                 return True
             except Exception as e:
                 logger.warning(f"Redis LPUSH attempt {attempt+1}/3: {e}")
@@ -300,7 +303,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
                 pass
             logger.info(
                 "🔌 WS DISCONNECT | agent=%s session=%s client=%s",
-                agent_id, session_id, client_ip or "unknown",
+                _resolved_agent_id, session_id, client_ip or "unknown",
             )
             break
         except Exception as e:
@@ -382,7 +385,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
     # poller_task 不在这里 stop（其他 session 可能还要用），由 lifespan 关闭
     if _redis:
         await _redis.close()
-    await ws_manager.disconnect(agent_id, session_id, websocket)
+    await ws_manager.disconnect(_resolved_agent_id, session_id, websocket)
 
 
 

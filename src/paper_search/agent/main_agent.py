@@ -27,6 +27,31 @@ from .outbox import outbox_publish
 
 logger = logging.getLogger(__name__)
 
+
+def _summarize_error_for_user(error_msg: str) -> str:
+    """将内部错误摘要转换为用户可读的友好消息。
+
+    确保 turn 终止时用户收到 message/reply（协议要求），而不是只有 error/* 系统消息。
+    """
+    msg_lower = error_msg.lower()
+
+    if "400" in msg_lower and ("bad request" in msg_lower or "http" in msg_lower):
+        return "抱歉，处理请求时遇到内部错误（LLM 请求格式异常）。工程师已收到详细日志，请稍后重试。"
+    if "429" in msg_lower or "rate" in msg_lower:
+        return "抱歉，当前请求频率过高，请稍等片刻后再试。"
+    if "timeout" in msg_lower or "timed out" in msg_lower:
+        return "抱歉，请求处理超时。请尝试简化您的问题后重试。"
+    if "connection" in msg_lower or "network" in msg_lower:
+        return "抱歉，LLM 服务暂时无法连接，请稍后重试。"
+    if "知识库中没有" in error_msg or "no vector results" in msg_lower:
+        return error_msg  # 已经是对用户友好的消息
+    if "top_k" in msg_lower or "nonetype" in msg_lower:
+        return "抱歉，检索参数异常，已自动修复。请重试您的问题。"
+    if len(error_msg) > 200:
+        return f"抱歉，处理请求时遇到内部错误。详细信息: {error_msg[:200]}…"
+    return f"抱歉，处理请求时遇到内部错误。详细信息: {error_msg}"
+
+
 # _wait_ws_reply 等待用户回答的最长时间
 ASK_USER_TIMEOUT_SEC = 30 * 60   # 等用户回答最长 30 分钟
 
@@ -355,11 +380,13 @@ class MainAgent:
         self,
         agent_id: str = "agent-001",
         redis_url: str = "redis://localhost:6379/0",
+        user_id: str = "default",
         llm=None,
         db=None,
         memory=None,
         registry=None,
         graph=None,  # v3.1: compiled LangGraph StateGraph
+        system_prompt: str = "",
     ):
         self._agent_id = agent_id
         self._redis_url = redis_url
@@ -368,13 +395,13 @@ class MainAgent:
         self._memory = memory       # Phase 4 接入 MemoryManager
         self._registry = registry   # ToolRegistry
         self._graph = graph         # v3.1: compiled MainGraph
+        self._system_prompt = system_prompt  # v3.2: per-agent
         self._redis = None
         # 当前正在处理的 correlation_id（每轮 BRPOP 重置）
         self._correlation_id: str = ""
-        # v3 Phase 1: 从 agent_id 提取 user_id（格式: agent-{user_id}）
-        self._user_id = "default"
-        if agent_id.startswith("agent-") and agent_id != "agent-001":
-            self._user_id = agent_id[6:]
+        # v3.2: _user_id now passed explicitly by AgentManager — no derivation
+        # 从 agent_id 提取 user_id（格式: agent-{user_id}）
+        self._user_id = user_id        # v3.2: explicit, no longer derived from agent_id
         # Track current session for debug callback
         self._current_session_id: str = "main"
         # AgentError 队列：子 agent / tool 通过 Reporter Redis Pub/Sub 上报的错误
@@ -392,6 +419,7 @@ class MainAgent:
         if self._redis is None:
             import redis.asyncio as aioredis
             self._redis = aioredis.from_url(self._redis_url, decode_responses=True)
+        return self._redis
 
     # ── Vector Store (惰性) ──────────────────────────────
 
@@ -638,8 +666,14 @@ class MainAgent:
                                      priority_kind="high")
 
                 if error:
+                    # Push user-facing error explanation BEFORE status/done
+                    error_msg = str(error)
+                    user_friendly = _summarize_error_for_user(error_msg)
+                    await self._push(session_id, "message", "reply", "assistant",
+                                     payload={"content": user_friendly},
+                                     priority_kind="high")
                     await self._push(session_id, "error", "INTERNAL_ERROR", "system",
-                                     payload={"message": str(error), "recoverable": True},
+                                     payload={"message": error_msg, "recoverable": True},
                                      priority_kind="urgent")
                     logger.error(f"Graph error: {error}")
 
@@ -650,6 +684,10 @@ class MainAgent:
                             self._correlation_id, len(final_reply or ""))
             except Exception as e:
                 logger.error(f"Graph invoke failed: {e}", exc_info=True)
+                error_user_msg = _summarize_error_for_user(str(e))
+                await self._push(session_id, "message", "reply", "assistant",
+                                 payload={"content": error_user_msg},
+                                 priority_kind="high")
                 await self._push(session_id, "error", "INTERNAL_ERROR", "system",
                                  payload={"message": f"Agent 处理失败: {e}", "recoverable": True},
                                  priority_kind="urgent")

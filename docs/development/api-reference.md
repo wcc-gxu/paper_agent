@@ -1,10 +1,10 @@
 # Paper Agent v3 — API 参考文档
 
-> 更新: 2026-07-13 | 版本: 3.1.0 | LLM: DeepSeek v4 Pro + Flash
+> 更新: 2026-07-15 | 版本: 3.1.0 | LLM: DeepSeek v4 Pro + Flash
 >
 > 架构: Fast Triage (flash) → chat/ops/research → Intent Classify (flash) → Plan (pro) → Plan Review (human-in-the-loop) → Execute ReAct (pro) → Evaluate (flash)
 >
-> WebSocket 协议详见 [websocket-protocol.md](websocket-protocol.md) (v10.1)
+> WebSocket 协议详见 [websocket-protocol.md](websocket-protocol.md) (v10.2)
 
 ---
 
@@ -15,9 +15,11 @@
 - [3. 搜索与论文](#3-搜索与论文)
 - [4. 知识库](#4-知识库)
 - [5. 项目管理](#5-项目管理)
-- [6. 订阅](#6-订阅)
-- [7. 设备注册 (APNs)](#7-设备注册-apns)
-- [8. 调试模式](#8-调试模式)
+- [6. 会话与消息](#6-会话与消息)
+- [7. 订阅](#7-订阅)
+- [8. 设备注册 (APNs)](#8-设备注册-apns)
+- [9. RAG 健康检查](#9-rag-健康检查)
+- [10. 调试模式](#10-调试模式)
 
 ---
 
@@ -258,7 +260,53 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-### 6. 订阅
+## 6. 会话与消息
+
+### `GET /api/sessions/{session_id}/messages`
+
+获取会话的离线消息（替代已移除的 WebSocket sync 协议）。返回去重后的最终状态消息列表。
+
+**Query Parameters**:
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `since` | string? | null | ISO 8601 时间戳，只返回此时间之后的消息 |
+| `limit` | int | 200 | 最大返回条数 (≤1000) |
+
+**Response** (200):
+```json
+{
+  "messages": [
+    {
+      "type": "message",
+      "subType": "reply",
+      "msg_id": "msg-abc123",
+      "payload": {"text": "以下是搜索结果..."},
+      "timestamp": "2026-07-14T08:00:00Z"
+    },
+    {
+      "type": "tool",
+      "subType": "result",
+      "msg_id": "tool-def456",
+      "payload": {"tool_call_id": "tc-1", "result": "..."},
+      "timestamp": "2026-07-14T07:59:55Z"
+    }
+  ],
+  "has_more": false
+}
+```
+
+**去重规则**:
+- `tool/progress|result|start` → 按 `tool_call_id` 去重，只保留最新状态
+- `plan_todo_update` → 按 `plan_id` 去重，只保留最新快照
+- `message/reply` → 每条保留（不做去重）
+- `status` / `thinking` → 不返回（`priority=silent`，不持久化）
+
+**认证**: Bearer Token 必需
+
+---
+
+### 7. 订阅
 
 ### `GET /api/subscriptions`
 
@@ -292,7 +340,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 7. 设备注册 (APNs)
+## 8. 设备注册 (APNs)
 
 ### `POST /api/devices/register`
 
@@ -312,9 +360,34 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 查看活跃设备 (token 脱敏)。
 
+## 9. RAG 健康检查
+
+### `GET /api/knowledge/health`
+
+查询 RAG 检索系统的运行状态（需要 Bearer Token）。
+
+**Query Parameters**:
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `hours` | int | 24 | 统计最近 N 小时的查询 |
+
+**Response** (200):
+```json
+{
+  "total_queries": 142,
+  "error_rate": 0.014,
+  "latency_p50_ms": 320,
+  "latency_p95_ms": 890,
+  "status": "healthy"
+}
+```
+
+数据来源: `rag_traces` 表，每次 RAG 检索 fire-and-forget 写入。
+
 ---
 
-## 8. 调试模式
+## 10. 调试模式
 
 设置 `DEBUG_PROTOCOL=1` 后，服务端通过 WebSocket 推送 `status{level:debug}` 消息：
 
@@ -323,6 +396,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 | `llm:thinking` | LLM 完整 thinking block |
 | `llm:thinking_delta` | LLM 流式思考 token |
 | `llm:tool_use` | LLM 调用 tool |
+| `rag:trace` | RAG 检索链路 (retrieval_ms / rerank_ms / total_ms / confidence) |
 
 调试消息 `priority=silent`，不持久化。生产环境不推送。
 

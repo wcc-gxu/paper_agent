@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from ..config import get_papers_dir, get_markdown_dir, get_outputs_dir
 from .auth import (
     verify_api_key,
+    verify_super_admin,
     auth_register,
     auth_login,
     auth_refresh,
@@ -123,6 +124,172 @@ async def api_me(user_id: str = Depends(verify_api_key)):
         "username": user.get("username", ""),
         "display_name": user.get("display_name", ""),
         "role": user.get("role", "researcher"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# Agent CRUD (v3.2 多智能体)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/agents")
+async def list_agents(user_id: str = Depends(verify_api_key)):
+    """列出当前用户的所有智能体."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    agents = db.list_user_agents(user_id)
+    return {"agents": agents}
+
+
+@router.post("/agents")
+async def create_agent(
+    name: str = Query("My Agent"),
+    display_name: str = Query("Paper Agent"),
+    system_prompt: str = Query(""),
+    llm_provider: str = Query("deepseek"),
+    user_id: str = Depends(verify_api_key),
+):
+    """创建新智能体。system_prompt 为空时使用系统默认。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    agent_id = db.create_agent(
+        user_id=user_id,
+        name=name,
+        display_name=display_name,
+        system_prompt=system_prompt,
+        llm_provider=llm_provider,
+    )
+    return {"agent_id": agent_id, "name": name, "status": "created"}
+
+
+@router.get("/agents/{agent_id}")
+async def get_agent(agent_id: str, user_id: str = Depends(verify_api_key)):
+    """获取智能体详情."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    agent = db.get_agent(agent_id)
+    if not agent or agent.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"agent": agent}
+
+
+@router.put("/agents/{agent_id}")
+async def update_agent(agent_id: str, req: dict, user_id: str = Depends(verify_api_key)):
+    """更新智能体配置 (name, system_prompt, llm_provider, display_name)."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    if not db.agent_belongs_to_user(agent_id, user_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    db.update_agent(agent_id, user_id=user_id, **req)
+    return {"agent_id": agent_id, "status": "updated"}
+
+
+@router.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: str, user_id: str = Depends(verify_api_key)):
+    """软删除智能体（设 is_active=false）."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    if not db.agent_belongs_to_user(agent_id, user_id):
+        raise HTTPException(status_code=404, detail="Agent not found")
+    db.deactivate_agent(agent_id, user_id=user_id)
+    return {"agent_id": agent_id, "status": "deactivated"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# User Preferences (v3.2)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/user/preferences")
+async def get_preferences(user_id: str = Depends(verify_api_key)):
+    """获取当前用户的所有偏好."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    prefs = db.get_user_preferences(user_id)
+    return {"preferences": prefs}
+
+
+@router.put("/user/preferences/{key}")
+async def set_preference(key: str, req: dict, user_id: str = Depends(verify_api_key)):
+    """设置单个偏好: {\"value\": ...}."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    db.set_user_preference(user_id, key, req.get("value"))
+    return {"key": key, "status": "saved"}
+
+
+@router.delete("/user/preferences/{key}")
+async def delete_preference(key: str, user_id: str = Depends(verify_api_key)):
+    """删除单个偏好."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    deleted = db.delete_user_preference(user_id, key)
+    return {"key": key, "status": "deleted" if deleted else "not_found"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# Super Admin (v3.2)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/admin/users")
+async def admin_list_users(user_id: str = Depends(verify_super_admin)):
+    """列出所有用户 (仅超级管理员)."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    users = db._fetchall("SELECT id, username, display_name, role, is_active, created_at FROM users ORDER BY created_at")
+    return {"users": users}
+
+
+@router.put("/admin/users/{target_user_id}/role")
+async def admin_set_role(target_user_id: str, req: dict, user_id: str = Depends(verify_super_admin)):
+    """修改用户角色 (仅超级管理员)."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    new_role = req.get("role", "researcher")
+    db._execute("UPDATE users SET role = %s WHERE id = %s", (new_role, target_user_id))
+    return {"user_id": target_user_id, "role": new_role, "status": "updated"}
+
+
+@router.post("/admin/users/{target_user_id}/deactivate")
+async def admin_deactivate_user(target_user_id: str, user_id: str = Depends(verify_super_admin)):
+    """停用用户 (仅超级管理员)."""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    db._execute("UPDATE users SET is_active = false WHERE id = %s", (target_user_id,))
+    return {"user_id": target_user_id, "status": "deactivated"}
+
+
+@router.get("/admin/system/health")
+async def admin_system_health(user_id: str = Depends(verify_super_admin)):
+    """完整系统健康检查 (仅超级管理员)."""
+    import time
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    t0 = time.monotonic()
+    db.conn.execute("SELECT 1")
+    db_ms = int((time.monotonic() - t0) * 1000)
+
+    user_count = db.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    agent_count = db.conn.execute("SELECT COUNT(*) FROM agents WHERE is_active = true").fetchone()[0]
+    session_count = db.conn.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0]
+
+    import redis.asyncio as aioredis
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    try:
+        r = aioredis.from_url(redis_url, decode_responses=True)
+        redis_ok = await r.ping()
+        await r.aclose()
+    except Exception:
+        redis_ok = False
+
+    return {
+        "status": "healthy",
+        "db_latency_ms": db_ms,
+        "redis": "ok" if redis_ok else "unavailable",
+        "users": user_count,
+        "active_agents": agent_count,
+        "active_sessions": session_count,
     }
 
 

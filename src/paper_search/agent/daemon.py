@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -91,6 +92,230 @@ class AgentManifest:
 
 
 # ═══════════════════════════════════════════════════════════════
+# AgentManager — v3.2 多智能体路由
+# ═══════════════════════════════════════════════════════════════
+
+
+class AgentManager:
+    """管理一个用户的所有智能体实例。
+
+    v3.2: 一个 daemon 进程处理一个用户的所有智能体。
+    BRPOP agent:ws:{user_id} → 读 target_agent_id → 路由到对应 MainAgent。
+    """
+
+    def __init__(self, user_id: str, redis_url: str, db, llm, registry, memory, vector_store):
+        self.user_id = user_id
+        self.redis_url = redis_url
+        self.db = db
+        self.llm = llm
+        self.registry = registry
+        self.memory = memory
+        self.vector_store = vector_store
+        self._agents: dict[str, "MainAgent"] = {}
+        self._default_agent_id: str = ""
+
+    async def load_agents(self, graph_builder) -> None:
+        """从 DB 加载该用户所有活跃智能体."""
+        agents = self.db.list_user_agents(self.user_id)
+        if not agents:
+            logger.warning("No agents found for user=%s, creating default", self.user_id)
+            agent_id = self.db.create_agent(user_id=self.user_id, name="Default Agent")
+            agents = self.db.list_user_agents(self.user_id)
+
+        for ag in agents:
+            agent_id = ag["id"]
+            system_prompt = ag.get("system_prompt", "") or ""
+            llm_provider = ag.get("llm_provider", "deepseek")
+            logger.info("Loading agent: %s (name=%s provider=%s prompt_len=%d)",
+                        agent_id, ag.get("name", ""), llm_provider, len(system_prompt))
+
+            from .main_agent import MainAgent
+            # Build graph with agent-specific system prompt
+            compiled_graph = graph_builder(
+                llm=self.llm,
+                registry=self.registry,
+                db=self.db,
+                push_fn=self._make_push_fn(agent_id),
+                get_user_fn=self._make_get_user_fn(),
+                agent_system_prompt=system_prompt,
+            )
+            ma = MainAgent(
+                agent_id=agent_id,
+                redis_url=self.redis_url,
+                user_id=self.user_id,
+                llm=self.llm,
+                db=self.db,
+                memory=self.memory,
+                registry=self.registry,
+                graph=compiled_graph,
+                system_prompt=system_prompt,
+            )
+            self._agents[agent_id] = ma
+            if self._default_agent_id == "":
+                self._default_agent_id = agent_id
+
+        logger.info("AgentManager: loaded %d agents for user=%s (default=%s)",
+                     len(self._agents), self.user_id, self._default_agent_id)
+
+    def get_agent(self, agent_id: str) -> "MainAgent":
+        """获取智能体实例，不存在则回退到默认智能体."""
+        return self._agents.get(agent_id) or self._agents.get(self._default_agent_id)
+
+    def _make_push_fn(self, agent_id: str):
+        """创建 push 回调 — 将消息推送到 user-scoped outbox."""
+        from .outbox import outbox_publish as _publish
+
+        async def push(session_id, msg_type, sub_type, role, payload, priority_kind="normal"):
+            envelope = {
+                "type": msg_type,
+                "subType": sub_type,
+                "role": role,
+                "agentId": agent_id,
+                "sessionId": session_id,
+                "payload": payload,
+                "priorityKind": priority_kind,
+            }
+            import redis.asyncio as aioredis
+            r = aioredis.from_url(self.redis_url, decode_responses=True)
+            try:
+                await _publish(r, self.db, envelope, user_id=self.user_id)
+            finally:
+                await r.aclose()
+
+        return push
+
+    def _make_get_user_fn(self):
+        """创建 get_user 回调 — 从 user-scoped 队列获取用户回复.
+
+        Handles multiple reply types:
+          - ask_reply: user response to ask card (clarification/choice)
+          - plan_approve: user approves a plan
+          - plan_revise: user requests plan revision with feedback
+
+        Matches by session_id and ask_id/review_id.
+        Non-matching messages are parked for later processing.
+        Returns None on timeout.
+        """
+        import redis.asyncio as aioredis
+        import json as _json
+        import asyncio as _asyncio
+
+        async def get_user(session_id, ask_id="", timeout=60):
+            ws_key = f"agent:ws:{self.user_id}"
+            parked_key = f"agent:ws:{self.user_id}:parked"
+            deadline = _asyncio.get_event_loop().time() + timeout
+
+            r = aioredis.from_url(self.redis_url, decode_responses=True)
+            try:
+                while True:
+                    remaining = deadline - _asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        return None
+                    # Check parked first
+                    raw = await r.rpop(parked_key)
+                    if raw is None:
+                        raw = await r.brpop(ws_key, timeout=int(min(remaining, 30)))
+                        if raw is None:
+                            continue
+                        raw = raw[1] if isinstance(raw, (list, tuple)) else raw
+
+                    try:
+                        msg = _json.loads(raw)
+                    except _json.JSONDecodeError:
+                        continue
+
+                    p = msg.get("payload") or {}
+                    msg_type = msg.get("type", "")
+
+                    # Match: ask_reply — matching session and ask_id
+                    if (msg_type == "ask_reply"
+                            and msg.get("_session_id") == session_id
+                            and p.get("ask_id") == ask_id):
+                        p["_type"] = "ask_reply"
+                        return p
+
+                    # Match: plan_approve — matching session and review_id
+                    if (msg_type == "plan_approve"
+                            and msg.get("_session_id") == session_id
+                            and p.get("plan_id", "")):
+                        review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
+                        if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
+                            p["_type"] = "plan_approve"
+                            return p
+
+                    # Match: plan_revise — matching session and review_id
+                    if (msg_type == "plan_revise"
+                            and msg.get("_session_id") == session_id
+                            and p.get("plan_id", "")):
+                        review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
+                        if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
+                            p["_type"] = "plan_revise"
+                            return p
+
+                    # Not matching — park it for the main loop to pick up later
+                    try:
+                        await r.lpush(parked_key, raw)
+                    except Exception:
+                        pass
+            finally:
+                await r.aclose()
+
+        return get_user
+
+    async def run(self):
+        """主循环：BRPOP agent:ws:{user_id} → dispatch to target agent."""
+        import redis.asyncio as aioredis
+        import json as _json
+        r = aioredis.from_url(self.redis_url, decode_responses=True)
+        ws_queue = f"agent:ws:{self.user_id}"
+        parked_queue = f"agent:ws:{self.user_id}:parked"
+
+        logger.info("AgentManager running: user=%s queue=%s agents=%d",
+                     self.user_id, ws_queue, len(self._agents))
+
+        while True:
+            try:
+                raw = await r.brpop(ws_queue, timeout=0)
+            except Exception as e:
+                logger.error("AgentManager BRPOP error: %s, retrying...", e)
+                await asyncio.sleep(1)
+                continue
+
+            msg_list = [_json.loads(raw[1])]
+            # Drain backlog
+            while True:
+                more = await r.rpop(ws_queue)
+                if more is None:
+                    break
+                msg_list.append(_json.loads(more))
+            # Drain parked
+            while True:
+                more = await r.rpop(parked_queue)
+                if more is None:
+                    break
+                msg_list.append(_json.loads(more))
+
+            target_agent_id = msg_list[0].get("target_agent_id", "")
+            agent = self.get_agent(target_agent_id)
+            if agent is None:
+                logger.warning("No agent for target=%s, using default=%s",
+                              target_agent_id, self._default_agent_id)
+                agent = self._agents.get(self._default_agent_id)
+                if agent is None:
+                    continue
+
+            session_id = msg_list[0].get("_session_id", "main")
+            # Combine message text for the agent
+            user_content = agent._combine_user_text(msg_list)
+            agent._correlation_id = str(uuid.uuid4())
+            agent._current_session_id = session_id
+            try:
+                await agent._run_turn(session_id, user_content)
+            except Exception as e:
+                logger.error("Agent %s turn error: %s", agent._agent_id, e, exc_info=True)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Bootstrap
 # ═══════════════════════════════════════════════════════════════
 
@@ -144,10 +369,10 @@ class AgentBootstrap:
         self._db = PostgresAgentDB()
         logger.info("Database: PostgreSQL")
 
-        # 2. LLMClientV2
-        from ..agent.llm_client_v2 import LLMClientV2
-        self._llm = LLMClientV2(provider=llm_provider)
-        logger.info("LLM client initialized")
+        # 2. LLMClientV2 — via singleton (shared across daemon, tools, celery)
+        from ..agent.llm_client_v2 import get_llm_client
+        self._llm = get_llm_client(provider=llm_provider)
+        logger.info("LLM client initialized (singleton, provider=%s)", llm_provider)
 
         # 3. ToolRegistry — inject DB singleton
         from ..agent.tool_registry import ToolRegistry, set_db

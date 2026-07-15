@@ -23,6 +23,7 @@ LangGraph 双图结构:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Annotated, Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -358,21 +359,49 @@ class KnowledgeAgent:
 
     async def _search_node(self, state: KnowledgeQueryState) -> dict:
         question = state["question"]
-        top_k = state.get("top_k", 5)
-        use_fulltext = state.get("use_fulltext", True)
+        top_k = state.get("top_k") or 5
+        use_fulltext = state.get("use_fulltext") or True
         project_id = state.get("project_id")
 
         await self._notify("检索中", 3, 5, "向量检索相关知识")
 
+        t_start = time.monotonic()
+        retrieval_ms = 0
+        rerank_ms = 0
+
         try:
             if self.vector_store:
-                # 使用向量存储直接检索
+                # Stage 1: 向量检索
+                t1 = time.monotonic()
                 results = self.vector_store.search_similar(
                     question, n_results=top_k * 2,
                 )
-                # 如果有 LLM，做 rerank
-                if self.llm and results:
-                    results = await self._llm_rerank(question, results, top_k)
+                retrieval_ms = int((time.monotonic() - t1) * 1000)
+
+                # Short-circuit: RAG 无结果 → 直接返回，不调 rerank/LLM
+                if not results:
+                    logger.info("KnowledgeAgent search: no vector results, returning empty")
+                    self._record_rag_trace(
+                        session_id=state.get("session_id") or "",
+                        query_text=question,
+                        retrieved_count=0,
+                        reranked_count=0,
+                        retrieval_ms=retrieval_ms,
+                        rerank_ms=0,
+                        total_ms=int((time.monotonic() - t_start) * 1000),
+                        confidence=0.0,
+                    )
+                    return {
+                        "sources": [],
+                        "answer": "",
+                        "retrieval_rounds": state.get("retrieval_rounds", 0) + 1,
+                        "error": "",
+                    }
+
+                # Stage 2: Cross-Encoder Rerank
+                t2 = time.monotonic()
+                results = await self._llm_rerank(question, results, top_k)
+                rerank_ms = int((time.monotonic() - t2) * 1000)
 
                 sources = [{
                     "paper_id": r.get("paper_id", ""),
@@ -380,6 +409,18 @@ class KnowledgeAgent:
                     "relevance": r.get("score", 0.5),
                     "snippet": (r.get("chunk_text") or r.get("abstract") or "")[:500],
                 } for r in results[:top_k]]
+
+                # 记录 RAG trace (fire-and-forget)
+                self._record_rag_trace(
+                    session_id=state.get("session_id") or "",
+                    query_text=question,
+                    retrieved_count=len(results),
+                    reranked_count=len(sources),
+                    retrieval_ms=retrieval_ms,
+                    rerank_ms=rerank_ms,
+                    total_ms=int((time.monotonic() - t_start) * 1000),
+                    confidence=0.7 if sources else 0.1,
+                )
 
                 return {
                     "sources": sources,
@@ -398,6 +439,18 @@ class KnowledgeAgent:
             logger.error(
                 f"KnowledgeAgent search failed (round {state.get('retrieval_rounds', 0) + 1}/{state.get('max_rounds', 3)}): "
                 f"{type(e).__name__}: {e}\n{tb}"
+            )
+            # 记录错误 trace
+            self._record_rag_trace(
+                session_id=state.get("session_id", ""),
+                query_text=question,
+                retrieved_count=0,
+                reranked_count=0,
+                retrieval_ms=retrieval_ms,
+                rerank_ms=rerank_ms,
+                total_ms=int((time.monotonic() - t_start) * 1000),
+                confidence=0.0,
+                error_text=str(e),
             )
             # CRITICAL: increment retrieval_rounds even on error to prevent infinite loop
             current_round = state.get("retrieval_rounds", 0) + 1
@@ -463,7 +516,7 @@ class KnowledgeAgent:
                     f"Question: {question}\n\n"
                     f"Provide a concise answer with citations like [1], [2], etc."
                 )
-                response = await self.llm.chat(prompt)
+                response = await self.llm.chat([{"role": "user", "content": prompt}])
                 return {
                     "answer": response,
                     "confidence": state.get("confidence", 0.7),
@@ -577,9 +630,15 @@ class KnowledgeAgent:
             return {"success": False, "count": 0}
 
     async def _dedup_with_vector_store(self, paper_id: str, paper: dict) -> dict:
-        """使用向量存储去重检查。"""
+        """使用向量存储去重检查。
+
+        Returns:
+            dict with keys: is_duplicate, duplicate_of, similarity, potential_duplicate
+            - score > 0.95 → is_duplicate=True (直接拒)
+            - 0.8 < score ≤ 0.95 → potential_duplicate=True (标记待确认)
+        """
         if not self.vector_store:
-            return {"is_duplicate": False}
+            return {"is_duplicate": False, "similarity": 0.0}
         try:
             title = paper.get("title", "")
             results = self.vector_store.search_similar(title, n_results=3)
@@ -587,36 +646,104 @@ class KnowledgeAgent:
                 if r.get("paper_id") != paper_id:
                     score = r.get("score", 0)
                     if score > 0.95:
-                        return {"is_duplicate": True, "duplicate_of": r["paper_id"]}
-            return {"is_duplicate": False}
+                        return {
+                            "is_duplicate": True,
+                            "duplicate_of": r["paper_id"],
+                            "similarity": score,
+                        }
+                    elif score > 0.8:
+                        return {
+                            "is_duplicate": False,
+                            "potential_duplicate": True,
+                            "duplicate_of": r["paper_id"],
+                            "similarity": score,
+                        }
+            return {"is_duplicate": False, "similarity": 0.0}
         except Exception as e:
             logger.warning(f"_dedup_with_vector_store failed for {paper_id}: {e}")
-            return {"is_duplicate": False}
+            return {"is_duplicate": False, "similarity": 0.0}
 
     async def _llm_rerank(self, question: str, results: list[dict], top_k: int) -> list[dict]:
-        """LLM Reranker — 对检索结果重排序。"""
-        if not self.llm or len(results) <= top_k:
+        """Cross-Encoder 重排序 — BGE-reranker-v2-m3 (SiliconFlow).
+
+        替代原有 LLM 重排序。失败时返回原始向量排序结果。
+        """
+        import asyncio
+
+        from ..reranker import RerankError, get_reranker
+
+        if not results or len(results) <= top_k:
             return results
+
+        # 截断到 ~2000 chars (约 512 tokens)
+        RERANK_CHAR_LIMIT = 2000
+        documents = []
+        for r in results:
+            title = r.get("title", "")
+            text = (r.get("chunk_text") or r.get("abstract") or "")[:RERANK_CHAR_LIMIT]
+            documents.append(f"{title} {text}" if title else text)
+
         try:
-            items_text = "\n".join([
-                f"[{i}] {r.get('title','')}: {(r.get('chunk_text') or r.get('abstract',''))[:200]}"
-                for i, r in enumerate(results[:top_k * 2])
-            ])
-            prompt = (
-                f"Rank these papers by relevance to: {question}\n\n"
-                f"{items_text}\n\n"
-                f"Return the indices of the top {top_k} most relevant papers, "
-                f"one per line, like: [0]\n[3]\n[1]"
+            reranker = get_reranker()
+            rerank_results = await asyncio.to_thread(
+                reranker.rerank, question, documents, top_k=top_k,
             )
-            response = await self.llm.chat(prompt)
-            # 简单解析
-            import re
-            indices = [int(m.group(1)) for m in re.finditer(r'\[(\d+)\]', response)]
-            ranked = [results[i] for i in indices if i < len(results)]
-            return ranked[:top_k] if ranked else results[:top_k]
-        except Exception as e:
-            logger.warning(f"_llm_rerank failed: {e}")
+        except RerankError as e:
+            logger.error(f"KnowledgeAgent rerank 失败 (hard error): {e}")
             return results[:top_k]
+
+        ranked = []
+        for rr in rerank_results:
+            idx = rr.index
+            if 0 <= idx < len(results):
+                item = dict(results[idx])
+                item["score"] = round(rr.score, 4)
+                ranked.append(item)
+
+        return ranked[:top_k]
+
+    def _record_rag_trace(
+        self,
+        session_id: str,
+        query_text: str,
+        retrieved_count: int,
+        reranked_count: int,
+        retrieval_ms: int = 0,
+        rerank_ms: int = 0,
+        total_ms: int = 0,
+        confidence: float = 0.0,
+        error_text: str = "",
+    ) -> None:
+        """Fire-and-forget 写 rag_traces 表."""
+        try:
+            from ..pgdb import _uuid
+
+            if not self.db:
+                return
+            trace_id = _uuid("rag")
+            self.db.conn.execute(
+                """INSERT INTO rag_traces
+                   (id, session_id, user_id, query_text, retrieved_count,
+                    reranked_count, retrieval_ms, rerank_ms, total_ms,
+                    confidence, error_text)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    trace_id,
+                    (session_id or "unknown")[:64],
+                    "user-default",
+                    (query_text or "")[:500],
+                    retrieved_count,
+                    reranked_count,
+                    retrieval_ms,
+                    rerank_ms,
+                    total_ms,
+                    confidence,
+                    (error_text or "")[:500],
+                ),
+            )
+            self.db.conn.commit()
+        except Exception as e:
+            logger.debug(f"Failed to record rag_trace: {e}")
 
     async def _notify(self, stage: str, index: int, total: int, msg: str,
                        current: int = 0, paper_total: int = 0):

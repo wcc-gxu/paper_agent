@@ -285,12 +285,14 @@ class PgVectorStore:
         try:
             emb = self._embed_texts([query])[0]
             cur = self.conn.cursor(cursor_factory=self._extras.RealDictCursor)
+            # DISTINCT ON (paper_id) 确保每篇论文只返回一次，避免同一论文多个 chunk 占据 top-k
             cur.execute(
-                """SELECT pc.paper_id, pc.metadata->>'title' AS title,
+                """SELECT DISTINCT ON (pc.paper_id) pc.paper_id,
+                   pc.metadata->>'title' AS title,
                    1 - (pc.embedding <=> %s::vector) AS similarity
                    FROM paper_chunks pc
                    WHERE pc.user_id = %s AND pc.chunk_type = 'abstract'
-                   ORDER BY pc.embedding <=> %s::vector
+                   ORDER BY pc.paper_id, pc.embedding <=> %s::vector
                    LIMIT %s""",
                 (self._format_vector(emb), self.user_id, self._format_vector(emb), n_results),
             )

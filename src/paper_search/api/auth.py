@@ -63,8 +63,8 @@ def _verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def _create_jwt(user_id: str, username: str, token_type: str = "access") -> str:
-    """创建 JWT token。"""
+def _create_jwt(user_id: str, username: str, token_type: str = "access", agent_id: str = None) -> str:
+    """创建 JWT token。v3.2: 可选 agent_id 表示客户端当前活跃智能体。"""
     if not JWT_SECRET:
         raise RuntimeError("JWT_SECRET not configured")
     now = datetime.now(timezone.utc)
@@ -80,6 +80,8 @@ def _create_jwt(user_id: str, username: str, token_type: str = "access") -> str:
         "exp": expire,
         "jti": str(uuid.uuid4()),
     }
+    if agent_id:
+        to_encode["agent_id"] = agent_id
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
@@ -153,26 +155,23 @@ async def verify_ws_token(
     websocket: WebSocket,
     agent_id: str,
     token: Optional[str] = None,
-) -> str:
-    """WebSocket 连接时验证 JWT token，返回 user_id。
+) -> tuple[str, str]:
+    """WebSocket 连接时验证 JWT token，返回 (user_id, resolved_agent_id)。
 
-    token 来源: 查询参数 ?token=<jwt>
+    v3.2 变更: agent_id 由 DB 验证而非从 user_id 派生，支持多智能体。
+    兼容旧格式: 无 JWT 时从 agent_id 提取 user_id。
 
-    验证规则:
-    - JWT_SECRET 已设置 + 有效 JWT → 返回 user_id（必须匹配 agent_id）
-    - JWT_SECRET 未设置 → 开放模式，从 agent_id 提取 user_id
-    - token 无效/缺失/JWT_SECRET 已设置但无 token → 拒绝连接（401）
-
-    返回: user_id 字符串
-    异常: 连接被拒绝时 raise WebSocket close
+    返回: (user_id, agent_id) 元组
     """
+    from ..agent.pgdb import PostgresAgentDB
+
     if not JWT_SECRET:
         # 开放模式: 从 agent_id 提取 user_id
         if agent_id.startswith("agent-"):
             extracted = agent_id[6:]
             if extracted and extracted != "001":
-                return extracted
-        return "default"
+                return extracted, agent_id
+        return "default", agent_id
 
     if not token:
         await websocket.close(code=4001, reason="Missing JWT token (?token=<jwt>)")
@@ -189,17 +188,49 @@ async def verify_ws_token(
         raise HTTPException(status_code=401, detail="Not an access token")
 
     user_id = payload["sub"]
+    jwt_agent_id = payload.get("agent_id", "")
 
-    # 交叉验证: agent_id 必须匹配 user_id
-    expected_agent = f"agent-{user_id}" if user_id != "default" else "agent-001"
-    if agent_id != expected_agent and agent_id != "agent-001":
-        logger.warning(
-            "WS auth mismatch: agent_id=%s does not match JWT user_id=%s",
-            agent_id, user_id,
-        )
-        await websocket.close(code=4003, reason="agent_id mismatch with JWT")
-        raise HTTPException(status_code=403, detail="agent_id mismatch")
+    # v3.2: DB-backed agent 验证
+    db = PostgresAgentDB()
 
+    # 如果 JWT 有 agent_id，验证其属于该用户
+    if jwt_agent_id:
+        if not db.agent_belongs_to_user(jwt_agent_id, user_id):
+            await websocket.close(code=4003, reason="agent_id does not belong to this user")
+            raise HTTPException(status_code=403, detail="agent_id not owned by user")
+        return user_id, jwt_agent_id
+
+    # JWT 无 agent_id → 使用用户默认智能体
+    default_agent = db.get_default_agent(user_id)
+    if default_agent:
+        return user_id, default_agent["id"]
+
+    # 向后兼容: 旧 agent_id 格式 (agent-{user_id} / agent-001)
+    if agent_id.startswith("agent-"):
+        if not db.agent_belongs_to_user(agent_id, user_id):
+            await websocket.close(code=4003, reason="agent_id mismatch with JWT")
+            raise HTTPException(status_code=403, detail="agent_id mismatch")
+        return user_id, agent_id
+
+    await websocket.close(code=4003, reason="No valid agent found")
+    raise HTTPException(status_code=403, detail="No valid agent")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 超级管理员依赖 (v3.2)
+# ═══════════════════════════════════════════════════════════════
+
+
+async def verify_super_admin(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+) -> str:
+    """验证超级管理员权限 → 返回 user_id。普通用户返回 403。"""
+    user_id = await verify_api_key(credentials)
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    user = db.get_user(user_id)
+    if not user or user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Super admin access required")
     return user_id
 
 
