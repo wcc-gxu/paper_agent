@@ -81,55 +81,53 @@ def test_task_logger_error():
 
 @pytest.mark.asyncio
 async def test_pipeline_runner_search():
-    """测试搜索阶段（真实 API 调用）。"""
+    """测试搜索阶段（真实 API 调用，需要 DATABASE_URL）。"""
+    import os
+    if not os.environ.get("PYTEST_DB_INTEGRATION"):
+        pytest.skip("PYTEST_DB_INTEGRATION not set — skip DB integration test")
+
     from paper_search.agent.sub_agent import PipelineRunner
     from paper_search.engine import PaperSearchEngine
     from paper_search.config import Config
-    from paper_search.agent.db import AgentDB
+    from paper_search.agent.pgdb import PostgresAgentDB
     from paper_search.agent.llm_client_v2 import LLMClientV2
-    from paper_search.agent.chroma_store import ChromaStoreV2
+    from paper_search.agent.pgvector_store import PgVectorStore
     from paper_search.agent.pdf_converter import PDFConverter
     from paper_search.agent.journal_ranker import JournalRanker
     from paper_search.agent.task_logger import TaskLogger
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        # 用临时 DB
-        db = AgentDB(tmp_path / "test.db")
-        engine = PaperSearchEngine(Config())
-        llm = LLMClientV2()
-        chroma = ChromaStoreV2()
-        converter = PDFConverter(max_concurrent=1)
-        ranker = JournalRanker()
+    db = PostgresAgentDB()
+    engine = PaperSearchEngine(Config())
+    llm = LLMClientV2()
+    vector_store = PgVectorStore()
+    converter = PDFConverter(max_concurrent=1)
+    ranker = JournalRanker()
 
-        runner = PipelineRunner(
-            engine=engine, db=db, llm=llm, chroma=chroma,
-            converter=converter, ranker=ranker,
-        )
+    runner = PipelineRunner(
+        engine=engine, db=db, llm=llm, chroma=vector_store,
+        converter=converter, ranker=ranker,
+    )
 
-        # 测试搜索
-        project_id = db.create_project(user_query="transformer attention")
-        tlog = TaskLogger(tmp_path / "logs" / "tasks", "test-search")
+    # 测试搜索
+    project_id = db.create_project(user_query="transformer attention")
+    tlog = TaskLogger(Path("logs/tasks"), "test-search")
 
-        papers = await runner._search_stage(
-            "test-search", project_id,
-            "transformer attention mechanism", ["arxiv", "semantic_scholar"],
-            2023, 5, tlog,
-        )
+    papers = await runner._search_stage(
+        "test-search", project_id,
+        "transformer attention mechanism", ["arxiv", "semantic_scholar"],
+        2023, 5, tlog,
+    )
 
-        assert isinstance(papers, list)
-        if papers:
-            assert "title" in papers[0]
-            assert "paper_id" in papers[0]
-            print(f"Search returned {len(papers)} papers")
+    assert isinstance(papers, list)
+    if papers:
+        assert "title" in papers[0]
+        assert "paper_id" in papers[0]
+        print(f"Search returned {len(papers)} papers")
 
-        # 验证日志写入
-        events = tlog.read_events()
-        found_events = [e for e in events if e.get("event_type") == "search_found"]
-        assert len(found_events) == len(papers)
-
-        # 清理（Windows 文件句柄）
-        db.close()
+    # 验证日志写入
+    events = tlog.read_events()
+    found_events = [e for e in events if e.get("event_type") == "search_found"]
+    assert len(found_events) == len(papers)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -139,40 +137,40 @@ async def test_pipeline_runner_search():
 
 @pytest.mark.asyncio
 async def test_error_handling_download_failure():
-    """测试下载失败时的错误处理。"""
+    """测试下载失败时的错误处理（需要 DATABASE_URL）。"""
+    import os
+    if not os.environ.get("PYTEST_DB_INTEGRATION"):
+        pytest.skip("PYTEST_DB_INTEGRATION not set — skip DB integration test")
+
     from paper_search.agent.sub_agent import PipelineRunner
-    from paper_search.agent.db import AgentDB
+    from paper_search.agent.pgdb import PostgresAgentDB
     from paper_search.agent.llm_client_v2 import LLMClientV2
-    from paper_search.agent.chroma_store import ChromaStoreV2
+    from paper_search.agent.pgvector_store import PgVectorStore
     from paper_search.agent.pdf_converter import PDFConverter
     from paper_search.agent.journal_ranker import JournalRanker
     from paper_search.agent.task_logger import TaskLogger
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        db = AgentDB(tmp_path / "test.db")
-        db.create_project(user_query="test", project_id="test-proj")
-        tlog = TaskLogger(tmp_path / "logs" / "tasks", "test-err")
+    db = PostgresAgentDB()
+    db.create_project(user_query="test", project_id="test-proj")
+    tlog = TaskLogger(Path("logs/tasks"), "test-err")
 
-        # 创建一个无 engine 的 runner（下载会失败）
-        runner = PipelineRunner(
-            engine=None, db=db, llm=LLMClientV2(),
-            chroma=ChromaStoreV2(), converter=PDFConverter(),
-            ranker=JournalRanker(),
-        )
+    # 创建一个无 engine 的 runner（下载会失败）
+    runner = PipelineRunner(
+        engine=None, db=db, llm=LLMClientV2(),
+        chroma=PgVectorStore(), converter=PDFConverter(),
+        ranker=JournalRanker(),
+    )
 
-        paper = {"paper_id": "test-paper-1", "title": "Test Paper",
-                 "authors": [], "year": 2024, "abstract": "test",
-                 "source": "arxiv"}
+    paper = {"paper_id": "test-paper-1", "title": "Test Paper",
+             "authors": [], "year": 2024, "abstract": "test",
+             "source": "arxiv"}
 
-        # 下载应失败但不抛异常
-        result = await runner._download_single(
-            "test-err", "test-proj", paper, tlog,
-        )
-        assert result["success"] is False
-        assert "error" in result
-
-        db.close()
+    # 下载应失败但不抛异常
+    result = await runner._download_single(
+        "test-err", "test-proj", paper, tlog,
+    )
+    assert result["success"] is False
+    assert "error" in result
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -181,32 +179,33 @@ async def test_error_handling_download_failure():
 
 
 def test_ingest_agent_compile():
-    """测试 IngestAgent LangGraph 图编译。"""
+    """测试 IngestAgent LangGraph 图编译（需要 DATABASE_URL）。"""
+    import os
+    if not os.environ.get("PYTEST_DB_INTEGRATION"):
+        pytest.skip("PYTEST_DB_INTEGRATION not set — skip DB integration test")
+
     from paper_search.agent.sub_agent import PipelineRunner
     from paper_search.agent.graphs.ingest_graph import IngestAgent
-    from paper_search.agent.db import AgentDB
+    from paper_search.agent.pgdb import PostgresAgentDB
     from paper_search.agent.llm_client_v2 import LLMClientV2
-    from paper_search.agent.chroma_store import ChromaStoreV2
+    from paper_search.agent.pgvector_store import PgVectorStore
     from paper_search.agent.pdf_converter import PDFConverter
     from paper_search.agent.journal_ranker import JournalRanker
 
-    with tempfile.TemporaryDirectory() as tmp:
-        db = AgentDB(Path(tmp) / "test.db")
-        runner = PipelineRunner(
-            engine=None, db=db, llm=LLMClientV2(),
-            chroma=ChromaStoreV2(), converter=PDFConverter(),
-            ranker=JournalRanker(),
-        )
+    db = PostgresAgentDB()
+    runner = PipelineRunner(
+        engine=None, db=db, llm=LLMClientV2(),
+        chroma=PgVectorStore(), converter=PDFConverter(),
+        ranker=JournalRanker(),
+    )
 
-        agent = IngestAgent(runner)
-        graph = agent.compile()
+    agent = IngestAgent(runner)
+    graph = agent.compile()
 
+    assert graph is not None
+    nodes = list(graph.nodes.keys()) if hasattr(graph, 'nodes') else []
+    if not nodes:
         assert graph is not None
-        nodes = list(graph.nodes.keys()) if hasattr(graph, 'nodes') else []
-        if not nodes:
-            assert graph is not None
-
-        db.close()
 
 
 # ═══════════════════════════════════════════════════════════════

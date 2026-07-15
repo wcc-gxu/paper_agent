@@ -85,7 +85,7 @@ class TestClusteringDispatch:
                    return_value=common_mocks["db"]), \
              patch("paper_search.agent.llm_client_v2.LLMClientV2",
                    return_value=common_mocks["llm"]), \
-             patch("paper_search.agent.chroma_store.ChromaStoreV2",
+             patch("paper_search.agent.pgvector_store.PgVectorStore",
                    return_value=mock_chroma), \
              patch("paper_search.agent.graphs.clustering_graph.ClusteringAgent",
                    return_value=mock_agent_inst) as mock_agent_cls:
@@ -133,7 +133,7 @@ class TestClusteringDispatch:
                    return_value=common_mocks["db"]), \
              patch("paper_search.agent.llm_client_v2.LLMClientV2",
                    return_value=common_mocks["llm"]), \
-             patch("paper_search.agent.chroma_store.ChromaStoreV2",
+             patch("paper_search.agent.pgvector_store.PgVectorStore",
                    return_value=mock_chroma), \
              patch("paper_search.agent.graphs.clustering_graph.ClusteringAgent",
                    return_value=mock_agent_inst):
@@ -268,7 +268,7 @@ class TestTranslationDispatch:
                    return_value=common_mocks["db"]), \
              patch("paper_search.agent.llm_client_v2.LLMClientV2",
                    return_value=common_mocks["llm"]), \
-             patch("paper_search.agent.chroma_store.ChromaStoreV2",
+             patch("paper_search.agent.pgvector_store.PgVectorStore",
                    return_value=mock_chroma), \
              patch("paper_search.agent.graphs.translation_graph.TranslationAgent",
                    return_value=mock_agent_inst) as mock_agent_cls:
@@ -318,7 +318,7 @@ class TestTranslationDispatch:
                    return_value=common_mocks["db"]), \
              patch("paper_search.agent.llm_client_v2.LLMClientV2",
                    return_value=common_mocks["llm"]), \
-             patch("paper_search.agent.chroma_store.ChromaStoreV2",
+             patch("paper_search.agent.pgvector_store.PgVectorStore",
                    return_value=mock_chroma), \
              patch("paper_search.agent.graphs.translation_graph.TranslationAgent",
                    return_value=mock_agent_inst):
@@ -463,7 +463,7 @@ class TestRADQueryDispatch:
                    return_value=common_mocks["db"]), \
              patch("paper_search.agent.llm_client_v2.LLMClientV2",
                    return_value=common_mocks["llm"]), \
-             patch("paper_search.agent.chroma_store.ChromaStoreV2",
+             patch("paper_search.agent.pgvector_store.PgVectorStore",
                    return_value=mock_chroma), \
              patch("paper_search.agent.knowledge.KnowledgeBase",
                    return_value=mock_kb) as mock_kb_cls, \
@@ -514,7 +514,7 @@ class TestRADQueryDispatch:
                    return_value=common_mocks["db"]), \
              patch("paper_search.agent.llm_client_v2.LLMClientV2",
                    return_value=common_mocks["llm"]), \
-             patch("paper_search.agent.chroma_store.ChromaStoreV2",
+             patch("paper_search.agent.pgvector_store.PgVectorStore",
                    return_value=mock_chroma), \
              patch("paper_search.agent.knowledge.KnowledgeBase",
                    return_value=mock_kb), \

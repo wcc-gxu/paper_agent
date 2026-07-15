@@ -471,13 +471,11 @@ class TestVideoDB:
 
     @pytest.fixture
     def db(self):
-        from paper_search.agent.db import AgentDB
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-            db_path = Path(f.name)
-        db = AgentDB(db_path=db_path)
-        yield db
-        db.close()
-        db_path.unlink(missing_ok=True)
+        import os
+        if not os.environ.get("PYTEST_DB_INTEGRATION"):
+            pytest.skip("PYTEST_DB_INTEGRATION not set — skip DB integration test")
+        from paper_search.agent.pgdb import PostgresAgentDB
+        return PostgresAgentDB()
 
     def test_save_and_get_video_result(self, db):
         """保存并获取视频结果。"""

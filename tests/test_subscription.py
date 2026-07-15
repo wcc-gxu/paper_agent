@@ -57,16 +57,19 @@ class TestSubscriptionModels:
 
 
 class TestSubscriptionCRUD:
-    """订阅 CRUD 集成测试（真实 SQLite）。"""
+    """订阅 CRUD 集成测试。
+
+    需要 DATABASE_URL 且显式设置 PYTEST_DB_INTEGRATION=1 才运行。
+    否则 skip（避免污染生产数据库）。
+    """
 
     @pytest.fixture
     def db(self):
-        from paper_search.agent.db import AgentDB
-        db_path = Path(tempfile.NamedTemporaryFile(suffix=".db", delete=False).name)
-        db = AgentDB(db_path=db_path)
-        yield db
-        db.close()
-        db_path.unlink(missing_ok=True)
+        import os
+        if not os.environ.get("PYTEST_DB_INTEGRATION"):
+            pytest.skip("PYTEST_DB_INTEGRATION not set — skip DB integration test")
+        from paper_search.agent.pgdb import PostgresAgentDB
+        return PostgresAgentDB()
 
     def test_create_and_get_subscription(self, db):
         """创建并获取订阅。"""

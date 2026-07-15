@@ -118,7 +118,10 @@ class TestRankTask:
         mock_rank.ccf_level = "A"
         mock_rank.sci_zone = "Q1"
 
-        with patch("paper_search.agent.journal_ranker.JournalRanker") as mock_r_cls:
+        mock_db = MagicMock()
+
+        with patch("paper_search.agent.journal_ranker.JournalRanker") as mock_r_cls, \
+             patch("paper_search.agent.celery_tasks._get_db", return_value=mock_db):
             mock_r = MagicMock()
             mock_r.rank.return_value = mock_rank
             mock_r_cls.return_value = mock_r
