@@ -976,3 +976,95 @@ ExtractedKnowledge {
 ```
 
 并删除原有的散落表述（"三步校验" / "严格校验四步" / "引用幻觉防控"等），统一指向此文档。
+
+---
+
+# 附录 B: 实现进度追踪
+
+> 最后更新: 2026-07-15
+> 对照本文档 §IV-VII 的设计，逐项记录实际代码落地状态。
+
+## B.1 L1 — Schema 约束 + 安全过滤
+
+| 设计项 | 文档出处 | 代码状态 | 文件 |
+|--------|----------|:---:|------|
+| chat_json Pydantic schema 强制 | §III.2 | ✅ 已落地 | `llm_client_v2.py:chat_json` |
+| tool_choice 硬强制 (Anthropic) | §III.3 | ✅ 已落地 | `llm_client_v2.py:853` |
+| thinking=disabled (DeepSeek) | §III.3 | ✅ 已落地 | `llm_client_v2.py:853` |
+| SafetyResult schema | §IV.2 | ✅ 已落地 | `main_agent_prompts.py` |
+| 7 regex 安全模式 | §IV.3 | ✅ 已落地 | `main_agent.py:_SAFETY_REGEX_PATTERNS` |
+| NFKC 归一化+零宽字符剥离 | §IV.3 | ✅ 已落地 | `main_agent.py:_normalize_for_safety` |
+| LLM 异步二次确认 | §IV.4 | ✅ 已落地 | `main_agent.py:_node_safety_filter` |
+| fail-closed (LLM不可用时拒答) | §IV.4 | ✅ 已落地 | `main_agent.py:753-764` |
+| 全节点低温采样 | §III.4 | ✅ 已落地 | safety 0.0, triage 0.0, plan 0.2, execute 0.3, eval 0.0 |
+
+## B.2 L2 — 引用验证 (CitationVerifier)
+
+| 设计项 | 文档出处 | 代码状态 | 文件 |
+|--------|----------|:---:|------|
+| CitationParser (正则提取引用) | §V.1 | ✅ 已落地 | `verifier.py:CitationParser` |
+| CitationVerifier.verify() (3 策略匹配) | §V.2 | ✅ 已落地 | `verifier.py:CitationVerifier.verify` |
+| LLM 事实核查 (全文读取) | §V.3 | ✅ 已落地 | `verifier.py:CitationVerifier._llm_fact_check` |
+| verify_and_wrap_report (L2 公开钩子) | §V.4 | ✅ 已落地 | `llm_client_v2.py:1743` (generate_report) |
+| fail-closed (异常时返回原报告+警告) | §V.4 | ✅ 已落地 | `verifier.py:verify_and_wrap_report` |
+| **RAG 回答集成引用验证** | §V.5 | ❌ **未落地** | `knowledge_graph.py:_format_node` 未调用 |
+| **Writing Agent 综述集成引用验证** | §V.5 | ❌ **未落地** | `writing_graph.py:_citation_node` 未调用 CitationVerifier |
+
+## B.3 L3 — 外部验证 (ExternalValidator)
+
+| 设计项 | 文档出处 | 代码状态 | 文件 |
+|--------|----------|:---:|------|
+| DOI 验证 (Crossref API) | §VI.2 | ✅ 已落地 | `external_validator.py:75` |
+| arXiv ID 验证 | §VI.2 | ✅ 已落地 | `external_validator.py:109` |
+| 标题搜索 (Semantic Scholar) | §VI.2 | ✅ 已落地 | `external_validator.py:145` |
+| 内存缓存 (1h TTL) | §VI.3 | ✅ 已落地 | `external_validator.py` in-memory dict |
+| 速率限制 + 2 重试 | §VI.3 | ✅ 已落地 | `external_validator.py` |
+| **集成到图中 (output_verify 节点)** | §VI.4 | ❌ **未落地** | 图中无 output_verify 节点 |
+| **external_validations 表写入** | §VI.5 | ❌ **未落地** | 表已建但 ExternalValidator 未写入 |
+
+## B.4 L4 — 输出验证节点 (output_verify)
+
+| 设计项 | 文档出处 | 代码状态 | 说明 |
+|--------|----------|:---:|------|
+| output_verify 节点 | §VII.2 | ❌ **未落地** | Supervision Graph 中无此节点 |
+| VerificationVerdict schema | §VII.3 | ❌ **未落地** | 未定义 |
+| CitationVerdict schema | §VII.3 | ❌ **未落地** | 未定义 |
+| GroundednessReport schema | §VII.3 | ❌ **未落地** | 未定义 |
+| HallucinationReport schema | §VII.3 | ❌ **未落地** | 未定义 |
+| revise loop (max 2 rounds) | §VII.4 | ❌ **未落地** | 无代码 |
+| groundedness LLM judge | §VII.5 | ❌ **未落地** | 无代码 |
+| hallucination review LLM judge | §VII.5 | ❌ **未落地** | 无代码 |
+| truth_confidence 决策门控 | §VII.6 | ⚠️ 部分 | `_evaluate` 记录 confidence 但不用于路由决策 |
+
+## B.5 提示词反虚构升级
+
+| 设计项 | 文档出处 | 代码状态 | 说明 |
+|--------|----------|:---:|------|
+| ANTI_FABRICATION_CLAUSE 定义 | Appendix A.1 | ✅ 已写 | 文档中有完整文本 |
+| P1 (RAG) 反虚构 | §V.2 | ⚠️ 部分 | RAG prompt 有基础约束但非标准化 |
+| P2-P8 反虚构升级 | §V.2 | ❌ **未落地** | 8 个 prompt 均未添加 |
+| REFUSAL_TEMPLATES | §V.3 | ❌ **未落地** | `refusal_templates.py` 不存在 |
+
+## B.6 审计基础设施
+
+| 设计项 | 文档出处 | 代码状态 | 说明 |
+|--------|----------|:---:|------|
+| hallucination_events 表 | §VIII.2 | ✅ DDL 已建 | `init_db.sql` 表存在 |
+| **hallucination_events 写入** | §VIII.3 | ❌ **未落地** | 无任何 Python 代码写入此表 |
+| 7 种 verify 生命周期事件 | §IX | ❌ **未落地** | 无代码 |
+| truthfulness_metadata (WS payload) | §VIII.3 | ❌ **未落地** | 无代码 |
+| KPI 仪表板 | §X | ❌ **未落地** | 无代码 |
+
+## B.7 落地率总结
+
+| 层面 | 设计项总数 | 已落地 | 部分落地 | 未落地 | 落地率 |
+|------|:---:|:---:|:---:|:---:|:---:|
+| L1 Schema + 安全 | 9 | 9 | 0 | 0 | **100%** |
+| L2 引用验证 | 7 | 6 | 0 | 1 | 86% |
+| L3 外部验证 | 6 | 5 | 0 | 1 | 83% |
+| L4 输出验证 | 9 | 0 | 1 | 8 | 11% |
+| 提示词反虚构 | 4 | 1 | 1 | 2 | 25% |
+| 审计基础设施 | 5 | 1 | 0 | 4 | 20% |
+| **总计** | **40** | **22** | **2** | **16** | **55%** |
+
+> **诚实评估**: 安全过滤 (L1) 完整落地。引用验证模块存在但集成范围窄（仅 generate_report）。外部验证模块存在但未集成到图。输出验证节点完全缺失。审计基础设施只有 DDL 没有写入逻辑。**核心短板是"集成"，不是"模块开发"。**
