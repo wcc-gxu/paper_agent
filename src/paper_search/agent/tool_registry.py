@@ -30,6 +30,12 @@ from langchain_core.tools import StructuredTool
 
 logger = logging.getLogger(__name__)
 
+ALLOWED_BASH_COMMANDS = {
+    "date", "ls", "cat", "head", "tail", "wc", "find", "stat", "du", "df",
+    "who", "ps", "env", "echo", "which", "uname", "hostname", "pwd",
+}
+
+
 # ── DB Singleton（替代 66 处惰性 AgentDB() 实例化） ──────────────
 
 _db_instance: Any = None
@@ -500,12 +506,13 @@ class ToolRegistry:
         self._register_resume_subscription()
 
         # ── 子 Agent 工具 25（执行阶段直接调用）──
-        self._register_sub_agent_tools()
 
         # ── v3 Phase 2: 新 Agent 工具 8 ──
         self._register_literature_agent_tools()
         self._register_knowledge_agent_tools()
+        self._register_research_agent_tools()
         self._register_writing_agent_tools()
+        self._register_translation_agent_tools()
         self._register_glossary_agent_tools()
         self._register_capture_agent_tools()  # 原 video agent 改名
         self._register_user_preference_tool()
@@ -1485,52 +1492,6 @@ class ToolRegistry:
     # 子 Agent 工具
     # ══════════════════════════════════════════════════════════
 
-    def _register_sub_agent_tools(self):
-        """注册子 Agent 工具（执行阶段由 Plan Graph 直接调用）。"""
-        # Abstracts the existing CLI/MCP functions as direct tool wrappers
-        sub_tools = [
-            ("agent_search_papers", "跨多源搜索学术论文", self._make_search_papers(),
-             {"keywords": {"type": "str", "description": "搜索关键词"}, "sources": {"type": "str", "description": "逗号分隔的来源", "required": False}, "year_from": {"type": "int", "description": "起始年份", "required": False}, "max_results": {"type": "int", "description": "最大返回数", "required": False}}),
-            ("agent_download_paper", "下载单篇论文 PDF。参数: paper_id 或 title（需先 search_papers 入库）", self._make_download_paper(),
-             {"title": {"type": "str", "description": "论文标题", "required": False}, "source": {"type": "str", "description": "来源", "required": False}, "paper_id": {"type": "str", "description": "论文 ID", "required": False}}),
-            ("agent_convert_paper", "PDF 转 Markdown。参数: paper_id（用已下载的 pdf_path，或显式传 pdf_path）", self._make_convert_paper(),
-             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "pdf_path": {"type": "str", "description": "PDF 路径", "required": False}}),
-            ("agent_index_paper", "Markdown 索引入 ChromaDB。参数: paper_id 或 project_id+all（索引项目全部已转换论文）", self._make_index_paper(),
-             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "project_id": {"type": "str", "description": "项目 ID", "required": False}, "all": {"type": "bool", "description": "索引该项目全部论文", "required": False}}),
-            ("agent_evaluate_papers", "LLM 批量评估论文相关性。参数: project_id, query(可选), all(默认true)", self._make_evaluate_papers(),
-             {"project_id": {"type": "str", "description": "项目 ID", "required": False}, "query": {"type": "str", "description": "评估查询", "required": False}, "all": {"type": "bool", "description": "评估全部未评估论文", "required": False}}),
-            ("agent_rank_papers", "期刊等级评定 CCF/SCI → A+/A/B/C。参数: project_id（可选）, all(默认true)", self._make_rank_papers(),
-             {"project_id": {"type": "str", "description": "项目 ID", "required": False}, "all": {"type": "bool", "description": "评定全部期刊", "required": False}}),
-            ("agent_generate_survey", "生成 AI 文献综述报告。参数: project_id", self._make_generate_survey(),
-             {"project_id": {"type": "str", "description": "项目 ID", "required": False}}),
-            ("agent_paper_export", "导出 BibTeX/JSON 到文件。参数: project_id, format(bibtex|json)", self._make_paper_export(),
-             {"project_id": {"type": "str", "description": "项目 ID", "required": False}, "format": {"type": "str", "description": "导出格式 bibtex/json", "required": False}}),
-            ("agent_paper_clean", "清理项目 DB/索引", self._make_paper_clean(),
-             {"project_id": {"type": "str", "description": "项目 ID"}, "keep_pdfs": {"type": "bool", "description": "保留 PDF 文件", "required": False}}),
-            ("agent_batch_search", "从 JSON/CSV 批量搜索并入库。参数: file_path, download(默认false)", self._make_batch_search(),
-             {"file_path": {"type": "str", "description": "JSON/CSV 文件路径", "required": False}, "download": {"type": "bool", "description": "是否下载 PDF", "required": False}}),
-            ("agent_citation_chase", "引用追溯（Semantic Scholar，默认2层）。参数: paper_title 或 doi", self._make_citation_chase(),
-             {"paper_title": {"type": "str", "description": "论文标题", "required": False}, "doi": {"type": "str", "description": "DOI", "required": False}}),
-            ("agent_search_library", "ChromaDB 语义搜索已入库论文", self._make_search_library(),
-             {"query": {"type": "str", "description": "搜索查询"}, "top_k": {"type": "int", "description": "返回条数", "required": False}}),
-            ("agent_search_knowledge", "ChromaDB 搜索结构化知识", self._make_search_knowledge(),
-             {"query": {"type": "str", "description": "搜索查询"}, "top_k": {"type": "int", "description": "返回条数", "required": False}}),
-            ("agent_read_paper", "读取论文完整 Markdown", self._make_read_paper(),
-             {"paper_id": {"type": "str", "description": "论文 ID"}}),
-            ("agent_extract_knowledge", "从论文中提取结构化知识（贡献/方法/数据集/局限）并存长期记忆。参数: paper_id, deep(默认false)", self._make_extract_knowledge(),
-             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "deep": {"type": "bool", "description": "深度提取模式", "required": False}}),
-            ("agent_find_related", "发现相关论文（语义相似+引用关系）。参数: paper_id, top_k(默认10)", self._make_find_related(),
-             {"paper_id": {"type": "str", "description": "论文 ID", "required": False}, "top_k": {"type": "int", "description": "返回条数", "required": False}}),
-            ("agent_discover_gaps", "知识发现 — 研究空白/矛盾/趋势。参数: domain(可选), project_id(可选)", self._make_discover_gaps(),
-             {"domain": {"type": "str", "description": "研究领域", "required": False}, "project_id": {"type": "str", "description": "项目 ID", "required": False}}),
-            ("agent_build_glossary", "构建中英学术术语表。参数: project_id（从该项目论文提取术语）", self._make_build_glossary(),
-             {"project_id": {"type": "str", "description": "项目 ID", "required": False}}),
-            ("agent_translate_query", "中文查询翻译为学术英文关键词。参数: query, target_lang(en|zh, 默认en)", self._make_translate_query(),
-             {"query": {"type": "str", "description": "待翻译查询", "required": False}, "target_lang": {"type": "str", "description": "目标语言 en/zh", "required": False}}),
-        ]
-        for name, desc, func, args_schema in sub_tools:
-            self.register_direct(name, desc, func, args_schema=args_schema,
-                                 metadata=ToolMetadata(category="search"))
     def _make_search_papers(self):
         async def search_papers(keywords: str, sources: str = "arxiv,semantic_scholar",
                                  year_from: int = 2020, max_results: int = 20) -> str:
@@ -2167,8 +2128,51 @@ class ToolRegistry:
                 "project_id": {"type": "str", "description": "目标项目 ID"},
                 "agent_id": {"type": "str", "description": "智能体 ID (一个智能体一个 project)", "required": False},
             },
+            metadata=ToolMetadata(category="system"),
+        )
+        # bash_query — 只读 shell 白名单
+        self.register_direct(
+            "bash_query", "只读 shell 命令 (ls/cat/find/head/tail/wc 等)",
+            self._make_bash_query(),
+            args_schema={"command": {"type": "str", "description": "shell 命令（仅白名单）"}},
+            metadata=ToolMetadata(category="system"),
+        )
+        self.register_direct(
+            "agent_knowledge_get_fulltext",
+            "论文全文获取: 按 paper_id/title/year/journal_tier/venue 筛选并返回完整 Markdown",
+            self._make_knowledge_get_fulltext(),
+            args_schema={
+                "paper_id": {"type": "str", "description": "论文 ID", "required": False},
+                "title": {"type": "str", "description": "论文标题（模糊匹配）", "required": False},
+                "year": {"type": "int", "description": "发表年份", "required": False},
+                "journal_tier": {"type": "str", "description": "期刊等级: A+|A|B|C", "required": False},
+                "venue": {"type": "str", "description": "特定期刊/会议名称", "required": False},
+            },
             metadata=ToolMetadata(category="knowledge"),
         )
+
+    def _make_bash_query(self):
+        @tool_error_handler(agent="tool:bash_query", node="bash_query")
+        async def bash_query(command: str) -> str:
+            return await self._bash_query(command)
+        return bash_query
+
+    def _make_knowledge_get_fulltext(self):
+        @tool_error_handler(agent="tool:agent_knowledge_get_fulltext",
+                            node="KnowledgeAgent.get_fulltext")
+        async def knowledge_get_fulltext(paper_id: str = "", title: str = "",
+                                           year: int = 0, journal_tier: str = "",
+                                           venue: str = "") -> str:
+            from .graphs.knowledge_graph import KnowledgeAgent
+            from .pgdb import PostgresAgentDB
+            db = _get_db()
+            agent = KnowledgeAgent(db=db)
+            result = await agent.get_fulltext(
+                paper_id=paper_id, title=title, year=year,
+                journal_tier=journal_tier, venue=venue
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        return knowledge_get_fulltext
 
     def _make_knowledge_ingest(self):
         @tool_error_handler(agent="tool:agent_knowledge_ingest", node="KnowledgeAgent.run_ingest")
@@ -2213,6 +2217,18 @@ class ToolRegistry:
             return json.dumps(result, ensure_ascii=False, default=str)
         return knowledge_ingest_local
 
+    def _register_research_agent_tools(self):
+        """Research Agent 工具 — 聚类 + 引用追踪。"""
+        self.register_direct(
+            "agent_clustering", "论文聚类分析: 对项目论文做聚类+全景图",
+            self._make_clustering(),
+            args_schema={
+                "project_id": {"type": "str", "description": "项目 ID"},
+                "n_clusters": {"type": "int", "description": "聚类数", "required": False},
+            },
+            metadata=ToolMetadata(category="research"),
+        )
+
     def _register_writing_agent_tools(self):
         """Writing Agent 工具 — 综述生成与 AI 味检测。"""
         self.register_direct(
@@ -2248,6 +2264,20 @@ class ToolRegistry:
             result = quick_ai_flavor_check(text)
             return json.dumps(result, ensure_ascii=False, default=str)
         return check_ai_flavor
+
+    def _register_translation_agent_tools(self):
+        """Translation Agent 工具 — 统一翻译入口（合并旧 agent_translate_query + agent_build_glossary）。"""
+        self.register_direct(
+            "agent_translate", "学术翻译: translate|build_glossary|enrich",
+            self._make_translate(),
+            args_schema={
+                "action": {"type": "str", "description": "操作: translate|build_glossary|enrich"},
+                "text": {"type": "str", "description": "待翻译文本（translate时必填）", "required": False},
+                "project_id": {"type": "str", "description": "项目 ID（build_glossary时必填）", "required": False},
+                "direction": {"type": "str", "description": "翻译方向: zh2en|en2zh|auto", "required": False},
+            },
+            metadata=ToolMetadata(category="translation"),
+        )
 
     def _register_glossary_agent_tools(self):
         """Glossary Sub-Agent 工具 — 术语管理。"""

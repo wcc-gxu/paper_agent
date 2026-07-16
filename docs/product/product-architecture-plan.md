@@ -418,7 +418,8 @@ Stage 3: 方案生成 (Generate)
 
 ### 4.5 引用幻觉防控
 
-**严格校验策略：**
+**反幻觉策略：** 详见 [anti-hallucination.md](../development/anti-hallucination.md) v2.0 三层体系（人格设定 + 上下文质量 + 规则验证）。
+
 
 ```
 LLM 生成声明 (含引用)
@@ -514,7 +515,7 @@ WebSocket:
 
 | 难点 | 严重度 | 应对策略 |
 |------|--------|----------|
-| LLM 幻觉导致引用错误 | 🔴 致命 | 严格校验：每条引用强制与 DB/原文校验，不一致则拒绝/标记 |
+| LLM 幻觉导致引用错误 | 🔴 致命 | 三层反幻觉体系：人格设定 + 上下文质量 + 规则验证 |
 | 优化后方案质量 | 🔴 致命 | 多阶段 Pipeline + 人工确认 + 方案审查（未来加验证阶段） |
 | 质量评估客观性 | 🔴 致命 | 指标+LLM 混合评估，关键步骤人工确认 |
 | 知识提取质量 | 🔴 致命 | 引用网络增强 + LLM 结构化提取 + 持续优化 prompt |
@@ -567,7 +568,7 @@ WebSocket:
 **Phase 2: Agent 核心（3-4周）**
 - Agentic Loop 引擎（Plan-then-Execute + 状态机）
 - Prompt 优化引擎（3阶段 Pipeline）
-- 引用幻觉防控（严格校验）
+- 引用幻觉防控（三层反幻觉体系）
 - 崩溃恢复（检查点机制）
 - 成本控制（步数上限）
 
@@ -618,7 +619,7 @@ src/paper_search/
 │   ├── tool_registry.py   # [NEW] 统一工具注册中心
 │   ├── memory.py          # [NEW] 4层记忆系统
 │   ├── knowledge.py       # [NEW] 知识提取与管理
-│   ├── verifier.py        # [NEW] 引用校验与质量评估
+│   ├── verifier.py        # 引用规则校验（三层-规则验证）
 │   └── ...
 ├── api/                   # [NEW] FastAPI 层
 │   ├── app.py

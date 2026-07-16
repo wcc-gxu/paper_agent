@@ -75,17 +75,19 @@ v4:    plan → (clarify_needed) → clarify (Actor) → plan
 
 ## 3. 反幻觉体系
 
-| 层面 | 落地率 | 最大缺口 |
-|------|:---:|------|
-| L1 Schema + 安全过滤 | 100% | — |
-| L2 引用验证 | 86% | RAG 回答未集成 CitationVerifier |
-| L3 外部验证 | 83% | 未集成到图中 |
-| L4 输出验证 | 11% | output_verify 节点完全缺失 |
-| 提示词反虚构 | 25% | 8 个 prompt 未添加 |
-| 审计基础设施 | 20% | 表存在但无写入逻辑 |
-| **总计** | **55%** | **核心问题是集成，不是模块开发** |
+反幻觉策略已完全重构为三层设计，详见 [anti-hallucination.md](anti-hallucination.md)。
 
-详见 `anti-hallucination.md` 附录 B。
+三层防线：
+1. **人格设定** — LLM 是谨慎的领域专家，为自己说出的每一句话负责
+2. **上下文质量（主战场）** — 好材料自然产出好答案：query 改写 → 多源召回 → rerank → provenance 注入 → 阈值拒答
+3. **规则验证（兜底）** — 纯规则代码级硬核对：引用格式正则检查 + DB 存在性比对 + `RAG_MIN_SCORE` 门控
+
+旧版 4 层/6 层纵深体系已废弃。核心改进：不再区分“内部核对 vs 外部核对”——CitationVerifier、ExternalValidator 统一归入规则验证层。
+
+当前落地率：
+- 第一层（人格设定）：0% — 待 P2 实施
+- 第二层（上下文质量）：40% — RAG 已有基础约束，缺 provenance 注入和阈值拒答
+- 第三层（规则验证）：30% — JSON Schema 已有、安全过滤已有，引用格式正则 + DB 比对待实施
 
 ---
 
@@ -200,7 +202,7 @@ class TodoSpec(BaseModel):
 | 文档 | 存在? | 完整度 | 待更新 |
 |------|:---:|:---:|------|
 | Agent 架构设计 | ✅ `agent-architecture-v4.md` | 🔶 初稿 | 待讨论确认 |
-| 反幻觉策略 | ✅ `anti-hallucination.md` | ✅ 正文完整 | 附录 B 已追加 |
+| 反幻觉策略 | ✅ `anti-hallucination.md` (v2.0) | ✅ 三层体系完整 | 旧附录已删除 |
 | 反幻觉实现进度 | ✅ (同上附录 B) | ✅ | — |
 | 查缺补漏 | ✅ `gap-analysis.md` (本文档) | 🔶 初稿 | 持续更新 |
 | 记忆系统 | ✅ `memory-system.md` | ✅ | v2 迁移状态更新 |
@@ -216,41 +218,42 @@ class TodoSpec(BaseModel):
 
 ### P0 — 阻塞性 (必须做)
 
-| # | 任务 | 工作量 | 文件 |
-|---|------|:---:|------|
-| 1 | 新建 `clarify` 节点 (Actor+Restricted tools) | 2d | `main_graph.py` |
-| 2 | 合并 plan_review + ask_user → Gate | 1d | `main_graph.py` + `daemon.py` |
-| 3 | plan 新增 clarify_needed 字段 | 0.5d | `main_agent_prompts.py` |
-| 4 | 删除 3 个废弃 graph 文件 + 清除引用 | 2h | `ingest_graph.py`, `rad_query_graph.py`, `history_graph.py` |
-| 5 | 删除 19 个 v1 agent_ 工具 | 2h | `tool_registry.py` |
+| # | 任务 | 工作量 | 文件 | 决策 |
+|---|------|:---:|------|------|
+| 1 | 新建 `clarify` 节点 (Actor+Restricted tools) | 2d | `main_graph.py` | LLM 自主决定模式，不限轮次，Gate 超时 30min |
+| 2 | 合并 plan_review + ask_user → Gate | 1d | `main_graph.py` + `daemon.py` | 统一 Gate，共享 parked queue |
+| 3 | plan 新增 clarify_needed 字段 | 0.5d | `main_agent_prompts.py` | Plan 不调工具，需工具时走 clarify loop |
+| 4 | 删除 3 个废弃 graph 文件 + 清除引用 | 2h | `ingest_graph.py`, `rad_query_graph.py`, `history_graph.py` | 一次性清理，顺序：history→rad_query→ingest |
+| 5 | 删除 19 个 v1 agent_ 工具 | 2h | `tool_registry.py` | `_register_sub_agent_tools` 整块移除 |
 
 ### P1 — 重要 (应该做)
 
-| # | 任务 | 工作量 | 文件 |
-|---|------|:---:|------|
-| 6 | 新增 `agent_clustering` | 2h | `tool_registry.py` |
-| 7 | 新增 `agent_translate` (统一 Translation 入口) | 1h | `tool_registry.py` |
-| 8 | Knowledge Agent RAG 集成 CitationVerifier | 3h | `knowledge_graph.py` |
-| 9 | L4 output_verify 节点 (依赖 L2+L3 集成) | 2d | `main_graph.py` |
-| 10 | Writing Agent landscape + gap_analysis 节点 | 2d | `writing_graph.py` |
-| 11 | 时区工具函数 + Pydantic validator | 2h | `utils/datetime_utils.py` + models |
+| # | 任务 | 工作量 | 文件 | 决策 |
+|---|------|:---:|------|------|
+| 6 | 新增 `agent_clustering` | 2h | `tool_registry.py` | 封包 clustering_graph 为 agent 入口 |
+| 7 | 新增 `agent_translate` (统一 Translation 入口) | 1h | `tool_registry.py` | 合并 agent_translate_query + agent_build_glossary v1 |
+| 8 | Knowledge Agent RAG 集成规则验证（第三层） | 3h | `knowledge_graph.py` | 引用格式正则 + DB 存在性比对 |
+| 9 | 规则验证节点（output_verify，纯规则） | 1.5d | `main_graph.py` | 正则检查引用格式 + 编号越界 + DB 比对，无 LLM 复审 |
+| 10 | Writing Agent landscape + gap_analysis | 2d | `writing_graph.py` | landscape 为综述章节，gap_analysis 为独立 MD 文档 |
+| 11 | 时区工具函数 + Pydantic validator | 2h | `utils/datetime_utils.py` + models | `beijing_now()` + `@field_validator` 自动转 |
+| 12 | 新增 `agent_knowledge_get_fulltext` | 3h | `tool_registry.py` + `knowledge_graph.py` | 按 paper_id/title/year/journal_tier/venue 筛选全文 |
 
 ### P2 — 增强 (可以做)
 
-| # | 任务 | 工作量 | 文件 |
-|---|------|:---:|------|
-| 12 | 8 个 prompt 添加 ANTI_FABRICATION_CLAUSE | 1h | `main_agent_prompts.py` |
-| 13 | hallucination_events 写入逻辑 | 2h | `main_graph.py` + `pgdb.py` |
-| 14 | success_criterion 长度 200→500 + 新增字段 | 30min | `main_agent_prompts.py` |
-| 15 | bash_query 工具 (只读 shell) | 2h | `tool_registry.py` |
-| 16 | 文档更新 (CLAUDE.md, memory-system.md, api-reference.md) | 2h | 各文档 |
-| 17 | Literature Agent 语义关联推送 (Celery Beat) | 1d | `celery_tasks.py` |
+| # | 任务 | 工作量 | 文件 | 决策 |
+|---|------|:---:|------|------|
+| 13 | 8 个 prompt 添加专家人格设定 | 1h | `main_agent_prompts.py` | 正向表述“谨慎的专家”，替代旧 ANTI_FABRICATION_CLAUSE |
+| 14 | hallucination_events 写入逻辑 | 2h | `main_graph.py` + `pgdb.py` | 规则验证结果写入审计表 |
+| 15 | success_criterion 长度 200→500 + 加字段 | 30min | `main_agent_prompts.py` | 加 expected_output_keys 字段 |
+| 16 | bash_query 工具（白名单只读 shell） | 2h | `tool_registry.py` | 独立工具 + `_ALLOWED_BASH_COMMANDS` 白名单 |
+| 17 | 文档整体更新 | 2h | 各文档 | 含 CLAUDE.md、anti-hallucination、架构等 |
+| 18 | Literature Agent 每日语义推送 (Celery Beat) | 1d | `celery_tasks.py` | 基于用户订阅 + 自动推断 topic 供确认 |
 
 ### P3 — 远期
 
 | # | 任务 | 工作量 | 说明 |
 |---|------|:---:|------|
-| 18 | ExternalValidator 集成到 output_verify | 1d | 依赖 P1-#9 |
-| 19 | groundedness LLM judge | 1d | 依赖 P1-#9 |
-| 20 | revise loop | 2d | 依赖 P1-#9 |
+| 19 | ExternalValidator 集成到规则验证链 | 1d | 依赖 P1-#9 |
+| 20 | groundedness LLM judge | 1d | 数据驱动决策，先收集 KPI 再决定是否加 |
 | 21 | APNs 真实集成 (aioapns) | 3d | 已有骨架 |
+| 22 | 跨源一致性检测（≥2 源才采信孤立声明） | 0.5d | 第三层增强 |

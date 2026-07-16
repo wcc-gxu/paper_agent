@@ -177,10 +177,10 @@
 
 | AC# | 级别 | 验收项 | 验证方式 | 具体步骤 |
 |-----|:---:|--------|----------|----------|
-| **3.2.1** | P0 | `[local:pap-001]` 在库内存在 → 验证通过，状态 ✓ | 自动化测试 | `pytest tests/test_verifier.py::test_local_valid` |
-| **3.2.2** | P0 | `[local:pap-999]` 在库内不存在 → 验证失败，状态 ❌ | 自动化测试 | `pytest tests/test_verifier.py::test_local_not_found` |
-| **3.2.3** | P0 | 声明确认：LLM 声称 "该方法在 ImageNet 上达到 95%" → chunk 中确实包含此信息 → claim_verified=true | 自动化测试 | `pytest tests/test_verifier.py::test_claim_verified_true` |
-| **3.2.4** | P0 | 声明确认：LLM 声称 "达到 99%" → chunk 中说 95% → claim_verified=false | 自动化测试 | `pytest tests/test_verifier.py::test_claim_verified_false` |
+| **3.2.1** | P0 | 引用编号 `[N]` 格式正确且在 References 中存在 → 验证通过 | | 自动化测试 | `pytest tests/test_verifier.py::test_local_valid` |
+| **3.2.2** | P0 | paper_id 在 DB 中不存在 → 验证失败，标记 ⚠️[需核查] | | 自动化测试 | `pytest tests/test_verifier.py::test_local_not_found` |
+| **3.2.3** | P0 | References 条目完整且编号与正文一致 → 验证通过 | "该方法在 ImageNet 上达到 95%" → chunk 中确实包含此信息 → claim_verified=true | 自动化测试 | `pytest tests/test_verifier.py::test_claim_verified_true` |
+| **3.2.4** | P0 | 编号越界或 References 缺条目 → 验证失败，标记异常 | "达到 99%" → chunk 中说 95% → claim_verified=false | 自动化测试 | `pytest tests/test_verifier.py::test_claim_verified_false` |
 
 ### 4.3 外部验证
 

@@ -1,4 +1,4 @@
-# 智驭·研 v3 后端开发计划
+# [DEPRECATED] 智驭·研 v3 后端开发计划
 
 > 基于 [v3 重构方案](../product/智驭研_重构方案_v3.md) + [数据库架构设计](./database-architecture.md)
 >

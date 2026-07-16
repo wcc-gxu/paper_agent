@@ -1,7 +1,7 @@
 # Paper Agent v4 — Agent 架构设计文档
 
-> 最后更新: 2026-07-15
-> 状态: 设计中（已确认部分 + 待讨论项）
+> 最后更新: 2026-07-16
+> 状态: 设计中（12 项讨论全部已决策）
 > 来源: Claude Code 苏格拉底式架构对话
 
 ---
@@ -185,7 +185,13 @@ agent_knowledge_ask:
   输出: answer, sources, confidence, follow_up_questions
   子图: parse → route → search → evaluate ⇄ refine → format
   [NEW] 支持 filter_paper_ids 限定论文范围
-  [NEW] 支持 paper_id 精确查全文 (调用 search_fulltext)
+  [NEW] 支持 filter_journal_tier / filter_venue / filter_year 多维度筛选
+
+agent_knowledge_get_fulltext [NEW]:
+  输入: paper_id? | title? | year? | journal_tier? | venue?（至少一个）
+  输出: { paper_id, title, full_markdown, metadata, figures[] }
+  说明: 按条件筛选并返回论文完整 Markdown 全文。支持多条件组合筛选。
+        与 agent_knowledge_ask 互补：ask 做 RAG 问答，get_fulltext 提供全文阅读。
 
 agent_knowledge_ingest_local:
   输入: pdf_dir, project_id, agent_id?
@@ -422,52 +428,27 @@ push GateMessage → BRPOP agent:ws:{id} →
 
 ```
 Literature Agent:     agent_literature_search
-Knowledge Agent:      agent_knowledge_ingest, agent_knowledge_ask, agent_knowledge_ingest_local
+Knowledge Agent:      agent_knowledge_ingest, agent_knowledge_ask, agent_knowledge_ingest_local, agent_knowledge_get_fulltext [NEW]
 Research Agent:       agent_clustering [NEW], agent_citation_chase
 Writing Agent:        agent_generate_survey_v2, agent_check_ai_flavor
 Translation Agent:    agent_translate [NEW]
 Glossary Agent:       agent_build_glossary_v2
 Capture Agent:        agent_capture_video
-System (非 agent_):   约 45 个系统工具 (不变)
+System (非 agent_):   约 46 个系统工具 (不变)
 ```
 
 ---
 
-## 8. 反幻觉体系现状与缺口
+## 8. 反幻觉体系
 
-### 8.1 已落地
+反幻觉策略已完全重构为三层设计，详见 [anti-hallucination.md](anti-hallucination.md)。
 
-| 层面 | 内容 | 文件 |
-|------|------|------|
-| L1 安全过滤 | 7 regex 模式 + LLM 二次确认 + fail-closed | `main_agent.py:_node_safety_filter` |
-| L1 Schema 强约束 | 全部 LLM 调用 `chat_json(schema=PydanticModel)` + `tool_choice` | `llm_client_v2.py` |
-| L2 引用验证 | CitationVerifier (提取→匹配→LLM 事实核查) | `verifier.py`, 集成于 `generate_report` |
+三层防线：
+1. **人格设定** — LLM 是谨慎的领域专家，为自己说出的每一句话负责
+2. **上下文质量（主战场）** — 好材料自然产出好答案
+3. **规则验证（兜底）** — 代码级硬核对，正则检查引用格式 + DB 存在性比对
 
-### 8.2 已设计未落地
-
-| 层面 | 内容 | 文档出处 | 缺失 |
-|------|------|----------|------|
-| L2 RAG 引用校验 | RAG 回答中的引用验证 | anti-hallucination.md §IV | 未集成到 KnowledgeAgent.ask() |
-| L3 外部验证 | DOI/arXiv API 校验 | anti-hallucination.md §V | 模块存在但未集成 |
-| L4 output_verify | 图中输出验证节点 | anti-hallucination.md §VI | 图中无此节点 |
-| ANTI_FABRICATION | 8 个 prompt 的反虚构条款 | anti-hallucination.md §V.2 | 未添加到任何 prompt |
-| hallucination_events | 幻觉审计日志 | init_db.sql 表已建 | 无 Python 代码写入 |
-| groundedness judge | LLM 判断回答是否基于检索结果 | anti-hallucination.md §IV.5 | 无代码 |
-| revise loop | 最多 2 轮修正 | anti-hallucination.md §VI.4 | 无代码 |
-
-### 8.3 待办优先级
-
-| 优先级 | 行动 | 工作量 |
-|:---:|------|:---:|
-| P0 | Writing Agent 综述输出集成 CitationVerifier | 2h |
-| P0 | KnowledgeAgent.ask() 集成 CitationVerifier | 3h |
-| P1 | 8 个 prompt 添加 ANTI_FABRICATION_CLAUSE | 1h |
-| P1 | hallucination_events 表写入逻辑 | 2h |
-| P2 | ExternalValidator 集成到 output_verify | 1d |
-| P2 | groundedness LLM judge | 1d |
-| P3 | revise loop | 2d |
-
----
+旧版 4 层/6 层纵深体系已废弃。不再区分“内部核对 vs 外部核对”——CitationVerifier、ExternalValidator 统一归入规则验证层。
 
 ## 9. 信息管理体系
 
@@ -544,50 +525,50 @@ def utc_to_beijing(utc_str: str) -> str:
 
 ---
 
-## 12. 待讨论/待确认事项
+## 12. 讨论事项（已决策）
 
 ### 12.1 clarify 节点
 
-- [ ] `auto` vs `ask_first` 模式：由 LLM 在 ReAct 中自主决定，还是由 plan 节点输出字段控制？
-- [ ] clarify 的超时策略：30 分钟？还是更短？
-- [ ] clarify 结果如何注入 plan 的 replan prompt？是否需要专门的 `clarify_results` 格式化器？
+- [x] 由 LLM 自主决定，JSON Schema 固定字段控制。用户交互不限轮次，自动执行限制 8 轮。
+- [x] Gate 超时 30 分钟，超时后返回 END。
+- [x] 通过 `clarify_results` 字段回传，plan 消费而非从零生成。
 
 ### 12.2 bash_query 工具
 
-- [ ] 是把 `bash_exec` 拆成两个工具（`bash_exec` + `bash_query`），还是在 `bash_exec` 内部根据节点上下文限制命令？
-- [ ] 白名单命令是否需要支持参数化（如 `head -n 100`）——当前设计支持，但需确认
+- [x] 是把 `bash_exec` 拆成两个工具（`bash_exec` + `bash_query`），还是在 `bash_exec` 内部根据节点上下文限制命令？
+- [x] 白名单命令是否需要支持参数化（如 `head -n 100`）——当前设计支持，但需确认
 
 ### 12.3 Plan 节点工具访问
 
-- [ ] plan 是否应该返回 `clarify_needed` 字段（触发 clarify），而不是自己调工具？
-- [ ] 如果 plan 需要工具调用来验证可行性（如"这篇论文是否已在库中"），应该返回 clarify_needed 还是直接调？
+- [x] plan 是否应该返回 `clarify_needed` 字段（触发 clarify），而不是自己调工具？
+- [x] 如果 plan 需要工具调用来验证可行性（如"这篇论文是否已在库中"），应该返回 clarify_needed 还是直接调？
 
 ### 12.4 时区迁移
 
-- [ ] Pydantic validator 是在序列化时自动转，还是需要显式调用 `beijing_now()`？
-- [ ] Celery Beat schedule 是否也需要显示为北京时间（目前用 cron 表达式，无时区信息）？
+- [x] Pydantic validator 是在序列化时自动转，还是需要显式调用 `beijing_now()`？
+- [x] Celery Beat schedule 是否也需要显示为北京时间（目前用 cron 表达式，无时区信息）？
 
 ### 12.5 旧代码清理顺序
 
-- [ ] 先清理 `history_graph.py`（无外部引用，最安全）
-- [ ] → `rad_query_graph.py`（需改 celery_tasks.py 路由到 KnowledgeAgent）
-- [ ] → `ingest_graph.py`（需改 routes.py 路由到 LiteratureAgent）
-- [ ] → 19 个旧 agent_ 工具（`_register_sub_agent_tools`）
-- [ ] 清理顺序是否正确？是否需要分 PR？
+- [x] 先清理 `history_graph.py`（无外部引用，最安全）
+- [x] → `rad_query_graph.py`（需改 celery_tasks.py 路由到 KnowledgeAgent）
+- [x] → `ingest_graph.py`（需改 routes.py 路由到 LiteratureAgent）
+- [x] → 19 个旧 agent_ 工具（`_register_sub_agent_tools`）
+- [x] 清理顺序是否正确？是否需要分 PR？
 
 ### 12.6 Writing Agent landscape + gap_analysis
 
-- [ ] gap_analysis 的输出格式：是综述末尾的一个章节，还是独立的结构化 JSON？
-- [ ] 如何标注"AI辅助分析，需人工验证"？是通过 outbox `confidence` 字段还是文本内标记？
-- [ ] 是否需要在 Gate 阶段让用户选择"是否包含缺口分析"（因为可能增加 LLM 调用成本）？
+- [x] gap_analysis 的输出格式：是综述末尾的一个章节，还是独立的结构化 JSON？
+- [x] 如何标注"AI辅助分析，需人工验证"？是通过 outbox `confidence` 字段还是文本内标记？
+- [x] 是否需要在 Gate 阶段让用户选择"是否包含缺口分析"（因为可能增加 LLM 调用成本）？
 
 ### 12.7 Knowledge Agent 增强
 
-- [ ] `agent_knowledge_ask` 的 `filter_paper_ids` 参数：是否需要同时支持 `filter_project_id`、`filter_year`、`filter_venue`？
-- [ ] 是否新增 `agent_knowledge_get_fulltext` 工具（读取某篇论文完整 MD），还是通过 `agent_knowledge_ask` + `filter_paper_ids` 覆盖？
+- [x] `agent_knowledge_ask` 的 `filter_paper_ids` 参数：是否需要同时支持 `filter_project_id`、`filter_year`、`filter_venue`？
+- [x] 是否新增 `agent_knowledge_get_fulltext` 工具（读取某篇论文完整 MD），还是通过 `agent_knowledge_ask` + `filter_paper_ids` 覆盖？
 
 ### 12.8 Literature Agent 定时推送
 
-- [ ] 语义关联发现的调度频率？每小时？每天？
-- [ ] 是否复用现有 `subscription_check_task`，还是新增 Celery task？
-- [ ] 推送内容格式：纯文本 vs 结构化 JSON（含 paper title/authors/abstract/relevance_score）？
+- [x] 语义关联发现的调度频率？每小时？每天？
+- [x] 是否复用现有 `subscription_check_task`，还是新增 Celery task？
+- [x] 推送内容格式：纯文本 vs 结构化 JSON（含 paper title/authors/abstract/relevance_score）？

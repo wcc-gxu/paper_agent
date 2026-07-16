@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-Paper Agent v3 — 个人 AI 科研助理。输入研究方向 → 自动搜索/下载/阅读/综述/知识库沉淀。支持视频分享链接解析+下载+转写+LLM总结。
+Paper Agent v4 — 个人 AI 科研助理。输入研究方向 → 自动搜索/下载/阅读/综述/知识库沉淀。支持视频分享链接解析+下载+转写+LLM总结。
 
 - **产品形态**: Python 后端 (FastAPI + WebSocket) + iOS 客户端
 - **主 Agent**: MainAgent (LangGraph StateGraph 6 节点 + JSON Schema 强约束 + safety 双闸 + evaluate 5 出口)
@@ -89,7 +89,7 @@ WS 消息 → BRPOP agent:ws:{agent_id}
 
 **Tool 命名规范**：子 Agent 以 `agent_` 前缀（`agent_search`, `agent_ingest`, `agent_survey`），普通 tool 无前缀。LLM 不区分两者——都是 tool_use。
 
-**安全双闸**：(1) 入口 regex 同步秒过；(2) regex 命中后 LLM 异步并行二次确认，主流程不阻塞；(3) 每个 tool 调用前再过一次 regex 检测 arguments。fail-closed 纪律：LLM 不可用时一律拒答（详见 [anti-hallucination.md L4](docs/development/anti-hallucination.md)）。
+**安全双闸**：(1) 入口 regex 同步秒过；(2) regex 命中后 LLM 异步并行二次确认，主流程不阻塞；(3) 每个 tool 调用前再过一次 regex 检测 arguments。fail-closed 纪律：LLM 不可用时一律拒答（详见 [anti-hallucination.md](docs/development/anti-hallucination.md) 工程纪律）。
 
 **evaluate_completion 5 出口**：`done` / `retry_tools` / `ask_user` / `replan` / `fail`。总轮数硬上限 8 轮。`INTENT_ASK_THRESHOLD` 默认 0.6 控制 C3 灰区。
 
@@ -219,7 +219,7 @@ graph.aget_state(config={"configurable": {"thread_id": session_id}})
 → state.next 标识下一个待执行节点 → 自动续上
 ```
 
-**v1 → v2 变化**：废弃 `agent_events` 表 + `_replay` + `_resume_from_state`，改用 Checkpointer 标准 history（3 张 langgraph 表 `checkpoints` / `checkpoint_blobs` / `checkpoint_writes`，与业务表同库）。反幻觉专用 telemetry 表 `hallucination_events` 保留作为项目级审计（[anti-hallucination.md §8.1](docs/development/anti-hallucination.md)），与 Checkpointer history 互补。
+**v1 → v2 变化**：废弃 `agent_events` 表 + `_replay` + `_resume_from_state`，改用 Checkpointer 标准 history（3 张 langgraph 表 `checkpoints` / `checkpoint_blobs` / `checkpoint_writes`，与业务表同库）。反幻觉专用 telemetry 表 `hallucination_events` 保留作为项目级审计（[anti-hallucination.md](docs/development/anti-hallucination.md) 第三层），与 Checkpointer history 互补。
 
 ### 7 个子 Agent（v3 目标架构，Phase 2 实现）
 
@@ -277,7 +277,7 @@ src/paper_search/
 │   ├── reporter.py                 # Agent → 主 Agent 双通道上报 (Redis Pub/Sub agent:reports:{agent_id})
 │   ├── task_logger.py              # 任务 JSON 日志
 │   ├── sub_agent.py                # PipelineRunner 编排器
-│   ├── verifier.py                 # 引用三步校验
+│   ├── verifier.py                 # 引用规则校验
 │   ├── video_downloader.py         # yt-dlp 封装
 │   ├── video_browser.py            # CloakBrowser 封装
 │   ├── knowledge.py                # RAG 问答 + Cross-Encoder Rerank + rag_traces
@@ -456,10 +456,10 @@ Python >= 3.11
 | 记忆去重 | ✅ | update_preference: exact/high_sim skip + LLM merge |
 | **多用户多智能体 (v3.2)** | ✅ | agents 表 + AgentManager + agent CRUD API + JWT agent_id + 超级管理员 + 热重载 |
 | 7 子 Agent (LangGraph StateGraph) v2 | ✅ | 当前：Ingest/RADQuery/Cluster/CitationChase/History/Translation/Video + Knowledge/Literature/Writing/Glossary |
-| 7 子 Agent v3 重构 | 📐 | 目标：Literature/Knowledge/Research/Writing/Capture/Translation/Glossary |
+| 7 子 Agent v4 架构 | ✅ | 7 Agent 全部就位，+clarify +Gate 合并 +21 个 tool |
 | Celery 任务 | ✅ | 10 task (含 session_close_check) + Beat 5 schedule |
 | ToolRegistry | ✅ | 73+ 工具 (含 check_rag_health + update_preference 去重) |
-| 反幻觉策略 (4 层主线) | 🔶 | L1/L4 已落地，L2/L3 Phase B/C |
+| 反幻觉策略 (三层体系 v2.0) | ✅ | 文档重写 + 规则验证 + 审计写入已完成 |
 | 文档 | ✅ | CLAUDE.md / main-agent.md / memory-system.md / websocket-protocol.md / anti-hallucination.md / api-reference.md |
 | 测试 | 🔶 | 各模块有单元/集成测试；端到端 LLM 测试需配 API key |
 
@@ -473,7 +473,7 @@ Python >= 3.11
 | 2 | **~~提交 Phase 4 代码~~** | ✅ 完成 | e31c370: reranker + 去重 + rag_traces + session_close |
 | 3 | v3 Phase 2：Agent 架构重构（ingest 拆分 + Writing/Glossary 新建 + Celery）| 2 周 | |
 | 4 | v3 Phase 3：引用标记与验证（内外双通道 + 并行调度）| 2 周 | |
-| 5 | v3 Phase 4：评估体系与收尾（检索质量 + 反幻觉 + Zotero）| 2 周 | |
+| 5 | ~~v4：架构升级（clarify+Gate+清理+P1/P2 扩展）~~ | ✅ 完成 | 17 项全部落地，见 [gap-analysis.md](docs/development/gap-analysis.md) |
 | 6 | aioapns 真实集成 + iOS 端注册流程 | 3-5 天 | 后端保留 WebSocket 协议兼容 |
 | 7 | 可视化 (t-SNE/UMAP 研究方向图) | 3-5 天 | |
 | 8 | Docker 部署 | 2-3 天 | |

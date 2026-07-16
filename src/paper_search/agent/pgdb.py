@@ -1177,3 +1177,16 @@ class PostgresAgentDB:
             "SELECT * FROM subscription_results WHERE subscription_id = %s ORDER BY created_at DESC LIMIT %s",
             (subscription_id, limit),
         )
+
+    async def write_hallucination_event(self, event: dict):
+        """Write a hallucination audit event."""
+        try:
+            import json as _json
+            await self._execute("""
+                INSERT INTO hallucination_events (session_id, event_type, severity, details, created_at)
+                VALUES ($1, $2, $3, $4, NOW())
+            """, event.get("session_id"), event.get("event_type"),
+               event.get("severity", "info"),
+               event.get("details", "{}"))
+        except Exception:
+            pass  # Best-effort audit

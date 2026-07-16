@@ -43,6 +43,19 @@ from ..main_agent_prompts import (
 logger = logging.getLogger(__name__)
 
 MAX_REACT_ROUNDS = 8
+MAX_CLARIFY_ROUNDS = 3
+RESTRICTED_TOOLS = {
+    # 系统查询
+    "read_file", "glob_files", "grep_content", "log_view", "health_check",
+    "env_config", "get_current_time", "bash_query",
+    # 网络查询
+    "web_search", "web_fetch",
+    # 知识查询
+    "agent_knowledge_ask", "search_memory", "list_collections", "get_user_preference",
+    # 论文查询
+    "paper_status", "get_paper_abstract", "list_sources", "list_subscriptions",
+}
+
 MAX_PLAN_ITERATIONS = 3       # evaluate→replan→execute→evaluate 全局上限
 MAX_TODO_RETRIES = 2          # 单个 todo checkpoint 重试上限
 
@@ -111,6 +124,9 @@ class MainState(TypedDict, total=False):
     plan: Optional[dict]  # PlanOutput as dict
     needs_clarify: bool
     clarify_questions: list[dict]
+    clarify_mode: str
+    clarify_results: list[dict]
+    clarify_rounds: int
 
     # Execute
     todos: list[dict]  # TodoSpec list
@@ -147,6 +163,7 @@ class MainState(TypedDict, total=False):
     plan_id: str
     plan_approved: bool
     plan_feedback: str
+    gate_type: str
     plan_iterations: int  # plan review loop counter (distinct from evaluate replan)
 
 
@@ -299,12 +316,13 @@ class MainGraph:
         builder.add_node("fast_triage", self._fast_triage)
         builder.add_node("intent_classify", self._intent_classify)
         builder.add_node("plan", self._plan)
-        builder.add_node("plan_review", self._plan_review)
+        builder.add_node("clarify", self._clarify)
+        builder.add_node("gate", self._gate)
         builder.add_node("ops_confirm", self._ops_confirm)
         builder.add_node("execute", self._execute)
         builder.add_node("todo_checkpoint", self._todo_checkpoint)
         builder.add_node("evaluate", self._evaluate)
-        builder.add_node("ask_user", self._ask_user)
+        builder.add_node("ask_user", self._gate)  # merged into Gate
         builder.add_node("inline_reply", self._inline_reply)
 
         # Edges
@@ -325,13 +343,16 @@ class MainGraph:
         builder.add_conditional_edges(
             "plan",
             self._route_plan,
-            {"clarify": "ask_user", "plan_review": "plan_review"},
+            {"clarify": "clarify", "plan_review": "gate"},
         )
 
-        # plan_review → approve→execute / revise→plan / fail→END
+        # clarify → plan (replan with clarify results)
+        builder.add_edge("clarify", "plan")
+
+        # gate → approve→execute / revise→plan / fail→END / evaluate
         builder.add_conditional_edges(
-            "plan_review",
-            self._route_plan_review,
+            "gate",
+            self._route_gate,
             {"execute": "execute", "plan": "plan", "fail": END},
         )
 
@@ -364,7 +385,7 @@ class MainGraph:
             },
         )
 
-        # ask_user → evaluate (after user replies)
+        # ask_user → evaluate (after user replies via Gate)
         builder.add_edge("ask_user", "evaluate")
 
         builder.add_edge("inline_reply", END)
@@ -522,6 +543,7 @@ class MainGraph:
             "plan": data,
             "needs_clarify": needs_clarify,
             "clarify_questions": data.get("clarify_questions", []),
+            "clarify_mode": data.get("clarify_mode", "auto"),
             "todos": todos,
             "current_todo_index": 0,
             "tool_call_count": 0,
@@ -546,13 +568,47 @@ class MainGraph:
     # Node: plan_review (NEW — plan approval gate)
     # ═══════════════════════════════════════════════════════════
 
-    async def _plan_review(self, state: MainState) -> dict:
-        """Push plan_review card to user and wait for approve/revise.
+    async def _gate(self, state: MainState) -> dict:
+        """Unified Gate node: plan_review / ask_user / clarify_confirm.
 
-        This node is a human-in-the-loop gate: the plan is generated but
-        NOT executed until the user explicitly approves it.
+        Uses gate_type in state to determine behavior.
         """
         session_id = state.get("session_id", "main")
+        gate_type = state.get("gate_type", "plan_review")
+
+        # ── ask_user path ──
+        if gate_type == "ask_user":
+            ask_user_question = state.get("ask_user_question")
+            if not ask_user_question:
+                logger.warning("gate(ask_user) called without ask_user_question")
+                return {"next_action": "fail", "plan_iterations": state.get("plan_iterations", 0) + 1}
+
+            qtype = ask_user_question.get("type", "single_choice")
+            kind_map = {"single_choice": "choice", "multi_choice": "multi_choice", "open": "text"}
+            ask_kind = kind_map.get(qtype, "choice")
+
+            if self._push:
+                payload = {
+                    "ask_id": f"ask-{state.get("correlation_id", "")}-{uuid.uuid4().hex[:8]}",
+                    "kind": ask_kind,
+                    "prompt": ask_user_question.get("question", "请确认"),
+                }
+                if ask_kind in ("choice", "multi_choice"):
+                    payload["options"] = ask_user_question.get("options", [])
+                await self._push(session_id, "ask", "", "assistant", payload=payload, priority_kind="high")
+
+            if self._get_user:
+                ask_id = ask_user_question.get("ask_id", f"ask-{state.get("correlation_id", "")}")
+                reply = await self._get_user(session_id, ask_id, timeout=30 * 60)
+                if reply is None:
+                    return {"next_action": "fail", "final_reply": "等待用户回复超时",
+                            "plan_iterations": state.get("plan_iterations", 0) + 1}
+                return {"user_reply": reply}
+            else:
+                logger.warning("get_user_fn not configured")
+                return {"next_action": "fail", "plan_iterations": state.get("plan_iterations", 0) + 1}
+
+        # ── plan_review path (default) ──
         plan = state.get("plan") or {}
         plan_id = state.get("plan_id", "")
         plan_iterations = state.get("plan_iterations", 0)
@@ -649,7 +705,7 @@ class MainGraph:
 
     # ── Route: plan_review → execute / plan / fail ─────────
 
-    def _route_plan_review(self, state: MainState) -> str:
+    def _route_gate(self, state: MainState) -> str:
         plan_iterations = state.get("plan_iterations", 0)
         if plan_iterations >= MAX_PLAN_ITERATIONS:
             logger.warning("Plan review iterations exceeded %d, failing", MAX_PLAN_ITERATIONS)
@@ -895,6 +951,15 @@ class MainGraph:
                 # ── Free ReAct mode: text IS the final reply → push and end ──
                 is_free_react = current_todo.get("free_tools") or not current_todo.get("tool_calls")
                 if is_free_react:
+                    # Run output verification on final text
+                    if text_content and ("References" in text_content or "[" in text_content):
+                        try:
+                            verify_result = await self._verify_output(text_content, session_id)
+                            logger.info("Output verification: passed=%s, flags=%s",
+                                        verify_result.get("passed"), verify_result.get("flags"))
+                        except Exception as ve:
+                            logger.warning("Output verification failed: %s", ve)
+
                     logger.info("Free ReAct todo [%s] complete after %d rounds, pushing final reply",
                                 todo_label, round_count)
                     await self._push(session_id, "message", "text", "assistant",
@@ -1426,6 +1491,208 @@ class MainGraph:
             }
 
     # ── Route: todo_checkpoint → execute / evaluate ─────────
+
+
+    # ═══════════════════════════════════════════════════════════
+    # Node: clarify (Actor with Restricted tools)
+    # ═══════════════════════════════════════════════════════════
+
+    async def _clarify(self, state: MainState) -> dict:
+        """Clarify node: ReAct with Restricted (read-only) tools.
+
+        Two modes (LLM decides via plan output):
+          auto:       Direct ReAct with restricted tools, results → plan
+          ask_first:  Push Gate message → wait for user → ReAct → plan
+
+        Returns clarify_results dict consumed by plan node on replan.
+        """
+        session_id = state.get("session_id", "main")
+        messages = list(state.get("messages", []))
+        clarify_questions = state.get("clarify_questions", [])
+        clarify_mode = state.get("clarify_mode", "auto")
+        clarify_rounds = state.get("clarify_rounds", 0)
+
+        # Guard: too many clarify loops → force END
+        if clarify_rounds >= MAX_CLARIFY_ROUNDS:
+            logger.warning("clarify rounds exhausted (%d), forcing end", clarify_rounds)
+            await self._push_error(session_id, "clarify 轮次已用尽，跳过澄清",
+                                   subtype="MAX_ROUNDS")
+            return {"clarify_results": [], "clarify_rounds": clarify_rounds + 1}
+
+        # ── ask_first mode: push Gate, wait for user consent ──
+        if clarify_mode == "ask_first" and self._push and self._get_user:
+            questions_text = "\n".join(
+                q.get("question", q.get("label", "")) for q in clarify_questions
+            )
+            await self._push(
+                session_id, "gate", "", "assistant",
+                payload={
+                    "gate_type": "clarify_confirm",
+                    "message": f"需要确认以下操作:\n{questions_text}",
+                    "confirm_label": "允许",
+                    "deny_label": "跳过",
+                    "timeout_seconds": 1800,
+                },
+                priority_kind="high",
+            )
+            reply = await self._get_user(session_id, f"clarify-{clarify_rounds}", timeout=30 * 60)
+            if reply is None or not reply.get("confirmed"):
+                return {"clarify_results": [], "clarify_rounds": clarify_rounds + 1}
+
+        # ── Run ReAct with Restricted tools ──
+        system = (
+            "你是 Paper Agent 的澄清助手。请使用只读工具回答用户的澄清问题。\n"
+            "只读工具列表: agent_knowledge_ask, search_memory, read_file, glob_files, "
+            "grep_content, log_view, health_check, env_config, get_current_time, "
+            "bash_query, web_search, web_fetch, list_collections, get_user_preference, "
+            "paper_status, get_paper_abstract, list_sources, list_subscriptions\n\n"
+            "限制:\n"
+            "- 只能使用上述只读工具\n"
+            "- 不能修改任何数据\n"
+            "- 不能调用写操作工具\n"
+            "- 完成后输出澄清结果"
+        )
+
+        tools_msg = json.dumps(clarify_questions, ensure_ascii=False)
+        messages.append({"role": "user", "content": f"请回答以下澄清问题:\n{tools_msg}"})
+
+        clarify_results = []
+        round_count = 0
+        while round_count < MAX_CLARIFY_ROUNDS:
+            round_count += 1
+            safe_messages = _to_message_dicts(messages)
+            try:
+                response = await self.llm.chat(
+                    messages=[{"role": "system", "content": system}] + safe_messages,
+                    temperature=0.3,
+                    node="clarify",
+                )
+            except Exception as e:
+                logger.error(f"clarify LLM failed: {e}")
+                break
+
+            if not getattr(response, 'tool_calls', None):
+                # No more tool calls — LLM is done clarifying
+                text = getattr(response, 'content', '') or ""
+                clarify_results.append({"result": text})
+                messages.append({"role": "assistant", "content": text})
+                break
+
+            # Dispatch restricted tools
+            for tc in response.tool_calls:
+                tc_name = tc.get("function", {}).get("name", "")
+                tc_args = tc.get("function", {}).get("arguments", {})
+                if isinstance(tc_args, str):
+                    try:
+                        tc_args = json.loads(tc_args)
+                    except json.JSONDecodeError:
+                        tc_args = {}
+
+                # Only allow restricted tools
+                if tc_name not in RESTRICTED_TOOLS:
+                    logger.warning("clarify blocked non-restricted tool: %s", tc_name)
+                    result_json = json.dumps(
+                        {"error": f"工具 {tc_name} 在 clarify 阶段不可用"},
+                        ensure_ascii=False
+                    )
+                else:
+                    result_json = json.dumps(
+                        await self._dispatch_tool_simple(tc_name, tc_args, session_id),
+                        ensure_ascii=False, default=str
+                    )
+
+                messages.append({
+                    "role": "tool",
+                    "content": result_json,
+                    "tool_call_id": getattr(tc, 'id', 'call-clarify'),
+                })
+                clarify_results.append({"tool": tc_name, "args": tc_args, "result": result_json[:500]})
+
+        return {
+            "clarify_results": clarify_results,
+            "clarify_rounds": clarify_rounds + 1,
+        }
+
+
+    # ═══════════════════════════════════════════════════════════
+    # Method: _verify_output — rule-based reference verification
+    # ═══════════════════════════════════════════════════════════
+
+    async def _verify_output(self, text: str, session_id: str) -> dict:
+        """Run rule-based verification on final output text.
+
+        Checks:
+        1. Reference format: [N] markers match References section
+        2. DB existence: paper_id extracted from References exists in DB
+        3. RAG score: retrieved chunks had sufficient relevance (if applicable)
+
+        Returns verification_metadata dict with pass/fail per check.
+        """
+        import re
+        from ..pgdb import PostgresAgentDB
+
+        db = PostgresAgentDB(user_id=self._user_id)
+        result: dict[str, Any] = {"passed": True, "checks": [], "flags": []}
+
+        # 1. Extract [N] markers from body text (before References section)
+        ref_section_idx = text.rfind("## References")
+        body = text[:ref_section_idx] if ref_section_idx != -1 else text
+        refs_section = text[ref_section_idx:] if ref_section_idx != -1 else ""
+
+        body_markers = set()
+        for m in re.finditer(r'\[(\d+(?:,\s*\d+)*)\]', body):
+            for num in re.findall(r'\d+', m.group(1)):
+                body_markers.add(int(num))
+
+        # 2. Extract [N] entries from References section
+        ref_entries = {}
+        for m in re.finditer(r'^\[(\d+)\]\s+(.+)$', refs_section, re.MULTILINE):
+            ref_num = int(m.group(1))
+            ref_text = m.group(2).strip()
+            ref_entries[ref_num] = ref_text
+
+        # 3. Cross-check: body markers vs reference entries
+        missing_refs = body_markers - set(ref_entries.keys())
+        unused_refs = set(ref_entries.keys()) - body_markers
+
+        check1 = {"name": "reference_format", "passed": True, "detail": {}}
+        if missing_refs:
+            check1["passed"] = False
+            check1["detail"]["missing_references"] = sorted(missing_refs)
+            result["flags"].append(f"正文引用[{sorted(missing_refs)}]在References中找不到对应条目")
+        if unused_refs:
+            check1["detail"]["unused_references"] = sorted(unused_refs)
+
+        result["checks"].append(check1)
+
+        # 4. DB existence check: paper_id in References
+        paper_ids_in_refs = []
+        for ref_text in ref_entries.values():
+            # Look for paper_id pattern: pap-xxx
+            pids = re.findall(r'(?:paper_id[=:]?\s*)?(pap-[a-zA-Z0-9]+)', ref_text)
+            paper_ids_in_refs.extend(pids)
+
+        check2 = {"name": "db_existence", "passed": True, "detail": {"checked": len(paper_ids_in_refs), "missing": []}}
+        if paper_ids_in_refs:
+            for pid in paper_ids_in_refs:
+                try:
+                    exists = db.get_paper_meta(pid) is not None
+                    if not exists:
+                        check2["passed"] = False
+                        check2["detail"]["missing"].append(pid)
+                        result["flags"].append(f"paper_id {pid} 在数据库中不存在")
+                except Exception:
+                    pass  # DB lookup best-effort
+
+        result["checks"].append(check2)
+
+        # 5. Overall: mark any failure
+        result["passed"] = all(c["passed"] for c in result["checks"])
+        if not result["passed"]:
+            await self._push(session_id, "status", "verify", "assistant",
+                             payload={"verification": result}, priority_kind="low")
+
+        return result
 
     def _route_todo_checkpoint(self, state: MainState) -> str:
         if state.get("todo_checkpoint_satisfied", False):

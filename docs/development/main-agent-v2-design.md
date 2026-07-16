@@ -1,4 +1,4 @@
-# MainAgent v2 目标架构设计
+# [DEPRECATED] MainAgent v2 目标架构设计
 
 > 2026-06-23 | 主 Agent 重构设计 | 配套:[websocket-protocol.md](websocket-protocol.md) v10 / [plangraph-routing.md](plangraph-routing.md)(待建,另有 agent 撰写)
 

@@ -1,4 +1,4 @@
-# MainAgent — v3.1 架构
+# [DEPRECATED] MainAgent — v3.1 架构
 
 > v3.1 | 2026-07-12 | Fast Triage + ReAct Execute + thinking 策略
 >

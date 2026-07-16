@@ -220,7 +220,9 @@ class TodoSpec(BaseModel):
     label: str = Field(..., max_length=120, description="用户可见的简短描述")
     tool_calls: list[ToolCallSpec] = Field(default_factory=list, description="可并行执行的 tool 调用")
     parallel: bool = Field(False, description="tool_calls 是否可并行执行")
-    success_criterion: str = Field(..., max_length=200, description="LLM 判断此 todo 是否完成的依据")
+    success_criterion: str = Field(..., max_length=500, description="LLM 判断此 todo 是否完成的依据，支持量化指标")
+    expected_output_keys: list[str] = Field(default_factory=list, description="下游 todo 消费的字段名列表")
+    verify_method: str = Field(default="tool_output", description="验证方式: tool_output|llm_check|user_confirm")
 
 
 class PlanOutput(BaseModel):
@@ -234,8 +236,9 @@ class PlanOutput(BaseModel):
     estimated_seconds: int = Field(0, description="预估总耗时（秒）")
     needs_clarify: bool = Field(False, description="信息不足需要用户补充")
     clarify_questions: list[ClarificationQuestion] = Field(default_factory=list, description="澄清问题")
+    clarify_mode: str = Field(default="auto", description="澄清模式: auto=直接执行, ask_first=先问用户")
     todos: list[TodoSpec] = Field(default_factory=list, description="执行计划，按顺序执行")
-    reasoning: str = Field("", max_length=200)
+    reasoning: str = Field("", max_length=500)  # v4: 200→500, 审计需要更完整推理链
 
 
 class EvaluateV31Result(BaseModel):

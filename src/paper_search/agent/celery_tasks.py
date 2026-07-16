@@ -749,7 +749,7 @@ async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
     if agent_type == "rad_query":
         from .pgvector_store import PgVectorStore
         from .knowledge import KnowledgeBase
-        from .graphs.rad_query_graph import RADQueryAgent
+        from .graphs.knowledge_graph import KnowledgeAgent
         chroma = PgVectorStore()
         kb = KnowledgeBase(db, chroma, llm)
         agent = RADQueryAgent(kb, on_progress=on_progress)
@@ -1108,6 +1108,100 @@ def subscription_check_task(self) -> dict:
             raise self.retry(exc=e)
         reporter.report_error(task_id, error_str)
         return {"checked": 0, "new_papers": 0, "error": error_str}
+@app.task(bind=True, max_retries=1, default_retry_delay=120)
+def literature_push_task(self) -> dict:
+    """Celery Beat 每日任务: 基于用户订阅 + 论文库推断话题，推送最新论文。
+
+    由 Celery Beat 每天触发一次。
+    流程: 读取所有用户订阅 → 对每个订阅做语义搜索 → 过滤已入库 → 推送通知。
+    """
+    import asyncio
+
+    task_id = self.request.id
+    reporter = _get_reporter()
+    db = _get_db()
+
+    try:
+        subscriptions = db.list_subscriptions(enabled_only=True)
+        if not subscriptions:
+            return {"checked": 0, "pushed": 0}
+
+        total_pushed = 0
+        engine = PaperSearchEngine(Config())
+        loop = asyncio.new_event_loop()
+
+        try:
+            for sub in subscriptions:
+                sub_id = sub["id"]
+                sub_name = sub.get("name", sub_id)
+                keywords = sub.get("keywords", "")
+                if not keywords:
+                    continue
+
+                try:
+                    import json as _json
+                    sources = sub.get("sources", ["arxiv", "semantic_scholar"])
+                    if isinstance(sources, str):
+                        sources = _json.loads(sources)
+
+                    stypes = [
+                        SourceType(s) for s in sources
+                        if s in [x.value for x in SourceType]
+                    ] or [SourceType.ARXIV, SourceType.SEMANTIC_SCHOLAR]
+
+                    query = SearchQuery(
+                        keywords=keywords,
+                        sources=stypes,
+                        max_results=10,
+                        year_from=datetime.now().year,
+                    )
+                    result = loop.run_until_complete(engine.search(query))
+
+                    pushed = 0
+                    for paper in result.papers:
+                        pid = db.upsert_paper(paper)
+                        paper_dict = {
+                            "paper_id": pid,
+                            "title": paper.title,
+                            "authors": paper.authors[:5] if paper.authors else [],
+                            "year": paper.year,
+                            "abstract": (paper.abstract or "")[:200],
+                            "source": str(paper.source) if hasattr(paper, "source") else "",
+                        }
+                        db.save_subscription_result(sub_id, paper_dict)
+                        pushed += 1
+
+                    if pushed:
+                        reporter.publish_notification({
+                            "type": "literature_push",
+                            "subscription_id": sub_id,
+                            "subscription_name": sub_name,
+                            "new_papers_count": pushed,
+                            "message": f"「{sub_name}」发现 {pushed} 篇新论文",
+                        })
+                        total_pushed += pushed
+
+                except Exception as sub_err:
+                    logger.error(f"literature_push '{sub_name}' failed: {sub_err}")
+                    continue
+
+        finally:
+            loop.close()
+
+        reporter.report_done(task_id, {
+            "subscriptions_checked": len(subscriptions),
+            "papers_pushed": total_pushed,
+        })
+        return {"checked": len(subscriptions), "pushed": total_pushed}
+
+    except Exception as e:
+        error_str = str(e)
+        logger.error(f"literature_push_task failed: {error_str}")
+        if self.request.retries < self.max_retries:
+            raise self.retry(exc=e)
+        reporter.report_error(task_id, error_str)
+        return {"checked": 0, "pushed": 0, "error": error_str}
+
 
 
 # ═══════════════════════════════════════════════════════════════

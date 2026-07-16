@@ -1,4 +1,4 @@
-# 智驭·研 v3 数据迁移方案
+# [DEPRECATED] 智驭·研 v3 数据迁移方案
 
 > 从 SQLite + ChromaDB（单用户）迁移到 PostgreSQL + pgvector（多用户）
 >

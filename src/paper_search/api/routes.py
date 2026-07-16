@@ -745,7 +745,7 @@ async def _run_ingest(task_id: str, project_id: str, user_query: str,
     """后台执行 IngestAgent。"""
     try:
         from ..agent.sub_agent import PipelineRunner
-        from ..agent.graphs.ingest_graph import IngestAgent
+        from ..agent.graphs.knowledge_graph import KnowledgeAgent
         from ..agent.pdf_converter import PDFConverter
         from ..agent.journal_ranker import JournalRanker
         from ..agent.pgvector_store import PgVectorStore

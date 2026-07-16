@@ -188,13 +188,15 @@ class WritingState(TypedDict, total=False):
 
 
 class WritingAgent:
-    """学术写作辅助 Agent — 4 节点 StateGraph。
+    """学术写作辅助 Agent — 6 节点 StateGraph。
 
     节点:
       survey            → 生成文献综述
       template_recommend → 推荐写作模板
       citation_format   → 统一引用格式并标记
       ai_flavor_check   → AI 味检测与替换
+      landscape         → 生成研究全景图（分支地图+代表工作+时间线）
+      gap_analysis      → 生成缺口分析文档（独立 MD，标注 AI 辅助）
     """
 
     def __init__(self, db=None, vector_store=None, llm_client=None, on_progress=None):
@@ -211,12 +213,16 @@ class WritingAgent:
         builder.add_node("template_recommend", self._template_node)
         builder.add_node("citation_format", self._citation_node)
         builder.add_node("ai_flavor_check", self._ai_flavor_node)
+        builder.add_node("landscape", self._landscape_node)
+        builder.add_node("gap_analysis", self._gap_analysis_node)
 
         builder.add_edge(START, "survey")
         builder.add_edge("survey", "template_recommend")
         builder.add_edge("template_recommend", "citation_format")
         builder.add_edge("citation_format", "ai_flavor_check")
-        builder.add_edge("ai_flavor_check", END)
+        builder.add_edge("ai_flavor_check", "landscape")
+        builder.add_edge("landscape", "gap_analysis")
+        builder.add_edge("gap_analysis", END)
 
         self._graph = builder.compile(checkpointer=checkpointer)
         return self._graph
@@ -246,6 +252,15 @@ class WritingAgent:
     async def check_citations(self, text: str) -> dict:
         """独立引用格式检查（可单独调用）。"""
         return await self._citation_check(text)
+
+    async def generate_gap_analysis(self, project_id: str) -> dict:
+        """生成缺口分析的便捷入口。返回独立 MD 文档路径。"""
+        if self._graph is None:
+            self.compile()
+
+        state = {"project_id": project_id, "user_query": "", "template": "arxiv", "papers": []}
+        result = await self._graph.ainvoke(state)
+        return result.get("result", {}).get("gap_analysis", {})
 
     async def remove_ai_flavor(self, text: str) -> dict:
         """独立 AI 味检查与清理（可单独调用）。"""

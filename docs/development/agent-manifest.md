@@ -52,13 +52,13 @@
         "safety_regex_guard",
         "intent_classify",
         "inline_reply",
-        "maybe_clarify",
+        "clarify",
         "scenario_plan",
         "execute_plan",
         "evaluate_completion"
       ],
       "iteration_limit": 8,
-      "ask_user_limit": 2
+      "user_timeout_seconds": 1800
     },
     "checkpointer": {
       "backend": "async_sqlite",
@@ -217,7 +217,7 @@
   │        └── Celery (复用 Redis broker)
   │     ③ build_main_graph().compile(checkpointer=, store=)
   │        ├── 注入 force_tool_choice / enable_prompt_caching
-  │        ├── iteration_limit / ask_user_limit 校验
+  │        ├── iteration_limit / user_timeout 校验
   │        └── interrupt_before 配置（如启用审批断点）
   │     ④ 启动 outbox_poller (每个 agent_id 一个协程)
   │     ⑤ 启动 FastAPI + WebSocket

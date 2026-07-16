@@ -72,7 +72,7 @@ GET /api/sessions/{session_id}/messages?since=<ISO_8601_timestamp>
 
 ```json
 {
-  "type": "status | message | tool | tool_execution | plan_review | plan_todo_update | ask | error | pong",
+  "type": "status | message | tool | tool_execution | gate | plan_todo_update | error | pong",
   "subType": "<子类,仅 tool/error 用>",
   "msg_id": "<uuid,server 出站必填>",
   "agentId": "agent-001",
@@ -95,7 +95,7 @@ GET /api/sessions/{session_id}/messages?since=<ISO_8601_timestamp>
 | `capabilities` | **入站** | 客户端可用能力列表,**每条 inbound 消息都带**;服务端缓存最新值 |
 | `payload` | 双向 | 消息体 |
 
-> **v10→v10.1 变更**: `priorityKind` → `priority`; `role` 删除; 新增 `plan_review`/`plan_todo_update`/`tool_execution` 消息类型; WebSocket 连接新增 JWT 认证。
+> **v10→v10.1 变更**: `priorityKind` → `priority`; `role` 删除; 新增 `gate`（合并 plan_review+ask_user）/`plan_todo_update`/`tool_execution` 消息类型; WebSocket 连接新增 JWT 认证。
 
 ### 1.6 消息速查全表
 
@@ -110,7 +110,7 @@ GET /api/sessions/{session_id}/messages?since=<ISO_8601_timestamp>
 | `tool` | `result` | high | 任务终态(done/failed) |
 | `tool` | `call` | high | 请求客户端执行本地 tool |
 | `tool_execution` | — | normal | 每次 tool 调用的独立追踪消息 (v10.1) |
-| `plan_review` | — | high | 计划审批卡片 (v10.1) |
+| `gate` | plan_review / ask_user / clarify_confirm | high | 统一人机交互 (v11) |
 | `plan_todo_update` | — | normal | Todo 进度全量快照 (v10.1) |
 | `ask` | — | high | **唯一**用户操作入口(5 种 kind) |
 | `error` | `TASK_FAILED` / `INTERNAL_ERROR` / `ASK_TIMEOUT` | urgent | 错误 |

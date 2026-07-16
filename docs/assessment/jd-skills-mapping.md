@@ -51,7 +51,7 @@
 | **Reranker** | Cross-Encoder (sentence-transformers / BGE-Reranker) | 📋 规划中 |
 | **文档分块** | SectionChunker (section-aware 论文分块) | ✅ 已完成 |
 | **多跳检索** | Query Decomposition (复杂问题拆解) | 📋 规划中 |
-| **引用校验** | CitationVerifier (DB 匹配 + 原文对照) | 🔧 重构中 |
+| **引用校验** | 三层反幻觉体系 (人格 + 上下文质量 + 规则验证) | ✅ v2.0 设计完成 |
 | **知识提取** | LLM 结构化提取 (contribution/method/dataset/limitation) | ✅ 已完成 |
 
 ---
