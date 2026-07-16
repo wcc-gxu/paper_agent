@@ -7,55 +7,34 @@ on:
     branches: [master, main, dev]
 
 jobs:
-  test-1:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev
-      - run: python -m pip install -e ".[all]" pytest pytest-asyncio
-      - run: PYTHONPATH=src python -m pytest tests/test_main_agent_safety_intent.py -v --tb=short
 
-  test-2:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev
-      - run: python -m pip install -e ".[all]" pytest pytest-asyncio
-      - run: PYTHONPATH=src python -m pytest tests/test_celery_tasks.py -v --tb=short
 
-  test-3:
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev
-      - run: python -m pip install -e ".[all]" pytest pytest-asyncio
-      - run: PYTHONPATH=src python -m pytest tests/test_sub_agent_dispatch.py -v --tb=short
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev
 
-  test-4:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev
-      - run: python -m pip install -e ".[all]" pytest pytest-asyncio
-      - run: PYTHONPATH=src python -m pytest tests/test_anti_hallucination.py -v --tb=short
+      - name: Install Python deps
+        run: python -m pip install -e ".[all]" pytest pytest-asyncio
+
+      - name: Run tests
+        run: |
+          PYTHONPATH=src python -m pytest \
+            tests/test_main_agent_safety_intent.py \
+            tests/test_celery_tasks.py \
+            tests/test_anti_hallucination.py \
+            tests/test_subscription.py \
+            -v --tb=short
 
   build-dev:
-    needs: [test-1, test-2, test-4]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: test
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -73,9 +52,9 @@ jobs:
           cache-to: type=gha,mode=max
 
   build-prod:
-    needs: [test-1, test-2, test-4]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    needs: test
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

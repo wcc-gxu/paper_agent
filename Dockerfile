@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -9,7 +10,10 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY src/ src/
 
-RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary
+RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary && \
+    apt-get remove -y build-essential && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONPATH=/app/src
 
