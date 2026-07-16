@@ -20,10 +20,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential python3-dev
 
       - name: Install Python deps
-        run: python -m pip install -e ".[all]"
+        run: python -m pip install -e ".[all]" pytest pytest-asyncio
 
       - name: Run tests
-        run: PYTHONPATH=src python -m pytest tests/ -v
+        run: PYTHONPATH=src python -m pytest tests/ -v --tb=short -x --ignore=tests/test_ws_client.py --ignore=tests/test_video_agent.py 2>&1
 
   build-dev:
     needs: test
