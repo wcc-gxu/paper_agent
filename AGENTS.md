@@ -66,6 +66,12 @@ feature/* ──→ PR ──→ dev ──→ PR ──→ master
 
 **No lint, format, or typecheck config exists.**
 
+## Security
+
+- **`.env` is gitignored** — never commit API keys or secrets
+- **Config defaults must use placeholders** — no real keys in `config.py` fallback values
+- GitHub Push Protection enabled — commits with secrets will be rejected
+
 ## Environment gotchas
 
 - `.env` is **auto-loaded** by `config.py` at import — no manual sourcing needed
