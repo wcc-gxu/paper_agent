@@ -12,7 +12,7 @@ COPY pyproject.toml .
 COPY src/ src/
 COPY docs/ docs/
 
-RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary && \
+RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary python-multipart && \
     apt-get remove -y build-essential && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
@@ -20,6 +20,6 @@ RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary 
 ENV PYTHONPATH=/app/src
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/api/health || exit 1
 
 CMD ["uvicorn", "paper_search.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

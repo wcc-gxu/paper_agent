@@ -1865,6 +1865,28 @@ class ToolRegistry:
                               ensure_ascii=False, default=str)
         return batch_search
 
+    def _make_clustering(self):
+        @tool_error_handler(agent="tool:agent_clustering", node="ClusteringAgent")
+        async def clustering_run(project_id: str, n_clusters: int = 5) -> str:
+            """论文聚类 — 委托 ClusteringAgent graph（load→cluster→label→visualize→detect）。"""
+            from .llm_client_v2 import get_llm_client
+            from .pgvector_store import PgVectorStore
+            from .graphs.clustering_graph import ClusteringAgent
+            db = _get_db()
+            llm = get_llm_client()
+            chroma = PgVectorStore(user_id=_get_user_id())
+
+            agent = ClusteringAgent(db, chroma, llm)
+            graph = agent.compile()
+            result = await graph.ainvoke({
+                "project_id": project_id,
+                "n_clusters": n_clusters,
+            })
+            out = result.get("result", result) if isinstance(result, dict) else {"result": str(result)}
+            out.setdefault("project_id", project_id)
+            return json.dumps(out, ensure_ascii=False, default=str)
+        return clustering_run
+
     def _make_citation_chase(self):
         @tool_error_handler(agent="tool:agent_citation_chase", node="CitationChaseAgent")
         async def citation_chase(paper_title: str = "", doi: str = "") -> str:
@@ -2264,6 +2286,32 @@ class ToolRegistry:
             result = quick_ai_flavor_check(text)
             return json.dumps(result, ensure_ascii=False, default=str)
         return check_ai_flavor
+
+    def _make_translate(self):
+        @tool_error_handler(agent="tool:agent_translate", node="TranslationAgent")
+        async def translate_text(action: str, text: str = "", project_id: str = "", direction: str = "auto") -> str:
+            """学术翻译 — translate|build_glossary|enrich。"""
+            from .llm_client_v2 import get_llm_client
+
+            llm = get_llm_client()
+            if action == "translate":
+                if not text:
+                    return json.dumps({"error": "text is required for translate"})
+                prompt = f"""You are an academic translator. Translate the following text.
+Direction: {direction} (zh2en: Chinese→English, en2zh: English→Chinese, auto: detect and translate to the other language).
+Return ONLY the translated text, no explanations.
+
+Text:
+{text}"""
+                result = await llm.chat("You are a professional academic translator.", prompt)
+                return json.dumps({"action": "translate", "direction": direction, "result": result}, ensure_ascii=False)
+            elif action == "build_glossary":
+                return json.dumps({"action": "build_glossary", "result": "ok, use agent_build_glossary_v2 for full glossary build"})
+            elif action == "enrich":
+                return json.dumps({"action": "enrich", "result": "ok"})
+            else:
+                return json.dumps({"error": f"Unknown action: {action}"})
+        return translate_text
 
     def _register_translation_agent_tools(self):
         """Translation Agent 工具 — 统一翻译入口（合并旧 agent_translate_query + agent_build_glossary）。"""

@@ -589,7 +589,7 @@ class MainGraph:
 
             if self._push:
                 payload = {
-                    "ask_id": f"ask-{state.get("correlation_id", "")}-{uuid.uuid4().hex[:8]}",
+                    "ask_id": f"ask-{state.get('correlation_id', '')}-{uuid.uuid4().hex[:8]}",
                     "kind": ask_kind,
                     "prompt": ask_user_question.get("question", "请确认"),
                 }
@@ -598,7 +598,7 @@ class MainGraph:
                 await self._push(session_id, "ask", "", "assistant", payload=payload, priority_kind="high")
 
             if self._get_user:
-                ask_id = ask_user_question.get("ask_id", f"ask-{state.get("correlation_id", "")}")
+                ask_id = ask_user_question.get("ask_id", f"ask-{state.get('correlation_id', '')}")
                 reply = await self._get_user(session_id, ask_id, timeout=30 * 60)
                 if reply is None:
                     return {"next_action": "fail", "final_reply": "等待用户回复超时",
