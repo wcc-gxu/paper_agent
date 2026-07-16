@@ -10,6 +10,7 @@ WORKDIR /app
 
 COPY pyproject.toml .
 COPY src/ src/
+COPY docs/ docs/
 
 RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary && \
     apt-get remove -y build-essential && \
