@@ -1,0 +1,49 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 部署目标
+        type: choice
+        options: [test, production]
+        default: test
+
+jobs:
+  deploy-test:
+    if: github.event.inputs.environment == 'test'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to test
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.TEST_SSH_HOST }}
+          username: ${{ secrets.TEST_SSH_USER }}
+          key: ${{ secrets.TEST_SSH_KEY }}
+          port: ${{ secrets.TEST_SSH_PORT || 22 }}
+          script: |
+            cd /opt/paper_agant
+            export IMAGE_TAG=dev
+            docker compose pull api worker beat daemon
+            docker compose up -d --remove-orphans
+            docker compose ps
+
+  deploy-prod:
+    if: github.event.inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_SSH_PORT || 22 }}
+          script: |
+            cd /opt/paper_agant
+            export IMAGE_TAG=latest
+            docker compose pull api worker beat daemon
+            docker compose up -d --remove-orphans
+            docker compose ps

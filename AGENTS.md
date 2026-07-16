@@ -33,12 +33,36 @@ docker compose ps
 docker compose logs -f api
 
 # 部署到远端服务器
-DEPLOY_HOST=<server_ip> bash scripts/deploy.sh
+DEPLOY_HOST=<server_ip> bash scripts/deploy.sh                 # 生产 (master)
+DEPLOY_HOST=<server_ip> DEPLOY_ENV=test bash scripts/deploy.sh  # 测试 (dev)
 ```
 
-## CI (GitHub Actions)
+## Git Flow + CI/CD
 
-Push/PR 到 `master`/`main` 自动触发：测试 → 构建镜像 → 推送 `ghcr.io`。无需人工干预。
+```
+feature/* ──→ PR ──→ dev ──→ PR ──→ master
+   │                │                │
+   ▼                ▼                ▼
+ CI: 跑测试      CI: 测试→构建    CI: 测试→构建
+                 →推 :dev 镜像    →推 :latest 镜像
+                 →测试机自动部署    →生产机手动部署
+```
+
+| 分支 | CI 行为 | 部署 |
+|------|---------|------|
+| `feature/*` | 跑测试 | — |
+| `dev` | 测试 → 构建 → 推 `:dev` | 自动部署到测试机 |
+| `master` | 测试 → 构建 → 推 `:latest` | 手动触发 (`workflow_dispatch`) |
+
+**测试环境自动更新**：push 到 `dev` → CI 自动测试+构建+部署。**生产环境**：push 到 `master` 仅构建镜像，需在 Actions 页面手动触发 Deploy。
+
+**GitHub Secrets**（Settings → Secrets → Actions）:
+
+| Secret | 环境 | 说明 |
+|--------|------|------|
+| `TEST_SSH_HOST` / `PROD_SSH_HOST` | 服务器 IP |
+| `TEST_SSH_USER` / `PROD_SSH_USER` | SSH 用户名 |
+| `TEST_SSH_KEY` / `PROD_SSH_KEY` | SSH 私钥 |
 
 **No lint, format, or typecheck config exists.**
 
