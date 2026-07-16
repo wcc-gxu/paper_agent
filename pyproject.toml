@@ -67,6 +67,9 @@ all = [
     "yt-dlp>=2024.12",
     "faster-whisper>=1.1.0",
     "cloakbrowser>=0.3",
+    "pymupdf4llm",
+    "pgvector>=0.3",
+    "psycopg2-binary>=2.9",
 ]
 
 [build-system]

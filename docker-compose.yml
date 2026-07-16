@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: paper_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-paper_secret}
+      POSTGRES_DB: paper_search
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "paper_admin", "-d", "paper_search"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: ghcr.io/chaocaiwei/paper_agant:latest
+    command: uvicorn paper_search.api.app:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://paper_admin:${POSTGRES_PASSWORD:-paper_secret}@postgres:5432/paper_search
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - papers:/root/papers
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: ghcr.io/chaocaiwei/paper_agant:latest
+    command: celery -A paper_search.agent.celery_app worker --loglevel=info --concurrency=4
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://paper_admin:${POSTGRES_PASSWORD:-paper_secret}@postgres:5432/paper_search
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - papers:/root/papers
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: .
+    image: ghcr.io/chaocaiwei/paper_agant:latest
+    command: celery -A paper_search.agent.celery_app beat --loglevel=info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://paper_admin:${POSTGRES_PASSWORD:-paper_secret}@postgres:5432/paper_search
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - papers:/root/papers
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  daemon:
+    build: .
+    image: ghcr.io/chaocaiwei/paper_agant:latest
+    command: python -m paper_search.agent.daemon
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://paper_admin:${POSTGRES_PASSWORD:-paper_secret}@postgres:5432/paper_search
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - papers:/root/papers
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  papers:
