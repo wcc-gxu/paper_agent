@@ -591,51 +591,58 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
     # 推入 MainAgent._error_queue 供当前 turn 检查
 
     async def _consume_agent_reports():
-        """Background task: subscribe to agent error reports from Redis Pub/Sub."""
+        """Background task: subscribe to agent error reports from Redis Pub/Sub.
+
+        Redis 闪断（如容器重建）时自动重连，而不是永久退出。
+        """
         import redis.asyncio as aioredis
 
-        sub_redis = aioredis.from_url(redis, decode_responses=True)
         channel_name = f"agent:reports:{agent_id}"
 
-        try:
-            pubsub = sub_redis.pubsub()
-            await pubsub.subscribe(channel_name)
-            logger.info("Agent error report consumer started on channel: %s", channel_name)
+        while True:
+            sub_redis = aioredis.from_url(redis, decode_responses=True)
+            pubsub = None
+            try:
+                pubsub = sub_redis.pubsub()
+                await pubsub.subscribe(channel_name)
+                logger.info("Agent error report consumer started on channel: %s", channel_name)
 
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
+                async for message in pubsub.listen():
+                    if message.get("type") != "message":
+                        continue
+                    try:
+                        data = json.loads(message.get("data", "{}"))
+                    except json.JSONDecodeError:
+                        continue
+
+                    msg_type = data.get("type", "")
+                    if msg_type == "agent_error":
+                        # 推入 MainAgent 的错误队列
+                        main_agent.push_agent_error(data)
+                    elif msg_type == "agent_retry":
+                        logger.info(
+                            "[RETRY] agent=%s node=%s retry=%s/%s reason=%s",
+                            data.get("agent", "?"),
+                            data.get("node", "?"),
+                            data.get("retry_count", "?"),
+                            data.get("max_retries", "?"),
+                            data.get("reason", "")[:100],
+                        )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"Agent report consumer crashed: {e}, reconnecting in 5s", exc_info=True)
+            finally:
+                if pubsub is not None:
+                    try:
+                        await pubsub.unsubscribe(channel_name)
+                    except Exception:
+                        pass
                 try:
-                    data = json.loads(message.get("data", "{}"))
-                except json.JSONDecodeError:
-                    continue
-
-                msg_type = data.get("type", "")
-                if msg_type == "agent_error":
-                    # 推入 MainAgent 的错误队列
-                    main_agent.push_agent_error(data)
-                elif msg_type == "agent_retry":
-                    logger.info(
-                        "[RETRY] agent=%s node=%s retry=%s/%s reason=%s",
-                        data.get("agent", "?"),
-                        data.get("node", "?"),
-                        data.get("retry_count", "?"),
-                        data.get("max_retries", "?"),
-                        data.get("reason", "")[:100],
-                    )
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"Agent report consumer crashed: {e}", exc_info=True)
-        finally:
-            try:
-                await pubsub.unsubscribe(channel_name)
-            except Exception:
-                pass
-            try:
-                await sub_redis.close()
-            except Exception:
-                pass
+                    await sub_redis.aclose()
+                except Exception:
+                    pass
+            await asyncio.sleep(5)
 
     report_consumer_task = asyncio.create_task(
         _consume_agent_reports(), name="agent-report-consumer",
