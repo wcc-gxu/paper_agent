@@ -315,6 +315,142 @@ class AgentManager:
                 logger.error("Agent %s turn error: %s", agent._agent_id, e, exc_info=True)
 
 
+async def _run_agent_manager(data_dir: Optional[str] = None, user_id: str = "default"):
+    """AgentManager 入口 — user-scoped 队列，支持多智能体路由。"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    os.environ.setdefault("DEBUG_PROTOCOL", "1")
+    logger.info("DEBUG_PROTOCOL enabled")
+
+    path = Path(data_dir) if data_dir else None
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    user_id = os.getenv("PAPER_USER_ID", user_id)
+
+    bs = AgentBootstrap(data_dir=path, user_id=user_id)
+    result = await bs.bootstrap()
+
+    manifest = result["manifest"]
+    agent_id = manifest["agent"]["agent_id"]
+    logger.info("Bootstrap complete: agent_id=%s user_id=%s", agent_id, user_id)
+
+    from .graphs.main_graph import build_main_graph
+
+    manager = AgentManager(
+        user_id=user_id,
+        redis_url=redis_url,
+        db=result["db"],
+        llm=result["llm"],
+        registry=result["tools"],
+        memory=result["memory"],
+        vector_store=None,
+    )
+
+    await manager.load_agents(build_main_graph)
+
+    report_task = asyncio.create_task(
+        _consume_agent_reports(manager, redis_url),
+        name="agent-report-consumer",
+    )
+
+    stop_event = asyncio.Event()
+
+    def _sig_handler():
+        logger.info("Received shutdown signal")
+        stop_event.set()
+
+    try:
+        loop_evt = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop_evt.add_signal_handler(sig, _sig_handler)
+            except (NotImplementedError, RuntimeError):
+                pass
+    except RuntimeError:
+        pass
+
+    run_task = asyncio.create_task(manager.run(), name="agent-manager-run")
+    stop_task = asyncio.create_task(stop_event.wait(), name="stop-waiter")
+
+    try:
+        done, pending = await asyncio.wait(
+            {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
+        )
+    except asyncio.CancelledError:
+        pass
+    finally:
+        run_task.cancel()
+        report_task.cancel()
+        try:
+            await run_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        try:
+            await report_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    logger.info("AgentManager stopped, exiting daemon.")
+
+
+async def _consume_agent_reports(manager: "AgentManager", redis_url: str):
+    """订阅 agent:reports channels 并推入对应 MainAgent 的错误队列。"""
+    import redis.asyncio as aioredis
+
+    base_channel = f"agent:reports:{manager.user_id}"
+
+    while True:
+        sub_redis = aioredis.from_url(redis_url, decode_responses=True)
+        pubsub = None
+        try:
+            pubsub = sub_redis.pubsub()
+            pattern = base_channel + ":*"
+            await pubsub.psubscribe(pattern)
+            await pubsub.subscribe(base_channel)
+            logger.info("Agent report consumer started: %s + %s", base_channel, pattern)
+
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    data = json.loads(message.get("data", "{}"))
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type", "")
+                target_agent_id = data.get("agent_id", "")
+                agent = manager.get_agent(target_agent_id) if target_agent_id else None
+
+                if msg_type == "agent_error" and agent:
+                    agent.push_agent_error(data)
+                elif msg_type == "agent_retry":
+                    logger.info(
+                        "[RETRY] agent=%s node=%s retry=%s/%s reason=%s",
+                        data.get("agent", "?"),
+                        data.get("node", "?"),
+                        data.get("retry_count", "?"),
+                        data.get("max_retries", "?"),
+                        data.get("reason", "")[:100],
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error("Agent report consumer crashed: %s, reconnecting in 5s", e, exc_info=True)
+        finally:
+            if pubsub is not None:
+                try:
+                    await pubsub.punsubscribe(pattern)
+                    await pubsub.unsubscribe(base_channel)
+                except Exception:
+                    pass
+            try:
+                await sub_redis.aclose()
+            except Exception:
+                pass
+        await asyncio.sleep(5)
+
+
 # ═══════════════════════════════════════════════════════════════
 # Bootstrap
 # ═══════════════════════════════════════════════════════════════
@@ -691,7 +827,6 @@ async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
 
 
 if __name__ == "__main__":
-    # 简单 argv 解析（不引入 argparse 依赖）
     data_dir = None
     for i, arg in enumerate(sys.argv[1:]):
         if arg == "--data-dir" and i + 1 < len(sys.argv) - 1:
@@ -701,4 +836,4 @@ if __name__ == "__main__":
             data_dir = arg.split("=", 1)[1]
             break
 
-    asyncio.run(main(data_dir=data_dir))
+    asyncio.run(_run_agent_manager(data_dir=data_dir))

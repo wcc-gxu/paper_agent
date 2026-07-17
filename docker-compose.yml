@@ -38,6 +38,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      PAPER_USER_ID: ${PAPER_USER_ID:-default}
     volumes:
       - papers:/root/papers
       - /oss:/oss
@@ -65,6 +66,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      PAPER_USER_ID: ${PAPER_USER_ID:-default}
     volumes:
       - papers:/root/papers
       - /oss:/oss
@@ -88,6 +90,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      PAPER_USER_ID: ${PAPER_USER_ID:-default}
     volumes:
       - papers:/root/papers
       - /oss:/oss
@@ -111,6 +114,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      PAPER_USER_ID: ${PAPER_USER_ID:-default}
     volumes:
       - papers:/root/papers
       - /oss:/oss
