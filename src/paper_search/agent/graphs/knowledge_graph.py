@@ -175,9 +175,8 @@ class KnowledgeAgent:
         self._ingest_graph = None
         self._query_graph = None
         self._ingest_local_graph = None
-        self.oss_dir = oss_dir or os.path.join(
-            os.path.expanduser("~"), ".paper_search", "oss",
-        )
+        from ...config import get_base_dir
+        self.oss_dir = oss_dir or str(get_base_dir())
 
     # ═══════════════════════════════════════════════════════════
     # Ingest Graph: chunk → embed → dedup → rank

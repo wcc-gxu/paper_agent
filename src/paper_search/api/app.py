@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -110,7 +111,8 @@ async def lifespan(app: FastAPI):
     # 启动订阅通知监听器 (Redis Pub/Sub → WebSocket 桥接)
     try:
         from .ws import start_notification_listener
-        asyncio.create_task(start_notification_listener())
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        asyncio.create_task(start_notification_listener(redis_url=redis_url))
         logger.info("Subscription notification listener started")
     except Exception as e:
         logger.warning(f"Notification listener not started: {e}")

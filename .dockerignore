@@ -33,7 +33,7 @@ dist/
 build/
 *.egg-info/
 
-.DS_Store
+**/.DS_Store
 Thumbs.db
 
 docker-compose.yml

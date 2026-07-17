@@ -70,7 +70,7 @@ ok "服务已更新"
 echo "==> 健康检查..."
 sleep 3
 for i in 1 2 3 4 5; do
-    if curl -sf "http://${SSH_HOST}:8000/health" >/dev/null 2>&1; then
+    if curl -sf "http://${SSH_HOST}:8000/api/health" >/dev/null 2>&1; then
         ok "健康检查通过 (${DEPLOY_DESC})"
         exit 0
     fi
