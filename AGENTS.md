@@ -40,21 +40,22 @@ DEPLOY_HOST=<server_ip> DEPLOY_ENV=test bash scripts/deploy.sh  # 测试 (dev)
 ## Git Flow + CI/CD
 
 ```
-feature/* ──→ PR ──→ dev ──→ PR ──→ master
-   │                │                │
-   ▼                ▼                ▼
- CI: 跑测试      CI: 测试→构建    CI: 测试→构建
-                 →推 :dev 镜像    →推 :latest 镜像
-                 →测试机自动部署    →生产机手动部署
+feature/* ──→ PR ──→ develop ──→ PR ──→ master
+   │                  │                    │
+   ▼                  ▼                    ▼
+ CI: 跑测试      CI: 测试→构建          CI: 测试→构建
+                 └→ 推送 :dev 镜像      └→ 推送 :latest 镜像
+                 └→ 自动部署测试机         (手动 deploy.yml)
 ```
 
 | 分支 | CI 行为 | 部署 |
 |------|---------|------|
 | `feature/*` | 跑测试 | — |
-| `dev` | 测试 → 构建 → 推 `:dev` | 自动部署到测试机 |
+| `develop` | 测试 → 构建 → 推 `:dev` | 自动部署到测试机 |
 | `master` | 测试 → 构建 → 推 `:latest` | 手动触发 (`workflow_dispatch`) |
 
-**测试环境自动更新**：push 到 `dev` → CI 自动测试+构建+部署。**生产环境**：push 到 `master` 仅构建镜像，需在 Actions 页面手动触发 Deploy。
+**测试环境自动更新**：push 到 `develop` → CI 自动测试 → 构建镜像 → 自动 SSH 部署到测试机（含健康检查）。
+**生产环境**：push 到 `master` 仅构建镜像，需在 Actions 页面 → `Deploy to Server` → 选 `production` 手动触发。
 
 **GitHub Secrets**（Settings → Secrets → Actions）:
 

@@ -23,10 +23,35 @@ jobs:
           key: ${{ secrets.TEST_SSH_KEY }}
           port: ${{ secrets.TEST_SSH_PORT || 22 }}
           script: |
+            set -e
             cd /opt/paper_agant
             export IMAGE_TAG=dev
+            echo "=== Pulling images ==="
             docker compose pull api worker beat daemon
+            echo ""
+            echo "=== Starting services ==="
             docker compose up -d --remove-orphans
+            echo ""
+            echo "=== Health check ==="
+            sleep 5
+            HEALTH_OK=false
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -sf http://localhost:8000/api/health; then
+                echo "Health check passed"
+                HEALTH_OK=true
+                break
+              fi
+              echo "Waiting... ($i/10)"
+              sleep 3
+            done
+            if [ "$HEALTH_OK" = false ]; then
+              echo "ERROR: Health check failed after 10 retries"
+              echo "=== API logs (last 30 lines) ==="
+              docker compose logs --tail 30 api
+              exit 1
+            fi
+            echo ""
+            echo "=== Service status ==="
             docker compose ps
 
   deploy-prod:
@@ -42,8 +67,33 @@ jobs:
           key: ${{ secrets.PROD_SSH_KEY }}
           port: ${{ secrets.PROD_SSH_PORT || 22 }}
           script: |
+            set -e
             cd /opt/paper_agant
             export IMAGE_TAG=latest
+            echo "=== Pulling images ==="
             docker compose pull api worker beat daemon
+            echo ""
+            echo "=== Starting services ==="
             docker compose up -d --remove-orphans
+            echo ""
+            echo "=== Health check ==="
+            sleep 5
+            HEALTH_OK=false
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -sf http://localhost:8000/api/health; then
+                echo "Health check passed"
+                HEALTH_OK=true
+                break
+              fi
+              echo "Waiting... ($i/10)"
+              sleep 3
+            done
+            if [ "$HEALTH_OK" = false ]; then
+              echo "ERROR: Health check failed after 10 retries"
+              echo "=== API logs (last 30 lines) ==="
+              docker compose logs --tail 30 api
+              exit 1
+            fi
+            echo ""
+            echo "=== Service status ==="
             docker compose ps
