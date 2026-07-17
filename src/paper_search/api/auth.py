@@ -240,10 +240,7 @@ async def verify_super_admin(
 
 
 def auth_register(username: str, password: str, display_name: str = "") -> dict:
-    """注册新用户 → 返回 tokens。
-
-    返回: {user_id, username, access_token, refresh_token, token_type:"bearer"}
-    """
+    """注册新用户 → 自动创建默认智能体 → 返回 tokens + agent_id。"""
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
     if len(username) < 3:
@@ -261,15 +258,24 @@ def auth_register(username: str, password: str, display_name: str = "") -> dict:
 
     pwd_hash = _hash_password(password)
     display = display_name or username
-    user_id = db.create_user(username, display, password_hash=pwd_hash)
+    role = "super_admin" if username == "wcc" else "researcher"
+    user_id = db.create_user(username, display, role=role, password_hash=pwd_hash)
 
-    access_token = _create_jwt(user_id, username, "access")
-    refresh_token = _create_jwt(user_id, username, "refresh")
+    agent_id = db.create_agent(
+        user_id=user_id,
+        name="Default Agent",
+        display_name="Paper Agent",
+        agent_type="main",
+    )
+
+    access_token = _create_jwt(user_id, username, "access", agent_id=agent_id)
+    refresh_token = _create_jwt(user_id, username, "refresh", agent_id=agent_id)
 
     return {
         "user_id": user_id,
         "username": username,
         "display_name": display,
+        "agent_id": agent_id,
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
@@ -277,10 +283,7 @@ def auth_register(username: str, password: str, display_name: str = "") -> dict:
 
 
 def auth_login(username: str, password: str) -> dict:
-    """用户登录 → 返回 tokens。
-
-    返回: {user_id, username, access_token, refresh_token, token_type:"bearer"}
-    """
+    """用户登录 → 返回 tokens + 默认 agent_id。"""
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
 
@@ -298,13 +301,19 @@ def auth_login(username: str, password: str) -> dict:
     if not _verify_password(password, pwd_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    access_token = _create_jwt(user["id"], username, "access")
-    refresh_token = _create_jwt(user["id"], username, "refresh")
+    agent_id = None
+    default_agent = db.get_default_agent(user["id"])
+    if default_agent:
+        agent_id = default_agent["id"]
+
+    access_token = _create_jwt(user["id"], username, "access", agent_id=agent_id)
+    refresh_token = _create_jwt(user["id"], username, "refresh", agent_id=agent_id)
 
     return {
         "user_id": user["id"],
         "username": username,
         "display_name": user.get("display_name", username),
+        "agent_id": agent_id,
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
@@ -312,7 +321,7 @@ def auth_login(username: str, password: str) -> dict:
 
 
 def auth_refresh(refresh_token: str) -> dict:
-    """使用 refresh_token 获取新的 access_token。"""
+    """使用 refresh_token 获取新的 access_token + agent_id。"""
     if not refresh_token:
         raise HTTPException(status_code=400, detail="refresh_token required")
 
@@ -322,12 +331,14 @@ def auth_refresh(refresh_token: str) -> dict:
 
     user_id = payload["sub"]
     username = payload.get("username", "")
-    new_access = _create_jwt(user_id, username, "access")
-    new_refresh = _create_jwt(user_id, username, "refresh")
+    agent_id = payload.get("agent_id")
+    new_access = _create_jwt(user_id, username, "access", agent_id=agent_id)
+    new_refresh = _create_jwt(user_id, username, "refresh", agent_id=agent_id)
 
     return {
         "user_id": user_id,
         "username": username,
+        "agent_id": agent_id,
         "access_token": new_access,
         "refresh_token": new_refresh,
         "token_type": "bearer",

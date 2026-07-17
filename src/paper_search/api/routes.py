@@ -52,6 +52,7 @@ class TokenResponse(BaseModel):
     user_id: str
     username: str
     display_name: str = ""
+    agent_id: Optional[str] = None
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
@@ -119,11 +120,16 @@ async def api_me(user_id: str = Depends(verify_api_key)):
     user = db.get_user(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    agent_id = None
+    default_agent = db.get_default_agent(user_id)
+    if default_agent:
+        agent_id = default_agent["id"]
     return {
         "user_id": user.get("id", user_id),
         "username": user.get("username", ""),
         "display_name": user.get("display_name", ""),
         "role": user.get("role", "researcher"),
+        "agent_id": agent_id,
     }
 
 

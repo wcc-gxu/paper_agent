@@ -260,7 +260,7 @@ class PostgresAgentDB:
         agent_type: str = "main",
     ) -> str:
         """创建智能体，返回 agent_id."""
-        agent_id = _uuid("ag")
+        agent_id = _uuid("agent")
         self._execute(
             """INSERT INTO agents (id, user_id, name, display_name, agent_type, system_prompt, llm_provider)
                VALUES (%s, %s, %s, %s, %s, %s, %s)""",
