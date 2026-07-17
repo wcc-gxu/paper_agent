@@ -221,6 +221,12 @@ class PostgresAgentDB:
         )
         return user_id
 
+    def set_user_role(self, user_id: str, role: str) -> None:
+        self._execute(
+            "UPDATE users SET role = %s, updated_at = now() WHERE id = %s",
+            (role, user_id),
+        )
+
     def count_user_papers(self, user_id: str) -> int:
         """获取用户的论文总数（用于冷启动检测）。"""
         cur = self._raw_conn.cursor()

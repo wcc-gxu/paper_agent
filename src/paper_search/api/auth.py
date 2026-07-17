@@ -283,7 +283,9 @@ def auth_register(username: str, password: str, display_name: str = "") -> dict:
 
 
 def auth_login(username: str, password: str) -> dict:
-    """用户登录 → 返回 tokens + 默认 agent_id。"""
+    """用户登录 → 返回 tokens + 默认 agent_id。
+    若用户无 agent 则自动创建；wcc 自动升级为 super_admin。
+    """
     if not username or not password:
         raise HTTPException(status_code=400, detail="username and password required")
 
@@ -301,10 +303,20 @@ def auth_login(username: str, password: str) -> dict:
     if not _verify_password(password, pwd_hash):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    if username == "wcc" and user.get("role") != "super_admin":
+        db.set_user_role(user["id"], "super_admin")
+
     agent_id = None
     default_agent = db.get_default_agent(user["id"])
     if default_agent:
         agent_id = default_agent["id"]
+    else:
+        agent_id = db.create_agent(
+            user_id=user["id"],
+            name="Default Agent",
+            display_name="Paper Agent",
+            agent_type="main",
+        )
 
     access_token = _create_jwt(user["id"], username, "access", agent_id=agent_id)
     refresh_token = _create_jwt(user["id"], username, "refresh", agent_id=agent_id)
