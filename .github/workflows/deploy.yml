@@ -24,7 +24,7 @@ jobs:
           port: ${{ secrets.TEST_SSH_PORT || 22 }}
           script: |
             set -e
-            cd /opt/paper_agant
+            cd /ubuntu/paper_agant
             export IMAGE_TAG=dev
             echo "=== Pulling images ==="
             docker compose pull api worker beat daemon
@@ -68,7 +68,7 @@ jobs:
           port: ${{ secrets.PROD_SSH_PORT || 22 }}
           script: |
             set -e
-            cd /opt/paper_agant
+            cd /ubuntu/paper_agant
             export IMAGE_TAG=latest
             echo "=== Pulling images ==="
             docker compose pull api worker beat daemon
