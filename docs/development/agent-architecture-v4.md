@@ -1,60 +1,75 @@
-# Paper Agent v4 — Agent 架构设计文档
+# Paper Agent v4.1 — Agent 架构设计文档
 
 > 最后更新: 2026-07-18
-> 状态: 最终设计（决策完成，进入开发）
-> 来源: Claude Code 架构对话 + 12 轮需求确认
+> 状态: Supervisor + Agent 子进程架构（决策完成，进入开发）
+> 来源: Claude Code 架构对话 + OpenClaw 竞品分析 + 多轮需求确认
 
 ---
 
 ## 1. 概述
 
-### 1.1 核心节点（v4.0 最终版）
+### 1.1 进程架构
 
 ```
-Supervision Agent (编排层，在 daemon 中运行)
-  │
-  ├── intent_classify (flash)     — 意图分类（7种意图，独立打分，planning_prompt生成）
-  │   ├── [chat] → flash reply → END
-  │   ├── [ops] → ops_plan → Celery react execute → END
-  │   └── [research] → plan_node ────────────────────── 循环 ───────
-  │                       │                                          │
-  │                       │  needs_clarification?                    │
-  │                       │                                          │
-  │                       ├── true → clarify_node                    │
-  │                       │     (ReAct, max 5 rounds, tool+human)    │
-  │                       │     → return collected_info              │
-  │                       │     → 回到 plan_node ────────────────────┘
-  │                       │
-  │                       └── false → plan_review (Gate)
-  │                              │
-  │                        approve│ revise│
-  │                          │     │       └→ 注入feedback → plan_node
-  │                          ▼     ▼
-  │                     Celery Worker
-  │                     react_execute (ReAct, max 8 rounds)
-  │                       │
-  │                       ▼
-  │                     message/reply → END
-  │
-  └── (独立心跳 Task) — 每 10s 刷新 Redis，与 turn 并行
+┌─────────────────────────────────────────────────────────────────┐
+│                    Supervisor 容器 (daemon)                       │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │  Agent Supervisor                                           ││
+│  │  - 扫描 agents 表，管理所有用户 Agent 子进程                   ││
+│  │  - BRPOP agent:ws:{uid} → stdin → Agent 子进程               ││
+│  │  - Agent 子进程 stdout → LPUSH agent:outbox:{uid}            ││
+│  │  - 3 层健康检测 (poll/积压/stdout) → HSET agent:status       ││
+│  │  - SUBSCRIBE agent:control ← API 控制指令                    ││
+│  └─────────────────────────────────────────────────────────────┘│
+│         │ stdin/stdout pipe          │ stdin/stdout pipe         │
+│  ┌──────▼──────────┐         ┌──────▼──────────┐                │
+│  │ Agent 子进程     │         │ Agent 子进程     │   ...          │
+│  │ user-abc        │         │ user-xyz        │                │
+│  │ PID=1001        │         │ PID=1002        │                │
+│  │                 │         │                 │                │
+│  │ 不直接连 Redis   │         │ 不直接连 Redis   │                │
+│  │ 仅 stdin/stdout │         │ 仅 stdin/stdout │                │
+│  │                 │         │                 │                │
+│  │ intent_classify │         │ intent_classify │                │
+│  │   → plan ⇄ clarify → gate → Celery execute  │                │
+│  │                                                 │             │
+│  └─────────────────────────────────────────────────┘             │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐│
+│  │  Celery Worker 容器                                          ││
+│  │  重型任务: 论文搜索/下载/转换/向量化/综述/视频                   ││
+│  └─────────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 关键设计变更
+### 1.2 Supervior → Agent 通信模型
 
-| 概念 | 旧草案 | 最终版 | 原因 |
+Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout pipe 经由 Supervisor 中转：
+
+```
+入站: API → LPUSH agent:ws:{uid} → Supervisor BRPOP → Agent stdin
+出站: Agent stdout → Supervisor → LPUSH agent:outbox:{uid} → API BRPOP → WS
+状态: Agent stdout {"type":"state","state":"busy","node":"plan"} → Supervisor HSET agent:status
+控制: API PUBLISH agent:control → Supervisor SUBSCRIBE → 启停 Agent 子进程
+```
+
+### 1.3 关键设计变更 (v4.1)
+
+| 概念 | v4.0 草案 | v4.1 最终 | 原因 |
 |------|--------|--------|------|
-| Agent 数量 | 每用户多个 Agent | 每用户 **1 个 Agent** | 科研场景下系统提示词统一 |
-| 节点分类 | Actor/Plan/Judge/Responder/Gate 五型 | **intent_classify + plan_node + clarify_node + ops_plan** | LLM 做推理、代码做控制 |
-| 执行分离 | execute 在 daemon 内 | **全部 ReAct 放 Celery** | daemon 立即释放，其他 session 可立即服务 |
-| 审批 | 全走 plan_review | **ops 无 review，research 有 review** | ops 是管理员确定操作 |
-| 心跳 | 无 | **独立 asyncio.Task**，10s 续期 | 解决长任务误判问题 |
-| 规划节点 | 分离 | **一个 plan_node**，ops 有独立快速入口 | 统一工具注册，按角色过滤 |
+| Agent 进程模型 | daemon 内 asyncio.Task | **每用户独立子进程** (create_subprocess_exec) | OS 级隔离，崩溃互不影响 |
+| Agent 连 Redis | ✅ Agent 直连 | ❌ **Agent 不连 Redis，仅 stdin/stdout** | 简化 Agent、Gateway 可拦截 |
+| 心跳机制 | Agent → Redis heartbeat key | **Supervisor 3 层检测 (poll/积压/stdout)** | Agent 无需主动上报，减少误报 |
+| API 查状态 | GET Redis heartbeat key | **HGET agent:status Hash** (Supervisor 维护) | 一次查询所有用户 |
+| Pub/Sub 用途 | 心跳 + 进度上报 + 控制 | **仅控制指令 (agent:control)** | 单一职责 |
+| 工具调度 | 全部 Celery | **轻工具 in-process / 重工具 Celery** | 减少序列化开销 |
 
-### 1.3 7 种子意图
+### 1.4 7 种子意图（不变）
 
 | 类型 | 子意图 | 工具范围 | 说明 |
 |------|--------|---------|------|
-| non-research | `chat` | None | 闲聊/知识问答/文本处理 → flash reply |
+| non-research | `chat` | None | 闲聊/知识问答 → flash reply |
 | non-research | `ops` | docker_*, system_* | 运维操作（admin only）→ ops_plan |
 | research | `survey` | search, ingest | 文献调研 |
 | research | `kb_retrieval` | kb_search, kb_ask | 知识库检索/问答 |
@@ -64,197 +79,330 @@ Supervision Agent (编排层，在 daemon 中运行)
 
 ---
 
-## 2. 节点设计
-
-### 2.1 节点总览
+## 2. 代理节点设计（不变）
 
 | 节点 | LLM | 所在进程 | 输出 | 说明 |
 |------|-----|---------|------|------|
-| `intent_classify` | Flash (≈2s) | daemon | `intents[]`, `planning_prompt`, `should_plan` | 意图分类+规范化提示词 |
-| `chat_reply` | Flash/Pro | daemon | `message/reply` | 纯对话直接回答 |
-| `ops_plan` | Flash (≈2s) | daemon | plan JSON → Celery | 运维规划，无 review 直接执行 |
-| `plan_node` | Pro | daemon | `{ needs_clarification, plan? }` | 研究规划，按需请求澄清 |
-| `clarify_node` | Pro | daemon | `collected_info` | ReAct 循环（≤5轮）+ 工具调用 + 用户交互 |
-| `react_execute` | Pro | Celery Worker | `message/reply` | 执行已批准的计划（ReAct ≤8轮） |
-
-### 2.2 intent_classify 节点
-
-**System Prompt 核心规则**:
-- 7 种意图独立打分 (0-1)，score > 0.7 的进入 `intents[]`
-- 生成 `planning_prompt`：规范化意图描述，含用户目标、所需工具、约束、偏好
-- `should_plan = false` → chat 直接回答
-- Flash model 优先，confidence < 0.8 时升级 Pro 二次确认
-
-**JSON Output**:
-```json
-{
-  "intents": [{"intent": "survey", "score": 0.95}],
-  "planning_prompt": "用户要求搜索 transformer 论文并生成综述...",
-  "complexity": "medium",
-  "should_plan": true,
-  "hint": "可能需要1-2轮澄清"
-}
-```
-
-### 2.3 plan_node
-
-**输入**: `planning_prompt` + `recent_events`（clarify 返回的摘要）+ `user_preferences` + `session_context`
-
-**输出**:
-```json
-// 需要澄清
-{"needs_clarification": true, "clarification_goal": "...", "suggested_tools": [...], "suggested_questions": [...]}
-// 计划就绪
-{"needs_clarification": false, "plan": {"summary": "...", "danger_level": "medium", "todos": [...]}}
-```
-
-**约束**: plan_node 不调工具。需要工具时 → `needs_clarification = true` → daemon 路由到 clarify_node。
-
-### 2.4 clarify_node
-
-**ReAct 循环（≤5 rounds）**: LLM decide → tool_call → evaluate → ...
-
-**可用工具**: 所有只读工具（web_search, kb_search, paper_read, doc_read）+ 用户交互（ask）
-
-**用户交互**: `ask(choice/confirm/text)` → ws push → 等回复 → 注入 context
-
-**返回**: `collected_info`（LLM 自摘要）+ `decisions`（已确认决策）→ 传给 plan_node
-
-### 2.5 ops_plan
-
-**触发**: intents 只含 `ops`。无 research 意图。
-
-**行为**: Flash LLM → 产出 plan（含 batch tool calls）+ execution_strategy
-**无 plan_review** → 直接 Celery 执行。工具权限按 `user.role` 过滤。
+| `intent_classify` | Flash (≈2s) | Agent 子进程 | `intents[]`, `planning_prompt`, `should_plan` | 7 意图独立打分 |
+| `chat_reply` | Flash/Pro | Agent 子进程 | `message/reply` | 纯对话直接回答 |
+| `ops_plan` | Flash (≈2s) | Agent 子进程 | plan JSON → Celery | 运维规划，无 review |
+| `plan_node` | Pro | Agent 子进程 | `{ needs_clarification, plan? }` | 研究规划 |
+| `clarify_node` | Pro | Agent 子进程 | `collected_info` | ReAct ≤5 轮 |
+| `react_execute` | Pro | **Celery Worker** | `message/reply` | 执行已批准计划 |
 
 ---
 
-## 3. Plan ⇄ Clarify 循环（daemon 控制）
+## 3. Agent 状态机
+
+### 3.1 7 种状态
+
+```
+                    ┌─────────┐
+         API: start │ STARTING│ crash/error
+         ──────────→│         │──────────────┐
+                    └────┬─────┘              │
+                         │ init OK            ▼
+                    ┌────▼─────┐        ┌──────────┐
+                    │   IDLE   │◄───────│ CRASHED  │
+                    │(无活跃turn)│ 自动重启 │          │
+                    └────┬─────┘        └──────────┘
+         WS消息到达      │  turn完成
+                    ┌────▼─────┐
+                    │   BUSY   │
+                    │active>0  │
+                    └────┬─────┘
+                         │
+         API: stop  ┌────▼─────┐         ┌──────────┐
+         ──────────→│ STOPPING │         │ STALLED  │
+                    └────┬─────┘         │(idle但队列│
+                         │               │积压>0.5d) │
+                    ┌────▼─────┐         └──────────┘
+                    │ STOPPED  │
+                    └──────────┘
+```
+
+| 状态 | 含义 | 触发 | 前端 |
+|------|------|------|------|
+| `starting` | 子进程已 launch，初始化中 | API 调 start | 加载中 |
+| `idle` | 正常运行，无活跃 turn | turn 完成 | 绿色 ● 在线 |
+| `busy` | 正在处理消息 | WS 消息到达 | 黄色 ● 处理中 |
+| `stopping` | 收到停止信号，清理中 | API 调 stop | 停止中 |
+| `stopped` | 正常退出 | Agent 进程 exit 0 | 灰色 ● 已停止 |
+| `crashed` | 异常退出 | Agent 进程 exit ≠ 0 | 红色 ● 异常 |
+| `stalled` | idle 但队列积压 > 0.5d | Supervisor 队列检测 | 橙色 ● 卡死 |
+
+### 3.2 状态上报路径
+
+```
+路径 1: Agent → stdout → Supervisor → HSET agent:status
+
+  Agent 内部在 LangGraph 节点转换时:
+    print({"type":"state","state":"busy","node":"plan"})
+
+路径 2: Supervisor OS 检测 → HSET agent:status
+
+  proc.returncode is not None → state=crashed/stopped
+
+路径 3: Supervisor 队列检测 → HSET agent:status
+
+  state=idle + 队列最老消息 > 43200s → state=stalled
+```
+
+### 3.3 Busy 状态超时检测（按节点）
+
+| Agent 报告的 node | 合理超时 | 超时后动作 |
+|-------------------|:---:|------|
+| `intent_classify` | 2min | SIGTERM → 重启 |
+| `plan` | 2min | SIGTERM → 重启 |
+| `execute` | 5min | SIGTERM → 重启 |
+| `clarify` | 5min | SIGTERM → 重启 |
+| `gate` / `ask_user` | 10min | SIGALRM → Agent 内部处理超时 |
+| `evaluate` | 2min | SIGTERM → 重启 |
+| `inline_reply` | 1min | SIGTERM → 重启 |
+
+**用户 review 超时：** Agent 内部处理 `ASK_TIMEOUT`（已有机制），Supervisor 不发 SIGTERM，避免误杀正在等待用户输入的进程。
+
+---
+
+## 4. 3 层健康检测（Supervisor 外部监控）
+
+Agent 不主动发心跳。Supervisor 从外部检测：
+
+| 层 | 方式 | 延迟 | 检测什么 |
+|:---:|------|:---:|------|
+| 1 | `proc.poll()` / `returncode` | 即时（进程退出时 event loop 通知） | 进程死了吗 |
+| 2 | 队列积压 + state 对比 | ≤30s 周期 | idle 但不消费消息 |
+| 3 | stdout 最后更新时间 | ≤15s | 是否还有输出 |
 
 ```python
-async def plan_clarify_loop(planning_prompt, session, preferences):
-    recent_events = []
+# Supervisor 检测逻辑
+async def _monitor_loop(self):
     while True:
-        result = await plan_node.invoke(planning_prompt + recent_events)
-        
-        if result.needs_clarification:
-            info = await clarify_node.react_loop(
-                goal=result.clarification_goal,
-                max_rounds=5,  # clarify 内循环限制
-            )
-            recent_events.append({"collected_info": info.collected_info})
-            continue
-        
-        approved, feedback = await gate.plan_review(result.plan)
-        if approved:
-            return result.plan  # → Celery
-        recent_events.append({"feedback": feedback})
-```
+        for uid, proc in self.agents.items():
+            # Layer 1: OS process
+            if proc.returncode is not None:
+                state = "crashed" if proc.returncode != 0 else "stopped"
+                await self._hsync_status(uid, state=state)
+                if self._should_restart(uid, proc.returncode):
+                    asyncio.create_task(self._relaunch(uid))
+                continue
 
-**Context 压缩**: 每轮 clarify→plan 返回时生成摘要，防止 `recent_events` 线性膨胀。
+            info = self.status_cache.get(uid, {})
+            state = info.get("state")
+            node = info.get("node", "")
 
----
+            # Layer 2: busy timeout
+            if state == "busy":
+                timeout = NODE_TIMEOUTS.get(node, 300)
+                if now - info["updated"] > timeout:
+                    proc.send_signal(signal.SIGTERM)
 
-## 4. Celery ReAct Execute
+            # Layer 2: idle queue staleness
+            if state == "idle":
+                oldest = await redis.xrange(f"agent:ws:{uid}", count=1)
+                if oldest and now - oldest.timestamp > 43200:  # 0.5d
+                    await self._hsync_status(uid, state="stalled")
 
-**提交**:
-```python
-celery_app.send_task("react_execute", args=[{
-    "plan_id", "agent_id", "user_id", "session_id",
-    "todos": approved_todos,
-    "context": {"document_id": ..., "preferences": ...}
-}])
-```
+            # Layer 3: stdout silent
+            if now - info["updated"] > 15:
+                logger.warning(f"Agent {uid} stdout silent for {now - info['updated']}s")
 
-**Worker 执行**: while round < 8 → LLM decide → tool_execute (支持并行) → evaluate → done/summary
-
-**取消**: `celery_app.control.revoke(task_id, terminate=True)` → 捕获 RevokedError → push status/cancelled
-
----
-
-## 5. Agent 心跳
-
-**daemon.py 心跳 Task**（独立，与 turn 并行）:
-```python
-async def _heartbeat_loop(self, r):
-    key = f"agent:heartbeat:{self.user_id}"
-    while not self._stopping:
-        await r.set(key, json.dumps({"status": "running", "active_turns": N}), ex=15)
         await asyncio.sleep(10)
 ```
 
-**app.py 检测**: 消息入队前 `GET agent:heartbeat:{user_id}` → 不存在则 `error/AGENT_NOT_RUNNING`；active_turns > 0 则 `status{stage:"queued"}`
-
 ---
 
-## 6. 子 Agent 工具集
+## 5. 工具分类：in-process vs Celery
 
-> 以下子 Agent 保持不变：Literature / Knowledge / Research / Writing / Translation / Glossary / Capture。由 `react_execute` 节点调用。
+### 5.1 Agent 进程内（asyncio / sync）
 
-| Agent | 工具 | 说明 |
-|-------|------|------|
-| Literature | `agent_literature_search` | 搜索→下载→评估→排名 |
-| Knowledge | `agent_knowledge_ingest/ask/ingest_local/get_fulltext` | RAG 入库/问答 |
-| Research | `agent_clustering`, `agent_citation_chase` | 聚类+引用追踪 |
-| Writing | `agent_generate_survey_v2`, `agent_check_ai_flavor` | 综述+AI味检查 |
-| Translation | `agent_translate` | 学术翻译 |
-| Glossary | `agent_build_glossary_v2` | 术语库构建 |
-| Capture | `agent_capture_video` | 视频下载+转写 |
+执行时间 <10s，内存占用小，失败不影响进程稳定性：
 
-### v4.0 新增文档编辑工具
+| 类别 | 工具 | 执行方式 |
+|------|------|:---:|
+| 文件读写 | read_file, write_file, edit_file, glob_files | sync / to_thread |
+| 内容搜索 | grep_content, web_search, web_fetch | async |
+| 文档 (v4.0) | doc_read, doc_write_section, doc_append, doc_diff_apply, doc_generate_review, doc_search_rag | sync |
+| 记忆 & 偏好 | search/summarize/delete_memory, get_user_preference | sync |
+| DB 轻量读 | paper_status, list_sources, get_paper_abstract | sync |
+| 订阅管理 | create/list/delete subscription | sync |
+| Zotero | zotero_export, zotero_import | sync |
+| iOS 工具 | ios_* (9 个) | sync (等客户端回复) |
 
-| 工具 | 条件 | 说明 |
+### 5.2 Celery Worker 容器
+
+执行时间 >10s，CPU/内存密集，或需要资源隔离：
+
+| 类别 | 工具 | 原因 |
 |------|------|------|
-| `doc_read` | Session 绑定文档 | 读取文档全文/部分 |
-| `doc_write_section` | Session 绑定文档 | 覆盖段落 |
-| `doc_append` | Session 绑定文档 | 追加内容 |
-| `doc_diff_apply` | Session 绑定文档 | 生成 diff → DiffPreviewCard |
-| `doc_generate_review` | Session 绑定文档 | 生成综述 → docs/reviews/ |
-| `doc_search_rag` | Session 绑定文档 | 搜索知识库引用 |
+| 论文搜索/下载 | agent_search_papers, agent_download_paper | 网络 IO + 可能超时 |
+| PDF 转换 | agent_convert_paper | CPU 密集，可能 OOM |
+| 向量化入库 | agent_index_paper | 批量 embedding API |
+| 综述生成 | agent_generate_survey | 长 LLM 调用 |
+| 知识库 | agent_knowledge_ingest/ask/extract | 批量 chunk + LLM |
+| 引用分析 | agent_citation_chase, agent_clustering | 爬虫 + 计算 |
+| 翻译/术语 | agent_translate, agent_build_glossary | 批量 LLM |
+| 视频 | agent_capture_video | 下载 + ASR |
+| Docker/系统 | docker_compose_*, apt_install, pip_install | 系统级操作 |
+
+### 5.3 子 Agent 进度上报
+
+Celery 任务**不直接写 outbox**。结果通过 Agent 内部 asyncio.Queue 中继，Agent 统一 stdout 上报：
+
+```
+Celery 报告进度 → Agent 内部 Queue → Agent stdout → Supervisor → LPUSH outbox:{uid}
+```
 
 ---
 
-## 7. 工具权限（按角色）
+## 6. 进程模型与隔离
 
-| 工具类别 | Student | Professor | Admin |
-|---------|:---:|:---:|:---:|
-| 论文搜索/RAG/上传/分析 | ✅ | ✅ | ✅ |
-| 文档编辑 (doc_*) | ✅ | ✅ | ✅ |
-| 写作/翻译/术语/订阅 | ✅ | ✅ | ✅ |
-| Docker/系统操作 | ❌ | ❌ | ✅ |
+### 6.1 进程管理（Supervisor → Agent）
+
+```python
+# 创建
+proc = await asyncio.create_subprocess_exec(
+    sys.executable, "-m", "paper_search.agent.agent_worker",
+    "--user-id", uid,
+    stdin=asyncio.subprocess.PIPE,
+    stdout=asyncio.subprocess.PIPE,
+    stderr=asyncio.subprocess.PIPE,
+)
+
+# 停止（优雅）
+proc.send_signal(signal.SIGTERM)
+await asyncio.sleep(5)
+if proc.returncode is None:
+    proc.kill()  # 强制
+
+# 检测
+proc.returncode  # None = 运行中, int = 退出码
+```
+
+### 6.2 隔离保证
+
+| 层级 | 机制 | 失败影响 |
+|------|------|:---:|
+| 用户间 | OS 进程隔离（独立 PID + 独立内存空间） | ✅ 零影响 |
+| 子 Agent（Celery）| 独立容器 + 独立 Python 进程 | ✅ 零影响（Agent 收到异常） |
+| 工具间（同一 Agent 内）| asyncio.Task + `asyncio.wait_for(task, timeout)` | ⚠️ 超时兜底 |
+
+### 6.3 Agent 内部并发
+
+```python
+# Agent 内部并发工具调用
+results = await asyncio.gather(
+    asyncio.wait_for(tool_a.execute(), timeout=300),
+    asyncio.wait_for(tool_b.execute(), timeout=300),
+    return_exceptions=True,
+)
+# 每个 Task 独立监控: task.done(), task.exception()
+```
 
 ---
 
-## 8. 反幻觉体系
+## 7. 幂等与重试
 
-三层防线：人格设定 → 上下文质量（主战场） → 规则验证（兜底）。详见 [anti-hallucination.md](anti-hallucination.md)。
+| 层级 | 幂等键 | 实现 |
+|------|--------|------|
+| 用户消息 | `msg_id` | API 缓存 "已接收" → 不重复入队 |
+| Agent turn | `correlation_id` | Agent 执行前查缓存，有 → 直接返回已有结果 |
+| Celery task | `task_id` + `acks_late=True` | 完成后 ack，崩溃不重复执行 |
+| 工具调用 | `tool_call_id` | outbox 已有去重索引 |
 
 ---
 
-## 9. v4.0 决策记录
+## 8. Redis Key 设计（仅 5 个 Key 类型）
+
+| Key | 类型 | 写 | 读 | 用途 |
+|-----|------|:---:|:---:|------|
+| `agent:status` | **Hash** | Supervisor | API | `HGETALL` 全量状态 / `HGET {uid}` 单用户 |
+| `agent:ws:{uid}` | **List** | API | Supervisor | 入站消息队列 |
+| `agent:outbox:{uid}` | **List** | Supervisor | API outbox_poller | 出站消息队列 |
+| `agent:control` | **Pub/Sub** | API | Supervisor | **唯一** Pub/Sub — 仅控制指令 |
+| `agent:ws:{uid}:parked` | **List** | Supervisor | Supervisor | 未匹配消息暂存（已有） |
+
+### agent:status Hash 结构
+
+```json
+{
+  "user-abc": {
+    "state": "busy", "node": "executing",
+    "active_turns": 2, "current_session": "sess-123",
+    "pid": 1001, "started_at": "2026-07-18T10:00:00Z",
+    "updated_at": "2026-07-18T10:05:23Z"
+  },
+  "user-xyz": {
+    "state": "idle", "node": null,
+    "active_turns": 0, "current_session": null,
+    "pid": 1002, "started_at": "2026-07-18T10:01:00Z",
+    "updated_at": "2026-07-18T10:05:20Z"
+  }
+}
+```
+
+**API 查询：** `HGET agent:status user-abc` — 1 次 Redis 往返，~0.1ms。
+
+**状态不存 DB（实时变化快，持久化无意义）。**
+
+---
+
+## 9. 消息全链路（10 步）
+
+```
+┌─ 入站 ───────────────────────────────────────────────────────┐
+│  1. Client → WS → FastAPI                                    │
+│  2. API: HGET agent:status {uid} → state=running?idle?      │
+│     NO → error/AGENT_NOT_RUNNING                             │
+│  3. API: LPUSH agent:ws:{uid}                                │
+│  4. Supervisor: BRPOP agent:ws:{uid}                        │
+│  5. Supervisor: proc.stdin.write(msg)                       │
+│  6. Agent: stdin.readline → process → print(result)         │
+├──────────────────────────────────────────────────────────────┤
+│  7. Supervisor: stdout.readline → parse JSON                │
+│  8. Supervisor: LPUSH agent:outbox:{uid} (内容不变)          │
+│  9. API outbox_poller: BRPOP agent:outbox:{uid}             │
+│ 10. API: ws_manager.broadcast → Client                      │
+├─ 状态同步 ───────────────────────────────────────────────────┤
+│  Agent: print({"type":"state","state":"busy"})              │
+│  Supervisor: HSET agent:status {uid} {state:busy,...}       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 10. 反幻觉体系（不变）
+
+三层防线：人格设定 → 上下文质量（主战场）→ 规则验证（兜底）。详见 [anti-hallucination.md](anti-hallucination.md)。
+
+---
+
+## 11. v4.1 决策记录
 
 | # | 决策 | 日期 |
 |---|------|------|
-| 1 | 每用户 1 个 Agent（注册时自动创建） | 2026-07-18 |
-| 2 | Redis 心跳 + 独立 Task + API 启停 | 2026-07-18 |
-| 3 | intent_classify 用 Flash（confidence < 0.8 升 Pro） | 2026-07-18 |
-| 4 | Plan ⇄ Clarify 外循环不限轮次，内循环 ≤5 轮 | 2026-07-18 |
-| 5 | ReAct 全量放 Celery Worker | 2026-07-18 |
-| 6 | Ops 无 plan_review，直接执行 | 2026-07-18 |
-| 7 | Plan 修改后重新 plan_review | 2026-07-18 |
-| 8 | Research+Ops 统一 plan_node（按角色过滤工具） | 2026-07-18 |
-| 9 | 6 个 doc_* 工具，仅绑定文档 Session 可用 | 2026-07-18 |
-| 10 | diff 以 DiffPreview 卡片呈现，用户接受/拒绝 | 2026-07-18 |
-| 11 | 版本：手动+AI turn+自动快照 | 2026-07-18 |
-| 12 | 用户偏好：4 项，界面编辑+对话修改 | 2026-07-18 |
+| 1 | 每用户 1 个 Agent 子进程（OS 级隔离） | 2026-07-18 |
+| 2 | Agent 子进程不连 Redis，仅 stdin/stdout pipe 通信 | 2026-07-18 |
+| 3 | Supervisor 3 层健康检测替代心跳（poll/积压/stdout） | 2026-07-18 |
+| 4 | API 通过 Redis Hash `agent:status` 查询状态（不直接问 Supervisor） | 2026-07-18 |
+| 5 | Pub/Sub 仅用于控制指令 `agent:control` | 2026-07-18 |
+| 6 | 工具二分：轻工具 Agent 内执行，重工具 Celery Worker | 2026-07-18 |
+| 7 | Celery 进度上报经 Agent stdout 中继，不直接写 outbox | 2026-07-18 |
+| 8 | Intent classify 7 意图独立打分，Flash 优先 | 2026-07-18 |
+| 9 | Plan ⇄ Clarify 外循环不限轮次，内循环 ≤5 轮 | 2026-07-18 |
+| 10 | ReAct 执行放 Celery Worker（max 8 rounds） | 2026-07-18 |
+| 11 | Ops 无 plan_review，直接执行 | 2026-07-18 |
+| 12 | 6 个 doc_* 工具，仅绑定文档 Session 可用 | 2026-07-18 |
+| 13 | idempotency: correlation_id/task_id/msg_id 三级去重 | 2026-07-18 |
+| 14 | busy 状态按 node 区分超时（2min/5min/10min） | 2026-07-18 |
 
 ---
 
-## 10. 相关文档
+## 12. 相关文档
 
 | 文档 | 状态 |
 |------|:---:|
-| 后端开发计划 `development-plan.md` | ✅ |
+| 开发计划 `development-plan.md` | ✅ |
 | API 参考 `api-reference.md` | 待更新 |
 | WS 协议 `websocket-protocol.md` | 待更新 |
 | 数据库架构 `database-architecture.md` | 待更新 |

@@ -180,9 +180,9 @@ docker compose up -d
 |------|------|------|
 | `/api/agents/me` | GET | 从 JWT 提取 user_id → 查 agents 表（取第一条活跃 agent）+ Redis 心跳合并 status |
 | `/api/agents/me` | PUT | 更新 system_prompt（user_id 关联的 agent） |
-| `/api/agents/me/status` | GET | 只读 Redis `agent:heartbeat:{user_id}`，返回 `{status, active_turns, progress}` |
-| `/api/agents/me/start` | POST | 异步启动 daemon（Docker API 或 subprocess） → 轮询 status 确认 |
-| `/api/agents/me/stop` | POST | 发停止信号 + DEL heartbeat key → 轮询确认 |
+| `/api/agents/me/status` | GET | 查 Redis Hash `HGET agent:status {uid}`（Supervisor 维护） |
+| `/api/agents/me/start` | POST | `PUBLISH agent:control {"cmd":"start","user_id":"..."}` → Supervisor 创建子进程 |
+| `/api/agents/me/stop` | POST | `PUBLISH agent:control {"cmd":"stop","user_id":"..."}` → Supervisor 发 SIGTERM |
 
 ### 4.2 Document 端点（新文件 `api/document_routes.py` 或追加到 routes.py）
 
@@ -230,111 +230,87 @@ docker compose up -d
 
 ---
 
-## 五、P2 — Agent 心跳 + Celery ReAct 拆分（4d）
+## 五、P2 — Agent Supervisor + 子进程模型（4d）
 
-### 5.1 Heartbeat (daemon.py)
+### 5.1 Agent Supervisor (daemon.py — 重写 AgentManager → AgentSupervisor)
 
-在 `AgentManager.__init__` 中新增独立心跳 Task:
-
-```python
-# daemon.py — AgentManager 中新增
-async def _heartbeat_loop(self, redis_client):
-    key = f"agent:heartbeat:{self.user_id}"
-    while not self._stopping:
-        await redis_client.set(key, json.dumps({
-            "status": "running",
-            "active_turns": self._active_turn_count,
-            "current_session": self._current_session_id,
-        }), ex=15)
-        await asyncio.sleep(10)
-```
-
-在 `AgentManager.run()` 启动时:
-```python
-self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(redis))
-```
-
-### 5.2 Heartbeat 检测 (app.py)
-
-消息入队 (`_push_to_redis`) 前检测:
+Supervisor 管理所有用户 Agent 子进程，通过 stdin/stdout pipe 通信：
 
 ```python
-# api/app.py — 在 WebSocket message handler 中
-heartbeat_raw = await redis.get(f"agent:heartbeat:{user_id}")
-if not heartbeat_raw:
-    await ws.send_text(json.dumps({
-        "type": "error", "subType": "AGENT_NOT_RUNNING",
-        "payload": {"code": "AGENT_NOT_RUNNING", "message": "Agent 未运行，请先启动"}
-    }))
-    return
-
-heartbeat = json.loads(heartbeat_raw)
-await redis.lpush(f"agent:ws:{user_id}", serialized_msg)
-
-if heartbeat.get("active_turns", 0) > 0:
-    await ws.send_text(json.dumps({
-        "type": "status", "payload": {"stage": "queued", "message": f"前面有 {heartbeat['active_turns']} 个任务排队中"}
-    }))
+class AgentSupervisor:
+    """管理所有用户 Agent 的生命周期 + 消息路由 + 状态监控."""
+    
+    async def run(self):
+        await asyncio.gather(
+            self._ingress_loop(),       # BRPOP agent:ws:* → stdin → Agent 子进程
+            self._egress_loop(),        # Agent 子进程 stdout → LPUSH agent:outbox:{uid}
+            self._monitor_loop(),       # 3 层健康检测 → HSET agent:status
+            self._control_listener(),   # SUBSCRIBE agent:control ← API 启停命令
+        )
 ```
 
-### 5.3 Celery ReAct 拆分
+### 5.2 Agent 子进程 (agent_worker.py — 新建)
+
+```python
+# 子进程入口 — 不连接 Redis，仅 stdin/stdout 通信
+async def agent_main(user_id: str):
+    while True:
+        msg = json.loads(sys.stdin.readline())
+        # 注入 LangGraph callback: 每次节点转换 stdout 上报状态
+        print({"type":"state","state":"busy","node":"intent_classify"})
+        result = await process_turn(msg)
+        print({"type":"reply","content":result})
+        print({"type":"state","state":"idle","node":None})
+```
+
+### 5.3 3 层健康检测
+
+| 层 | 方式 | 延迟 | 检测什么 |
+|:---:|------|:---:|------|
+| 1 | `proc.poll()` / `returncode` | 即时 | 进程死了吗 |
+| 2 | 队列积压 + state 对比 | 30s 周期 | idle 但最老消息 > 0.5d → stalled |
+| 3 | stdout 最后更新时间 | 15s | 是否还有输出 |
+
+Busy 状态按 node 超时: intent_classify/plan 2min, execute/clarify 5min, gate/ask_user 10min。
+
+### 5.4 API 状态查询
+
+API 不维护 Agent 状态。每次 WS 消息入站前 `HGET agent:status {uid}`：
+
+```python
+state = await redis.hget("agent:status", user_id)
+if not state or state.get("state") in ("stopped", "crashed", "stalled"):
+    return error/AGENT_NOT_RUNNING
+```
+
+### 5.5 Celery ReAct 拆分
 
 **目标**: `main_graph.py._execute()` 的 ReAct 逻辑 → 独立 Celery Task
 
 **新建 `agent/react_executor.py`**:
 
 ```python
-# agent/react_executor.py
 @celery_app.task(bind=True, max_retries=3, acks_late=True)
 def react_execute(self, plan: dict):
-    """
-    args = {
-        "plan_id", "agent_id", "user_id", "session_id",
-        "todos": [...],  # approved_todos
-        "context": {"document_id": ..., "preferences": ...}
-    }
-    """
     round_num = 0
-    context = build_initial_context(plan)
-    while round_num < REACT_MAX_ROUNDS:  # default 8
-        result = llm_pro_client.decide(context + tool_results)
+    while round_num < REACT_MAX_ROUNDS:
+        result = llm.chat(...)
         if result.done:
-            outbox_publish_sync("message", "reply", user_id, agent_id, session_id,
-                              payload={"content": result.summary})
-            return {"status": "done", "summary": result.summary}
-
-        results = execute_tools_parallel(result.tool_calls)
-        for r in results:
-            outbox_publish_sync("tool_execution", None, user_id, agent_id, session_id,
-                              payload=r.to_dict())
-        context.extend(results)
+            outbox_publish_sync(...)
+            return {"status": "done"}
+        execute_tools_parallel(result.tool_calls)
         round_num += 1
-
-    outbox_publish_sync("message", "reply", user_id, agent_id, session_id,
-                      payload={"content": best_effort_summary(context)})
 ```
 
-**daemon 修改**: `_gate()` 中 plan_approve 后:
-```python
-task = celery_app.send_task("react_execute", args=[plan_dict])
-# daemon 立即回到 BRPOP，不等待结果
-```
-
-**取消支持**:
-```python
-# 用户发送 cancel 消息 → daemon 收到
-celery_app.control.revoke(task_id, terminate=True)
-# Worker 捕获 RevokedError → outbox_publish(status="cancelled")
-```
-
-### 5.4 文件改动
+### 5.6 文件改动
 
 | 文件 | 操作 | 说明 |
 |------|------|------|
-| `agent/daemon.py` | 修改 | 新增 `_heartbeat_loop`，修改 `run()` 启动 heartbeat + plan_approve 后 submit Celery |
-| `api/app.py` | 修改 | `_push_to_redis` 前检测 heartbeat |
+| `agent/daemon.py` | **重写** | AgentManager→AgentSupervisor(300行) + 3层检测 + 控制 channel |
+| `agent/agent_worker.py` | **新建** | Agent 子进程入口 (80行)，仅 stdin/stdout 通信 |
 | `agent/react_executor.py` | **新建** | Celery ReAct execute task |
-| `agent/main_graph.py` | 修改 | `_execute()` 逻辑提取可复用部分供 react_executor 调用 |
+| `api/app.py` | 修改 | `HGET agent:status {uid}` 替代 heartbeat 检测 |
+| `api/routes.py` | 修改 | `/agents/me/start|stop` → PUBLISH `agent:control` |
 | `agent/graphs/main_graph.py` | 修改 | `_gate()` plan_approve → submit Celery 而非内联 execute |
 | `agent/celery_app.py` | 修改 | 注册 `react_execute` task |
 

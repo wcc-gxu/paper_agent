@@ -4,12 +4,15 @@
 
 ## 项目概述
 
-Paper Agent v4.0 — 个人 AI 科研助理。Python 后端 (FastAPI + WebSocket) + Vue 3 Web 客户端 + iOS 客户端。
+Paper Agent v4.1 — 个人 AI 科研助理。Python 后端 (FastAPI + WebSocket) + Vue 3 Web 客户端 + iOS 客户端。
 
-- **编排层**: Supervision Agent (daemon: intent_classify → plan ⇄ clarify → plan_review)
-- **执行层**: Celery Worker (react_execute, max 8 rounds)
+- **编排层**: Agent Supervisor (daemon 容器，管理 N 个 Agent 子进程。stdin/stdout pipe 通信)
+- **执行层**: Celery Worker (react_execute, max 8 rounds) + Agent 内部 asyncio 工具
+- **Agent 子进程**: 每用户独立 PID，不直接连 Redis。通过 Supervisor 中转消息
 - **消息**: Outbox 模式 (Redis List + PostgreSQL + APNs)
-- **v4.0 新增**: Agent 生命周期/文档管理/用户偏好/知识库共享/Celery 执行拆分/Redis 心跳
+- **状态**: Redis Hash `agent:status`（Supervisor 维护，API 查询）
+- **控制**: Pub/Sub `agent:control`（仅启停命令）
+- **v4.1 新增**: Agent 子进程模型/3 层健康检测/工具二分(in-process vs Celery)/幂等重试
 - **记忆**: LangGraph 三件套 + pgvector
 - **存储**: PostgreSQL+pgvector + Redis + 文件系统
 - **定时**: Celery Beat (订阅检查 + health_check + cleanup + 长期抽取 + session_close)
@@ -104,13 +107,27 @@ Sub-agent 工具使用 `agent_` 前缀 (e.g., `agent_literature_search`)。
 
 ## 服务进程
 
-| # | 服务 | 端口 |
-|---|---|---|
-| 1 | Redis | 6379 |
-| 2 | Celery Worker | — |
-| 3 | Celery Beat | — |
-| 4 | API Server | 8000 |
-| 5 | Agent Daemon | — |
+| # | 服务 | 端口 | 说明 |
+|---|---|---|---|
+| 1 | Redis | 6379 | 消息队列 + 状态缓存 |
+| 2 | Celery Worker | — | 重型任务（搜索/下载/转换/综述） |
+| 3 | Celery Beat | — | 定时任务（订阅/健康检查） |
+| 4 | API Server | 8000 | FastAPI + WebSocket |
+| 5 | Agent Supervisor | — | 管理 N 个 Agent 子进程 + 消息路由 + 状态监控 |
+
+### Agent 子进程隔离
+
+```python
+# Supervisor 创建 Agent 子进程
+proc = await asyncio.create_subprocess_exec(
+    sys.executable, "-m", "paper_search.agent.agent_worker",
+    "--user-id", uid,
+    stdin=PIPE, stdout=PIPE, stderr=PIPE,
+)
+
+# 用户间 OS 级隔离：独立 PID、独立内存空间、崩溃互不影响
+# Agent 不直接连 Redis，所有 IO 通过 Supervisor stdin/stdout pipe 中转
+```
 
 ## PostgreSQL 关键表
 
@@ -133,14 +150,16 @@ Sub-agent 工具使用 `agent_` 前缀 (e.g., `agent_literature_search`)。
 
 ## Redis Key 清单
 
-| Key | 类型 | 作用 |
-|---|---|---|
-| `agent:ws:{agent_id}` | List | iOS → Agent 入站 |
-| `agent:ws:{agent_id}:parked` | List | 暂存消息 |
-| `outbox:{agent_id}` | List | Agent → iOS 出站 |
-| `agent:reports:{agent_id}` | Pub/Sub | 子 Agent 上报 |
-| `agent:notifications` | Pub/Sub | Beat → API |
-| `vec:cache:{user_id}:{md5(query)}` | String | 向量缓存 (TTL 15min) |
+| Key | 类型 | 写 | 读 | 作用 |
+|-----|------|:---:|:---:|---|
+| `agent:status` | Hash | Supervisor | API | 全量 Agent 状态（state/node/pid/active_turns） |
+| `agent:ws:{uid}` | List | API | Supervisor | 入站消息队列 |
+| `agent:outbox:{uid}` | List | Supervisor | API | 出站消息队列 |
+| `agent:control` | Pub/Sub | API | Supervisor | 控制指令（仅启停） |
+| `agent:ws:{uid}:parked` | List | Supervisor | Supervisor | 未匹配消息暂存 |
+| `outbox:{uid}` | List | Agent outbox | outbox_poller | 出站消息（兼容旧版） |
+| `agent:reports:{uid}` | Pub/Sub | 子 Agent | Agent | 子 Agent 上报（保留，中继使用） |
+| `agent:notifications` | Pub/Sub | Celery Beat | API | 订阅通知 |
 
 ## Environment (.env)
 
@@ -175,11 +194,11 @@ Python >= 3.11
 
 ## 文档索引
 
+- [agent-architecture-v4.md](docs/development/agent-architecture-v4.md) — v4.1 Supervisor + Agent 子进程架构
 - [main-agent.md](docs/development/main-agent.md) — MainAgent LangGraph StateGraph 详解
 - [anti-hallucination.md](docs/development/anti-hallucination.md) — 反幻觉三层策略
 - [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 v10.2
 - [memory-system.md](docs/development/memory-system.md) — 记忆系统架构
 - [api-reference.md](docs/development/api-reference.md) — API 参考文档
 - [database-architecture.md](docs/development/database-architecture.md) — PostgreSQL schema
-- [agent-architecture-v4.md](docs/development/agent-architecture-v4.md) — v4 目标架构
 - [gap-analysis.md](docs/development/gap-analysis.md) — 当前差距分析
