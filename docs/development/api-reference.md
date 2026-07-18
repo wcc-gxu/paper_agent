@@ -1,10 +1,12 @@
-# Paper Agent v3 — API 参考文档
+# Paper Agent v4 — API 参考文档
 
-> 更新: 2026-07-15 | 版本: 3.1.0 | LLM: DeepSeek v4 Pro + Flash
+> 更新: 2026-07-18 | 版本: 4.0.0 | LLM: DeepSeek v4 Pro + Flash
 >
-> 架构: Fast Triage (flash) → chat/ops/research → Intent Classify (flash) → Plan (pro) → Plan Review (human-in-the-loop) → Execute ReAct (pro) → Evaluate (flash)
+> 架构: Intent Classify (flash) → [chat→reply] | [ops→ops_plan→Celery] | [research→plan⇄clarify→review→Celery]
 >
-> WebSocket 协议详见 [websocket-protocol.md](websocket-protocol.md) (v10.2)
+> v4.0 变更: Agent 生命周期/NEW Document CRUD/Preference/Share API。注册不再返回 agent_id。知识库按 user_id 隔离。
+>
+> 详见 [vue 客户端 API 参考](../../paper-agent-vue/docs/api-reference.md)
 
 ---
 
@@ -12,14 +14,18 @@
 
 - [1. 认证 (JWT)](#1-认证-jwt)
 - [2. 认证端点](#2-认证端点)
-- [3. 搜索与论文](#3-搜索与论文)
-- [4. 知识库](#4-知识库)
-- [5. 项目管理](#5-项目管理)
-- [6. 会话与消息](#6-会话与消息)
-- [7. 订阅](#7-订阅)
-- [8. 设备注册 (APNs)](#8-设备注册-apns)
-- [9. RAG 健康检查](#9-rag-健康检查)
-- [10. 调试模式](#10-调试模式)
+- [3. Agent 管理 (v4.0)](#3-agent-管理-v40)
+- [4. 搜索与论文](#4-搜索与论文)
+- [5. 知识库](#5-知识库)
+- [6. 项目管理](#6-项目管理)
+- [7. 文档管理 (v4.0)](#7-文档管理-v40)
+- [8. 用户偏好 (v4.0)](#8-用户偏好-v40)
+- [9. 会话与消息](#9-会话与消息)
+- [10. 订阅](#10-订阅)
+- [11. 知识共享 (v4.0)](#11-知识共享-v40)
+- [12. 设备注册 (APNs)](#12-设备注册-apns)
+- [13. RAG 健康检查](#13-rag-健康检查)
+- [14. 调试模式](#14-调试模式)
 
 ---
 
@@ -89,6 +95,8 @@ Base URL: `http://{host}:8000/api`
 }
 ```
 
+> **v4.0 变更**: 注册成功后服务端在后台自动创建 Agent 并启动。客户端应在登录后轮询 `GET /api/agents/me/status` 等待 Agent 就绪。
+
 **Errors**: 400 (参数不合法) | 409 (用户名已存在)
 
 ---
@@ -144,7 +152,31 @@ Base URL: `http://{host}:8000/api`
 
 ---
 
-## 3. 搜索与论文
+## 3. Agent 管理 (v4.0)
+
+### `GET /api/agents/me`
+
+获取当前用户 Agent 信息（DB + Redis 心跳合并）。
+
+```json
+{"id": "agent-xxx", "user_id": "...", "system_prompt": "...", "status": "running", "active_turns": 0}
+```
+
+### `PUT /api/agents/me`
+
+更新系统提示词。`{"system_prompt": "..."}`
+
+### `GET /api/agents/me/status`
+
+轻量轮询。`{"status": "starting", "progress": 0.6, "active_turns": 0}`
+
+### `POST /api/agents/me/start` / `POST /api/agents/me/stop`
+
+异步启停，轮询确认。
+
+---
+
+## 4. 搜索与论文
 
 ### `GET /api/health`
 
@@ -260,7 +292,24 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 6. 会话与消息
+## 7. 文档管理 (v4.0)
+
+`GET/POST /api/documents` — 列出/创建（mode=create/upload/from_paper）
+`GET/PUT/DELETE /api/documents/{id}` — CRUD + 乐观锁
+`GET /api/documents/{id}/download` — 下载 MD
+`GET/POST /api/documents/{id}/versions` — 版本列表/提交
+`GET /api/documents/{id}/versions/{vid}` — 版本内容
+`POST /api/documents/{id}/revert/{vid}` — 回滚
+
+---
+
+## 8. 用户偏好 (v4.0)
+
+`GET/PUT /api/preferences/me` — 研究领域/写作风格/语言/导师语录
+
+---
+
+## 9. 会话与消息
 
 ### `GET /api/sessions/{session_id}/messages`
 
@@ -306,7 +355,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-### 7. 订阅
+## 10. 订阅
 
 ### `GET /api/subscriptions`
 
@@ -340,7 +389,15 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 8. 设备注册 (APNs)
+## 11. 知识共享 (v4.0)
+
+`POST /api/share` — 发起共享请求
+`GET /api/share/requests` — 请求列表
+`PUT /api/share/requests/{id}` — 接受/拒绝
+
+---
+
+## 12. 设备注册 (APNs)
 
 ### `POST /api/devices/register`
 

@@ -1,8 +1,8 @@
-# 智驭·研 v3 数据库架构设计
+# 智驭·研 v4 数据库架构设计
 
-> 数据库方案：PostgreSQL (业务数据) + pgvector (向量存储) + Redis (缓存/队列)
+> 数据库方案：PostgreSQL (业务数据) + pgvector (向量存储) + Redis (缓存/队列/心跳)
 >
-> 日期：2026-07-10
+> 日期：2026-07-18
 
 ---
 
@@ -10,24 +10,85 @@
 
 1. [技术选型](#1-技术选型)
 2. [PostgreSQL 表结构](#2-postgresql-表结构)
-   - 2.1 表关系 ER 图
-   - 2.2 用户与认证
-   - 2.3 项目与论文
-   - 2.4 引用关系
-   - 2.5 会话与消息
-   - 2.6 Agent 任务
-   - 2.7 术语词表
-   - 2.8 写作模板
-   - 2.9 外部验证缓存
-   - 2.10 反幻觉事件
-   - 2.11 基础设施（搜索日志 / 期刊分级 / 视频）
-   - 2.12 碎片知识采集 [新增]
-   - 2.13 订阅
-   - 2.14 Agent 事件
+   ...
 3. [pgvector 向量存储设计](#3-pgvector-向量存储设计)
 4. [Redis 数据结构](#4-redis-数据结构)
 5. [索引策略](#5-索引策略)
-6. [迁移方案（SQLite → PostgreSQL）](#6-迁移方案)
+6. [v4.0 新增表](#6-v40-新增表)
+
+---
+
+## 6. v4.0 新增表
+
+### 6.1 agents
+
+```sql
+CREATE TABLE agents (
+  id VARCHAR(64) PRIMARY KEY DEFAULT gen_agent_id(),
+  user_id VARCHAR(64) UNIQUE NOT NULL REFERENCES users(id),
+  system_prompt TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 6.2 documents
+
+```sql
+CREATE TABLE documents (
+  id VARCHAR(64) PRIMARY KEY DEFAULT gen_doc_id(),
+  user_id VARCHAR(64) NOT NULL REFERENCES users(id),
+  title VARCHAR(200) NOT NULL,
+  file_path VARCHAR(500) NOT NULL,
+  is_auto_review BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_documents_user_id ON documents(user_id);
+```
+
+### 6.3 document_versions
+
+```sql
+CREATE TABLE document_versions (
+  id VARCHAR(64) PRIMARY KEY DEFAULT gen_ver_id(),
+  document_id VARCHAR(64) NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  version_number INT NOT NULL,
+  content TEXT NOT NULL,
+  trigger VARCHAR(32) CHECK (trigger IN ('manual_commit','ai_turn','auto_save','rollback')),
+  session_id VARCHAR(64),
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_versions_document_id ON document_versions(document_id);
+```
+
+### 6.4 user_preferences
+
+```sql
+CREATE TABLE user_preferences (
+  user_id VARCHAR(64) PRIMARY KEY REFERENCES users(id),
+  research_domain VARCHAR(200) DEFAULT '',
+  writing_style VARCHAR(100) DEFAULT 'APA',
+  language_pref VARCHAR(50) DEFAULT 'zh',
+  mentor_quotes TEXT DEFAULT '',
+  other JSONB DEFAULT '{}',
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+### 6.5 现有表修改
+
+```sql
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS document_id VARCHAR(64) REFERENCES documents(id);
+ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);
+CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_user_id ON knowledge_chunks(user_id);
+```
+
+### 6.6 Redis 新增 Key
+
+| Key | 类型 | 说明 |
+|-----|------|------|
+| `agent:heartbeat:{user_id}` | String (JSON) | Agent 心跳：`{"status":"running","active_turns":N}`，TTL 15s，独立 Task 每 10s 续期 |
 7. [多用户数据隔离策略](#7-多用户数据隔离策略)
 
 ---

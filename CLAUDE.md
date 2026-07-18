@@ -4,10 +4,12 @@
 
 ## 项目概述
 
-Paper Agent v4 — 个人 AI 科研助理。Python 后端 (FastAPI + WebSocket) + iOS 客户端。
+Paper Agent v4.0 — 个人 AI 科研助理。Python 后端 (FastAPI + WebSocket) + Vue 3 Web 客户端 + iOS 客户端。
 
-- **主 Agent**: MainAgent (LangGraph StateGraph 10 节点)
+- **编排层**: Supervision Agent (daemon: intent_classify → plan ⇄ clarify → plan_review)
+- **执行层**: Celery Worker (react_execute, max 8 rounds)
 - **消息**: Outbox 模式 (Redis List + PostgreSQL + APNs)
+- **v4.0 新增**: Agent 生命周期/文档管理/用户偏好/知识库共享/Celery 执行拆分/Redis 心跳
 - **记忆**: LangGraph 三件套 + pgvector
 - **存储**: PostgreSQL+pgvector + Redis + 文件系统
 - **定时**: Celery Beat (订阅检查 + health_check + cleanup + 长期抽取 + session_close)

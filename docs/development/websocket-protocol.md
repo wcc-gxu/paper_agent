@@ -1,8 +1,10 @@
-# Paper Agent v3 — WebSocket 通信协议
+# Paper Agent v4 — WebSocket 通信协议
 
-> iOS / Vue 客户端对接规范 | v10.2 | 2026-07-14
+> iOS / Vue 客户端对接规范 | v11.0 | 2026-07-18
 >
-> 变更: v10.2 移除 WS sync 协议，离线消息改为 REST API 拉取 (GET /api/sessions/{id}/messages)
+> v11.0 变更: Agent 心跳协议、AGENT_NOT_RUNNING error、queued status、doc_* 文档编辑工具、DiffPreview 卡片、document_edit capability
+>
+> 详见 [vue 客户端 WS 协议](../../paper-agent-vue/docs/websocket-protocol.md)
 
 ---
 

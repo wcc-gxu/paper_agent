@@ -1,10 +1,49 @@
-# 智驭·研 v3 后端验收标准
+# Paper Agent v4.0 — 后端验收标准
 
-> 对应 [后端开发计划](./backend-development-plan.md)
+> 对应 [后端开发计划](./development-plan.md)
 >
-> 日期：2026-07-10
+> 日期：2026-07-18
 
 ---
+
+## v4.0 新增验收项（25 项）
+
+| # | 验收项 | 级别 |
+|---|--------|:---:|
+| **Agent 生命周期** |||
+| 1 | 注册 → Agent 自动创建 + Redis 心跳开始 | P0 |
+| 2 | `GET /api/agents/me/status` 轮询返回正确状态 | P0 |
+| 3 | `POST /api/agents/me/start` 异步启动 daemon | P0 |
+| 4 | `POST /api/agents/me/stop` 停止 + DEL heartbeat key | P0 |
+| 5 | Agent 崩溃后 15s 内 heartbeat key 过期 | P0 |
+| 6 | daemon 独立 heartbeat Task 不被 `_run_turn` 阻塞 | P0 |
+| **消息路由** |||
+| 7 | WS 消息入队时检测 heartbeat → 不存在则 error/AGENT_NOT_RUNNING | P0 |
+| 8 | Agent busy 时消息入队 → 推送 status{stage:"queued"} | P1 |
+| **Celery 执行** |||
+| 9 | plan_approve → `celery_app.send_task("react_execute")` → daemon 立即回到 BRPOP | P0 |
+| 10 | Celery Worker react_execute 正确执行 ReAct loop（≤8 轮） | P0 |
+| 11 | Celery 任务取消 → outbox_publish(status="cancelled") | P1 |
+| **Intent Classify** |||
+| 12 | Flash model 7 种意图独立打分 > 0.7 → intents[] | P0 |
+| 13 | chat intent → flash reply，不进入 plan | P0 |
+| 14 | ops intent → ops_plan → Celery execute | P0 |
+| **Plan ⇄ Clarify** |||
+| 15 | plan_node 返回 needs_clarification → clarify_node 正确运行 | P0 |
+| 16 | clarify_node ReAct ≤5 轮 → 返回 collected_info | P0 |
+| 17 | Plan ⇄ Clarify 多轮循环正确（≥3 轮） | P1 |
+| **文档管理** |||
+| 18 | `POST /api/documents` 支持 mode=create/upload | P0 |
+| 19 | `PUT /api/documents/{id}` 乐观锁（version 匹配） | P0 |
+| 20 | `GET /api/documents/{id}/versions` 正确处理 4 种 trigger | P1 |
+| 21 | `POST /api/documents/{id}/revert/{vid}` 回滚+创建新版本 | P1 |
+| **知识库隔离** |||
+| 22 | Knowledge 查询按 JWT user_id 自动过滤 | P0 |
+| 23 | Knowledge 入库时写入 user_id | P0 |
+| **偏好/共享** |||
+| 24 | `GET/PUT /api/preferences/me` CRUD | P1 |
+| 25 | `POST /api/share` → 细粒度共享流程 | P2 |
+
 
 ## 目录
 
