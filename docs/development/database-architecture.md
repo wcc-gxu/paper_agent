@@ -1,702 +1,509 @@
-# 智驭·研 v4 数据库架构设计
+# Paper Agent v4.1 — 数据库架构设计
 
-> 数据库方案：PostgreSQL (业务数据) + pgvector (向量存储) + Redis (缓存/队列/心跳)
+> 数据库方案：PostgreSQL (业务数据) + pgvector (向量存储) + Redis (缓存/队列/路由)
 >
-> 日期：2026-07-18
+> 日期：2026-07-18 | 版本：4.1 | 表数：17 | 索引：28
 
 ---
 
 ## 目录
 
 1. [技术选型](#1-技术选型)
-2. [PostgreSQL 表结构](#2-postgresql-表结构)
-   ...
-3. [pgvector 向量存储设计](#3-pgvector-向量存储设计)
-4. [Redis 数据结构](#4-redis-数据结构)
+2. [表关系 ER 图](#2-表关系-er-图)
+3. [PostgreSQL 表结构（17 张）](#3-postgresql-表结构17-张)
+4. [pgvector 向量索引设计](#4-pgvector-向量索引设计)
 5. [索引策略](#5-索引策略)
-6. [v4.0 新增表](#6-v40-新增表)
-
----
-
-## 6. v4.0 新增表
-
-### 6.1 agents
-
-```sql
-CREATE TABLE agents (
-  id VARCHAR(64) PRIMARY KEY DEFAULT gen_agent_id(),
-  user_id VARCHAR(64) UNIQUE NOT NULL REFERENCES users(id),
-  system_prompt TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-### 6.2 documents
-
-```sql
-CREATE TABLE documents (
-  id VARCHAR(64) PRIMARY KEY DEFAULT gen_doc_id(),
-  user_id VARCHAR(64) NOT NULL REFERENCES users(id),
-  title VARCHAR(200) NOT NULL,
-  file_path VARCHAR(500) NOT NULL,
-  is_auto_review BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_documents_user_id ON documents(user_id);
-```
-
-### 6.3 document_versions
-
-```sql
-CREATE TABLE document_versions (
-  id VARCHAR(64) PRIMARY KEY DEFAULT gen_ver_id(),
-  document_id VARCHAR(64) NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  version_number INT NOT NULL,
-  content TEXT NOT NULL,
-  trigger VARCHAR(32) CHECK (trigger IN ('manual_commit','ai_turn','auto_save','rollback')),
-  session_id VARCHAR(64),
-  created_at TIMESTAMPTZ DEFAULT NOW()
-);
-CREATE INDEX idx_versions_document_id ON document_versions(document_id);
-```
-
-### 6.4 user_preferences
-
-```sql
-CREATE TABLE user_preferences (
-  user_id VARCHAR(64) PRIMARY KEY REFERENCES users(id),
-  research_domain VARCHAR(200) DEFAULT '',
-  writing_style VARCHAR(100) DEFAULT 'APA',
-  language_pref VARCHAR(50) DEFAULT 'zh',
-  mentor_quotes TEXT DEFAULT '',
-  other JSONB DEFAULT '{}',
-  updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-```
-
-### 6.5 现有表修改
-
-```sql
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS document_id VARCHAR(64) REFERENCES documents(id);
-ALTER TABLE knowledge_chunks ADD COLUMN IF NOT EXISTS user_id VARCHAR(64);
-CREATE INDEX IF NOT EXISTS idx_knowledge_chunks_user_id ON knowledge_chunks(user_id);
-```
-
-### 6.6 Redis 新增 Key
-
-| Key | 类型 | 说明 |
-|-----|------|------|
-| `agent:heartbeat:{user_id}` | String (JSON) | Agent 心跳：`{"status":"running","active_turns":N}`，TTL 15s，独立 Task 每 10s 续期 |
-7. [多用户数据隔离策略](#7-多用户数据隔离策略)
+6. [Redis 数据结构](#6-redis-数据结构)
+7. [多用户数据隔离](#7-多用户数据隔离)
+8. [迁移映射（30→17 表）](#8-迁移映射3017-表)
+9. [架构审查](#9-架构审查)
 
 ---
 
 ## 1. 技术选型
 
-| 组件 | 版本 | 用途 | 替代旧方案 |
-|------|------|------|-----------|
-| PostgreSQL | 16+ | 所有业务数据存储 | SQLite (AgentDB) |
-| pgvector | 0.8+ | 向量存储与检索 | ChromaDB |
-| Redis | 7+ | 缓存 / 消息队列 / Pub/Sub / 限流 | 保持不变，增强 |
+| 组件 | 版本 | 用途 |
+|------|------|------|
+| PostgreSQL | 16+ | 所有业务数据存储 |
+| pgvector | 0.8+ | 向量存储与检索（HNSW） |
+| Redis | 7+ | 缓存 / 消息队列 / Pub/Sub / 限流 / Agent 状态 |
 
 ### 选型理由
 
 | 对比维度 | SQLite | PostgreSQL + pgvector |
 |----------|--------|----------------------|
-| 并发写入 | 单写入锁，多用户场景瓶颈 | MVCC，天然高并发 |
-| 向量检索 | 依赖外部 ChromaDB，数据一致性问题 | pgvector 与业务表在同一事务中 |
-| 全文搜索 | 基础 FTS | `tsvector` + `tsquery`，中英文支持 |
-| JSON 查询 | 有限 | `jsonb` + GIN 索引 |
-| 运维 | 单文件，无运维 | 需要独立部署，但支持备份/复制 |
-| 多用户隔离 | 应用层限制 | Schema 级隔离 + RLS（可选） |
+| 并发写入 | 单写入锁 | MVCC，天然高并发 |
+| 向量检索 | 依赖外部 ChromaDB | pgvector 与业务表同一事务 |
+| 全文搜索 | 基础 FTS | tsvector + GIN 索引 |
+| JSON 查询 | 有限 | jsonb + GIN 索引 |
+| 运维 | 单文件 | 需要备份/复制方案 |
 
 ---
 
-## 2. PostgreSQL 表结构
-
-### 2.1 表关系 ER 图
+## 2. 表关系 ER 图
 
 ```
-users
+users ── 1:1 ── agents           (1 用户 1 agent)
   │
   ├── 1:N ── projects ── N:M ── papers
-  │   (via project_papers)
+  │             (via project_papers)
   │
-  ├── 1:N ── papers                   # 用户上传/入库的论文
-  ├── 1:N ── sessions
-  ├── 1:N ── glossary_terms
-  ├── 1:N ── writing_templates
-  ├── 1:N ── agent_tasks ── 1:N ── task_steps
-  ├── 1:N ── search_logs
-  ├── 1:N ── captures                # 碎片知识（网页/笔记/实验/音视频）
-  ├── 1:N ── subscriptions ── 1:N ── subscription_results
-  └── 1:N ── hallucination_events
+  ├── 1:N ── papers              (论文元数据)
+  │             ├── 1:N ── paper_chunks (pgvector 切片)
+  │             └── figures/archives 存为 JSONB 字段
+  │
+  ├── 1:N ── captures            (碎片知识 + embedding)
+  ├── 1:N ── glossary_terms      (术语库 + embedding)
+  ├── 1:N ── sessions            (聊天会话)
+  │             ├── 1:N ── ws_messages   (消息持久化)
+  │             └── summary 存为 JSONB 字段
+  │
+  ├── 1:N ── documents           (AI 写作文档 + versions JSONB)
+  ├── 1:N ── subscriptions       (订阅 + results JSONB)
+  ├── 1:N ── share_requests      (细粒度共享)
+  ├── 1:N ── hallucination_events (反幻觉审计)
+  └── 1:N ── event_logs          (通用事件日志)
 
-papers
-  │
-  ├── 1:N ── paper_chunks (pgvector)
-  ├── 1:N ── citations              (引用关系；cited_paper_id 可选 FK→papers)
-  └── N:M ── projects               (via project_papers)
-
-sessions
-  │
-  ├── 1:N ── ws_messages
-  └── 1:N ── conversation_archive
+独立表（不关联 user_id）：
+  journal_ranks                  (CCF/SCI 分级缓存)
+  _schema_meta                   (embedding 模型元数据)
 ```
 
-### 2.2 用户与认证
+---
+
+## 3. PostgreSQL 表结构（17 张）
+
+### 3.1 users — 用户
 
 ```sql
--- 用户表
 CREATE TABLE users (
-    id          TEXT PRIMARY KEY,           -- user-xxx (UUID)
-    username    TEXT NOT NULL UNIQUE,        -- 登录名
-    display_name TEXT NOT NULL,              -- 显示名称
-    api_token   TEXT NOT NULL UNIQUE,        -- Bearer Token (tok-xxx)
-    role        TEXT NOT NULL DEFAULT 'researcher',  -- researcher | admin
-    is_active   BOOLEAN NOT NULL DEFAULT true,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              TEXT PRIMARY KEY,                    -- user-{uuid}
+    username        TEXT NOT NULL UNIQUE,
+    display_name    TEXT NOT NULL,
+    password_hash   TEXT NOT NULL,
+    role            TEXT NOT NULL DEFAULT 'researcher',   -- researcher | super_admin
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- 用户配置（JSON 灵活扩展）
-CREATE TABLE user_configs (
-    id          TEXT PRIMARY KEY,           -- cfg-xxx
-    user_id     TEXT NOT NULL REFERENCES users(id),
-    config_key  TEXT NOT NULL,              -- e.g. 'llm.model_preference'
-    config_value JSONB NOT NULL DEFAULT '{}',
-    UNIQUE (user_id, config_key)
-);
-
-CREATE INDEX idx_users_api_token ON users(api_token);
+CREATE INDEX idx_users_username ON users(username);
 ```
 
-### 2.3 项目与论文
+### 3.2 agents — Agent 配置（1 用户 : 1 Agent）
 
 ```sql
--- 项目表
-CREATE TABLE projects (
-    id          TEXT PRIMARY KEY,           -- prj-xxx
-    user_id     TEXT NOT NULL REFERENCES users(id),
-    name        TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    domain      TEXT NOT NULL DEFAULT '',    -- computer_vision / nlp / system / ...
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE agents (
+    id              TEXT PRIMARY KEY,                    -- agent-{uuid}
+    user_id         TEXT UNIQUE NOT NULL REFERENCES users(id),
+    system_prompt   TEXT NOT NULL DEFAULT '',
+    state           TEXT NOT NULL DEFAULT 'stopped',      -- Supervisor 维护
+    llm_provider    TEXT NOT NULL DEFAULT 'deepseek',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE INDEX idx_agents_user ON agents(user_id);
+CREATE INDEX idx_agents_active ON agents(user_id, is_active);
+```
 
-CREATE INDEX idx_projects_user ON projects(user_id);
+**state 状态**: `starting` | `idle` | `busy` | `stopping` | `stopped` | `crashed` | `stalled`
 
--- 论文表
+> `state` 字段高频更新由 Supervisor 写 Redis Hash `agent:status`，DB 仅写大变更（启动/停止/崩溃）和每 5min 定时同步。
+
+### 3.3 papers — 论文
+
+```sql
 CREATE TABLE papers (
-    id              TEXT PRIMARY KEY,           -- pap-xxx
+    id              TEXT PRIMARY KEY,                    -- doi:{doi} | arxiv:{id} | sha256:{hash}
     user_id         TEXT NOT NULL REFERENCES users(id),
     title           TEXT NOT NULL,
-    authors         JSONB NOT NULL DEFAULT '[]', -- [{name, affiliation, email}]
+    authors         JSONB NOT NULL DEFAULT '[]',
     year            INTEGER,
-    venue           TEXT,                        -- 会议/期刊名
-    venue_type      TEXT,                        -- conference / journal / workshop / preprint
+    venue           TEXT,
+    venue_type      TEXT,                                -- conference | journal | preprint
     doi             TEXT,
     arxiv_id        TEXT,
     abstract        TEXT NOT NULL DEFAULT '',
-    keywords        JSONB NOT NULL DEFAULT '[]', -- [keyword1, keyword2, ...]
-    source          TEXT NOT NULL,               -- arxiv / semanticscholar / cnki / manual
-    source_priority INTEGER NOT NULL DEFAULT 30, -- 保留优先级（§6 去重用）
-    file_path       TEXT,                        -- PDF 文件路径
-    md_path         TEXT,                        -- Markdown 文件路径
-    figures_dir     TEXT,                        -- 图片目录路径
-    metadata        JSONB NOT NULL DEFAULT '{}', -- 灵活扩展元数据
-    citation_count  INTEGER NOT NULL DEFAULT 0,  -- 引用数（从 S2 API）
-    tl_dr           TEXT,                        -- 一句话摘要（LLM 生成）
-    status          TEXT NOT NULL DEFAULT 'ingested', -- searching / downloaded / converting / processing / ingested / active / archived / deleted
-    duplicate_of    TEXT,                        -- 如果是重复版本，指向主记录
-    alternate_versions JSONB DEFAULT '[]',       -- 其他版本的 paper_id 列表
-    -- 以下来自当前生产 schema（保留）
-    method_tags     JSONB DEFAULT '[]',           -- 提取的方法名列表
-    dataset_info    JSONB DEFAULT '{}',           -- 数据集名称和指标
-    code_url        TEXT,                         -- 开源代码链接
-    reading_level   TEXT,                         -- 阅读进度：unread / skimmed / read / intensive
-    digest          TEXT,                         -- 用户笔记/摘要
+    keywords        JSONB NOT NULL DEFAULT '[]',
+    source          TEXT NOT NULL,                       -- arxiv | semanticscholar | upload | manual
+    file_path       TEXT,
+    md_path         TEXT,
+    citation_count  INTEGER NOT NULL DEFAULT 0,
+    tl_dr           TEXT,                                -- 一句话摘要
+    status          TEXT NOT NULL DEFAULT 'ingested',
+    reading_level   TEXT,                                -- unread | skimmed | read | intensive
+    digest          TEXT,                                -- 用户笔记
+    figures         JSONB DEFAULT '[]',                  -- [{caption, page, image_hash, oss_path}]
+    archives        JSONB DEFAULT '{}',                  -- {original_pdf, oss_pdf, file_size, md5}
+    metadata        JSONB NOT NULL DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- 全文搜索索引
-CREATE INDEX idx_papers_title_fts ON papers USING gin(to_tsvector('english', title));
-CREATE INDEX idx_papers_abstract_fts ON papers USING gin(to_tsvector('english', abstract));
 CREATE INDEX idx_papers_user ON papers(user_id);
-CREATE INDEX idx_papers_venue ON papers(venue);
-CREATE INDEX idx_papers_year ON papers(year);
 CREATE INDEX idx_papers_doi ON papers(doi) WHERE doi IS NOT NULL;
-CREATE INDEX idx_papers_arxiv_id ON papers(arxiv_id) WHERE arxiv_id IS NOT NULL;
+CREATE INDEX idx_papers_arxiv ON papers(arxiv_id) WHERE arxiv_id IS NOT NULL;
+CREATE INDEX idx_papers_fts ON papers USING gin(to_tsvector('english', title || ' ' || abstract));
+```
 
--- 项目-论文关联表（N:M）
+### 3.4 projects — 项目
+
+```sql
+CREATE TABLE projects (
+    id              TEXT PRIMARY KEY,                    -- prj-{uuid}
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    name            TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    domain          TEXT NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_projects_user ON projects(user_id);
+```
+
+### 3.5 project_papers — 项目-论文关联 (N:M)
+
+```sql
 CREATE TABLE project_papers (
-    id          TEXT PRIMARY KEY,           -- pp-xxx
-    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    paper_id    TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-    added_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    paper_id        TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (project_id, paper_id)
 );
-
-CREATE INDEX idx_pp_project ON project_papers(project_id);
-CREATE INDEX idx_pp_paper ON project_papers(paper_id);
 ```
 
-### 2.4 引用关系
+### 3.6 paper_chunks — 论文向量切片 (pgvector)
 
 ```sql
-CREATE TABLE citations (
-    id              TEXT PRIMARY KEY,           -- cit-xxx
-    paper_id        TEXT NOT NULL REFERENCES papers(id),
-    cited_paper_id  TEXT REFERENCES papers(id) ON DELETE SET NULL, -- 引用的论文（如果在库内）
-    cited_doi       TEXT,                        -- 引用的论文 DOI（外部文献）
-    cited_title     TEXT,                        -- 引用的论文标题
-    cited_authors   JSONB,
-    cited_year      INTEGER,
-    citation_context TEXT,                       -- 引用上下文（具体引用语句）
-    classification  TEXT DEFAULT 'unknown',      -- supporting / mentioning / disputing
-    confidence      REAL NOT NULL DEFAULT 0.0,   -- 分类置信度（0-1）
-    verified        BOOLEAN NOT NULL DEFAULT false,
-    verified_by     TEXT,                        -- local_db / crossref / arxiv / semantic_scholar
-    verified_at     TIMESTAMPTZ,
+CREATE TABLE paper_chunks (
+    id              TEXT PRIMARY KEY,
+    paper_id        TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    chunk_text      TEXT NOT NULL,
+    chunk_type      TEXT NOT NULL DEFAULT 'body',        -- body | abstract | figure_caption | table
+    section_title   TEXT,
+    chunk_order     INTEGER NOT NULL,
+    embedding       vector(1024),
+    token_count     INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX idx_citations_paper ON citations(paper_id);
-CREATE INDEX idx_citations_cited ON citations(cited_paper_id) WHERE cited_paper_id IS NOT NULL;
+CREATE INDEX idx_chunks_paper ON paper_chunks(paper_id);
+CREATE INDEX idx_chunks_user ON paper_chunks(user_id);
 ```
 
-### 2.5 会话与消息
+### 3.7 captures — 碎片知识（含 embedding，参与统一 RAG 检索）
 
 ```sql
--- 会话表
-CREATE TABLE sessions (
-    id              TEXT PRIMARY KEY,           -- sess-xxx
+CREATE TABLE captures (
+    id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id),
-    agent_id        TEXT NOT NULL,              -- agent-{user_id}
-    thread_id       TEXT NOT NULL,              -- LangGraph thread_id
-    title           TEXT NOT NULL DEFAULT '新会话',
-    status          TEXT NOT NULL DEFAULT 'active', -- active / archived
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    message_count   INTEGER NOT NULL DEFAULT 0,
+    capture_type    TEXT NOT NULL,                       -- web_clip | experiment_note | meeting_note | audio | video
+    title           TEXT NOT NULL,
+    content         TEXT,
+    source_url      TEXT,
+    tags            JSONB NOT NULL DEFAULT '[]',
+    embedding       vector(1024),                       -- 统一 RAG 检索
+    status          TEXT NOT NULL DEFAULT 'active',     -- active | archived | deleted
+    metadata        JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX idx_sessions_user_thread ON sessions(user_id, thread_id);
-
--- WebSocket 消息表
-CREATE TABLE ws_messages (
-    id              TEXT PRIMARY KEY,           -- msg-xxx
-    session_id      TEXT NOT NULL REFERENCES sessions(id),
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    seq             INTEGER NOT NULL,           -- 会话内递增序列号（消息排序）
-    direction       TEXT NOT NULL,              -- inbound / outbound
-    msg_type        TEXT NOT NULL,              -- user/message / message/text / sub_agent/progress / ...
-    subtype         TEXT,                       -- 消息子类型
-    payload         JSONB NOT NULL DEFAULT '{}',
-    priority_kind   TEXT NOT NULL DEFAULT 'normal', -- normal / alert / progress
-    is_delivered    BOOLEAN NOT NULL DEFAULT false,
-    is_replay       BOOLEAN NOT NULL DEFAULT false, -- 是否回放消息
-    msg_id          TEXT,                       -- 客户端去重 ID
-    correlation_id  TEXT,                       -- 请求-响应对应 ID
-    delivered_at    TIMESTAMPTZ,
-    delivered_sessions TEXT[],                   -- 已送达的 session 列表
-    apns_sent_at    TIMESTAMPTZ,                -- iOS APNs 推送时间
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_ws_session ON ws_messages(session_id);
-CREATE INDEX idx_ws_user ON ws_messages(user_id);
-CREATE INDEX idx_ws_created ON ws_messages(created_at);
-CREATE INDEX idx_ws_session_seq ON ws_messages(session_id, seq);
-
--- 会话摘要归档（LangGraph Store episodes）
-CREATE TABLE conversation_archive (
-    id              TEXT PRIMARY KEY,           -- arch-xxx
-    session_id      TEXT NOT NULL REFERENCES sessions(id),
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    summary_text    TEXT NOT NULL,
-    summary_type    TEXT NOT NULL DEFAULT 'rolling', -- rolling / topic / final
-    start_msg_id    TEXT,
-    end_msg_id      TEXT,
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_conv_archive_session ON conversation_archive(session_id);
+CREATE INDEX idx_captures_user ON captures(user_id);
+CREATE INDEX idx_captures_type ON captures(user_id, capture_type);
+CREATE INDEX idx_captures_fts ON captures USING gin(to_tsvector('english', coalesce(title,'') || ' ' || coalesce(content,'')));
 ```
 
-### 2.6 Agent 任务
-
-```sql
-CREATE TABLE agent_tasks (
-    id              TEXT PRIMARY KEY,           -- task-xxx
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    mode            TEXT NOT NULL DEFAULT 'full_ingest', -- screening / full_ingest / rag_query / survey
-    name            TEXT NOT NULL DEFAULT '',    -- 任务名称（用户可读）
-    agent_name      TEXT NOT NULL,              -- LiteratureAgent / KnowledgeAgent / ...
-    task_kind       TEXT NOT NULL,              -- search / download / convert / chunk / embed / verify
-    celery_task_id  TEXT,                       -- Celery 异步任务 ID
-    status          TEXT NOT NULL DEFAULT 'pending', -- pending / running / done / failed
-    progress        JSONB DEFAULT '{}',          -- {stage, current, total, details}
-    arguments       JSONB NOT NULL DEFAULT '{}',
-    result          JSONB,
-    error_message   TEXT,
-    started_at      TIMESTAMPTZ,
-    completed_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_tasks_user ON agent_tasks(user_id);
-CREATE INDEX idx_tasks_status ON agent_tasks(status);
-CREATE INDEX idx_tasks_agent ON agent_tasks(agent_name);
-
--- 任务步骤明细
-CREATE TABLE task_steps (
-    id              TEXT PRIMARY KEY,           -- step-xxx
-    task_id         TEXT NOT NULL REFERENCES agent_tasks(id),
-    step_order      INTEGER NOT NULL,
-    step_name       TEXT NOT NULL,              -- search / evaluate / download / convert / chunk / embed
-    status          TEXT NOT NULL DEFAULT 'pending',
-    detail          JSONB DEFAULT '{}',          -- {papers_processed, errors, duration_ms}
-    started_at      TIMESTAMPTZ,
-    completed_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_steps_task ON task_steps(task_id);
-```
-
-### 2.7 术语词表
+### 3.8 glossary_terms — 术语库（含 embedding）
 
 ```sql
 CREATE TABLE glossary_terms (
-    id              TEXT PRIMARY KEY,           -- gl-xxx
+    id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id),
-    en_term         TEXT NOT NULL,               -- adversarial attack
-    zh_term         TEXT NOT NULL,               -- 对抗攻击
-    variants        JSONB NOT NULL DEFAULT '[]', -- ["adversarial perturbation", "对抗扰动"]
-    domain          TEXT NOT NULL DEFAULT '',     -- computer_vision / nlp / ...
-    source_paper_ids JSONB NOT NULL DEFAULT '[]',-- 来源于哪些论文
-    tf              REAL NOT NULL DEFAULT 0.0,   -- 归一化词频（跨文章平均）
-    df              INTEGER NOT NULL DEFAULT 0,  -- 文档频率
-    cross_doc_score REAL NOT NULL DEFAULT 0.0,   -- 跨文档加权分
-    llm_confidence  REAL NOT NULL DEFAULT 0.0,   -- LLM 审核置信度
+    en_term         TEXT NOT NULL,
+    zh_term         TEXT NOT NULL,
+    variants        JSONB NOT NULL DEFAULT '[]',
+    domain          TEXT NOT NULL DEFAULT '',
+    df              INTEGER NOT NULL DEFAULT 0,          -- 文档频率
     user_verified   BOOLEAN NOT NULL DEFAULT false,
-    last_seen_at    TIMESTAMPTZ,                 -- 最近在文献中出现的时间
-    usage_count     INTEGER NOT NULL DEFAULT 0,
+    embedding       vector(1024),                       -- 术语语义向量
+    last_seen_at    TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (user_id, en_term, zh_term)
 );
-
 CREATE INDEX idx_glossary_user ON glossary_terms(user_id);
 CREATE INDEX idx_glossary_domain ON glossary_terms(user_id, domain);
-CREATE INDEX idx_glossary_en ON glossary_terms(en_term);
+CREATE INDEX idx_glossary_fts ON glossary_terms USING gin(to_tsvector('english', en_term));
 ```
 
-### 2.8 写作模板
+### 3.9 journal_ranks — 期刊/会议分级缓存
 
 ```sql
-CREATE TABLE writing_templates (
-    id              TEXT PRIMARY KEY,           -- tpl-xxx
-    user_id         TEXT,                        -- NULL = 系统预置模板，非 NULL = 用户自定义
-    name            TEXT NOT NULL,               -- "CVPR Related Work"
-    venue           TEXT,                        -- cvpr / iccv / neurips / acl / ...
-    domain          TEXT NOT NULL DEFAULT '',     -- computer_vision / nlp / system / ...（按领域过滤模板）
-    section_type    TEXT NOT NULL,               -- related_work / method / introduction / abstract
-    structure_json  JSONB NOT NULL,              -- 结构骨架（填空模板）
-    sample_text     TEXT,                        -- 示例文本
-    source_paper_ids JSONB DEFAULT '[]',         -- 参考的模范论文
-    is_system       BOOLEAN NOT NULL DEFAULT false,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_templates_venue ON writing_templates(venue);
-CREATE INDEX idx_templates_user ON writing_templates(user_id) WHERE user_id IS NOT NULL;
-```
-
-### 2.9 外部验证缓存
-
-```sql
--- 外部引用验证结果缓存
-CREATE TABLE external_validations (
-    id              TEXT PRIMARY KEY,           -- ev-xxx
-    identifier_type TEXT NOT NULL,               -- doi / arxiv_id / title
-    identifier      TEXT NOT NULL,
-    validation_result JSONB NOT NULL,            -- {exists, title, authors, year, venue, doi}
-    validated_by    TEXT NOT NULL,               -- crossref / arxiv / semantic_scholar
-    validated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at      TIMESTAMPTZ NOT NULL,        -- 30 天后过期
-    UNIQUE (identifier_type, identifier)
-);
-
-CREATE INDEX idx_ev_expires ON external_validations(expires_at);
-```
-
-### 2.10 反幻觉事件
-
-```sql
--- 幻觉检测事件记录（用于评估和改进）
-CREATE TABLE hallucination_events (
-    id              TEXT PRIMARY KEY,           -- he-xxx
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    session_id      TEXT NOT NULL REFERENCES sessions(id),
-    citation_id     TEXT,                        -- 关联的 citation ID
-    event_type      TEXT NOT NULL,               -- false_citation / claim_mismatch / fabricated_doi / ...
-    llm_output      TEXT NOT NULL,               -- LLM 原始输出
-    expected_output TEXT,                        -- 期望的正确输出
-    verified_result JSONB NOT NULL,              -- 验证结果
-    action_taken    TEXT NOT NULL,               -- keep / flag / delete / revise / reject
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_he_user ON hallucination_events(user_id);
-CREATE INDEX idx_he_type ON hallucination_events(event_type);
-CREATE INDEX idx_he_created ON hallucination_events(created_at);
-```
-
-### 2.11 基础设施
-
-```sql
--- 搜索日志
-CREATE TABLE search_logs (
-    id              TEXT PRIMARY KEY,           -- slog-xxx
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    query           TEXT NOT NULL,
-    source          TEXT NOT NULL,               -- arxiv / semanticscholar / cnki / ...
-    result_count    INTEGER NOT NULL DEFAULT 0,
-    duration_ms     INTEGER,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_search_user ON search_logs(user_id);
-CREATE INDEX idx_search_created ON search_logs(created_at);
-
--- 期刊/会议分级缓存
 CREATE TABLE journal_ranks (
-    id              TEXT PRIMARY KEY,           -- jr-xxx
-    venue           TEXT NOT NULL UNIQUE,        -- 会议/期刊名
-    rank            TEXT NOT NULL,               -- CCF-A / CCF-B / CCF-C / SCI-1 / ...
-    source          TEXT NOT NULL,               -- ccf / sci / custom
-    year            INTEGER,                     -- 评级年份
+    id              TEXT PRIMARY KEY,
+    venue           TEXT NOT NULL UNIQUE,
+    rank            TEXT NOT NULL,                       -- CCF-A | CCF-B | CCF-C | SCI-1 | SCI-2
+    source          TEXT NOT NULL,                       -- ccf | sci | custom
+    year            INTEGER,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
--- 视频解析结果（由 Capture Agent 管理，将一次性迁移到 captures 表）
-CREATE TABLE videos (
-    id              TEXT PRIMARY KEY,           -- vid-xxx
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    url             TEXT NOT NULL,
-    platform        TEXT,                        -- youtube / bilibili / 抖音 / ...
-    title           TEXT,
-    duration_sec    INTEGER,
-    transcript      TEXT,                        -- ASR 转写全文
-    summary         TEXT,                        -- LLM 摘要
-    keywords        JSONB DEFAULT '[]',
-    status          TEXT NOT NULL DEFAULT 'pending',
-    metadata        JSONB DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_videos_user ON videos(user_id);
 ```
 
-### 2.12 碎片知识采集（Capture Agent）[新增]
+### 3.10 sessions — 会话
 
 ```sql
--- 碎片知识表（网页、实验记录、会议笔记、音视频等）
-CREATE TABLE captures (
-    id              TEXT PRIMARY KEY,           -- cap-xxx
+CREATE TABLE sessions (
+    id              TEXT PRIMARY KEY,                    -- sess-{uuid}
     user_id         TEXT NOT NULL REFERENCES users(id),
-    capture_type    TEXT NOT NULL,               -- web_clip / experiment_note / meeting_note / audio / video
-    title           TEXT NOT NULL,
-    content         TEXT,                         -- 文本内容 / 摘要
-    source_url      TEXT,                         -- 来源 URL（web_clip 时）
-    tags            JSONB NOT NULL DEFAULT '[]',
-    transcript      TEXT,                         -- ASR 转写文本（audio/video 时由 Capture Agent 生成）
-    summary         TEXT,                         -- LLM 摘要
-    keywords        JSONB DEFAULT '[]',
-    embedding       vector(1024),                -- 可选语义检索（与知识库统一检索）
-    status          TEXT NOT NULL DEFAULT 'active', -- active / archived / deleted
-    metadata        JSONB DEFAULT '{}',
+    agent_id        TEXT NOT NULL,
+    thread_id       TEXT NOT NULL,                       -- LangGraph thread_id
+    title           TEXT NOT NULL DEFAULT '新会话',
+    status          TEXT NOT NULL DEFAULT 'active',     -- active | archived
+    document_id     TEXT REFERENCES documents(id),       -- 绑定的写作文档
+    summary         JSONB DEFAULT '{}',                  -- {rolling_summary, topic_tags}
+    metadata        JSONB NOT NULL DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX idx_captures_user ON captures(user_id);
-CREATE INDEX idx_captures_type ON captures(user_id, capture_type);
-CREATE INDEX idx_captures_created ON captures(created_at);
+CREATE INDEX idx_sessions_user ON sessions(user_id);
+CREATE INDEX idx_sessions_thread ON sessions(user_id, thread_id);
 ```
 
-### 2.13 订阅
+### 3.11 ws_messages — WebSocket 消息（Outbox 持久化）
+
+```sql
+CREATE TABLE ws_messages (
+    id              TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL REFERENCES sessions(id),
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    seq             INTEGER NOT NULL,
+    direction       TEXT NOT NULL,                       -- inbound | outbound
+    msg_type        TEXT NOT NULL,
+    subtype         TEXT,
+    payload         JSONB NOT NULL DEFAULT '{}',
+    priority        TEXT NOT NULL DEFAULT 'normal',      -- silent | normal | high | urgent
+    msg_id          TEXT,
+    correlation_id  TEXT,
+    is_delivered    BOOLEAN NOT NULL DEFAULT false,
+    delivered_at    TIMESTAMPTZ,
+    apns_sent_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_ws_session ON ws_messages(session_id, created_at);
+CREATE INDEX idx_ws_user ON ws_messages(user_id, created_at DESC);
+
+-- 去重：同一 session 的 tool_call_id 只保留最新状态
+CREATE UNIQUE INDEX idx_ws_tool_dedup
+    ON ws_messages (session_id, (payload->>'tool_call_id'))
+    WHERE msg_type = 'tool' AND payload->>'tool_call_id' IS NOT NULL;
+
+-- 去重：同一 session 的 plan_id 只保留最新 plan_todo_update
+CREATE UNIQUE INDEX idx_ws_plan_dedup
+    ON ws_messages (session_id, (payload->>'plan_id'))
+    WHERE msg_type = 'plan_todo_update' AND payload->>'plan_id' IS NOT NULL;
+```
+
+### 3.12 documents — 文档（含版本历史 JSONB）
+
+```sql
+CREATE TABLE documents (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    title           TEXT NOT NULL,
+    file_path       TEXT NOT NULL,
+    is_auto_review  BOOLEAN DEFAULT FALSE,
+    versions        JSONB DEFAULT '[]',                  -- [{version_number, content, trigger, session_id, created_at}]
+    current_version INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_documents_user ON documents(user_id, updated_at DESC);
+```
+
+> 版本管理：`manual_commit` 立即持久化；`ai_turn`/`auto_save` 每 5s 最多写一次。版本数 > 200 时自动清理旧版本，保留最近 50 条。
+
+### 3.13 user_preferences — 用户偏好
+
+```sql
+CREATE TABLE user_preferences (
+    user_id         TEXT PRIMARY KEY REFERENCES users(id),
+    research_domain TEXT DEFAULT '',
+    writing_style   TEXT DEFAULT 'APA',
+    language_pref   TEXT DEFAULT 'zh',
+    mentor_quotes   TEXT DEFAULT '',
+    other           JSONB DEFAULT '{}',                  -- {writing_templates, config, ...}
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 3.14 subscriptions — 订阅（含结果 JSONB）
 
 ```sql
 CREATE TABLE subscriptions (
-    id              TEXT PRIMARY KEY,           -- sub-xxx
+    id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id),
-    query           TEXT NOT NULL,               -- 搜索 query
-    source          TEXT NOT NULL DEFAULT 'arxiv',
-    frequency       TEXT NOT NULL DEFAULT 'daily', -- daily / weekly
-    max_papers_per_check INTEGER NOT NULL DEFAULT 20, -- 每次检查最多推送论文数
+    name            TEXT NOT NULL,
+    query           TEXT NOT NULL,
+    sources         JSONB NOT NULL DEFAULT '["arxiv"]',
+    frequency       TEXT NOT NULL DEFAULT 'daily',
+    max_papers      INTEGER NOT NULL DEFAULT 20,
     is_active       BOOLEAN NOT NULL DEFAULT true,
+    results         JSONB DEFAULT '[]',                  -- [{paper_id, title, doi, is_new, created_at}]
     last_checked_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE subscription_results (
-    id              TEXT PRIMARY KEY,           -- sr-xxx
-    subscription_id TEXT NOT NULL REFERENCES subscriptions(id) ON DELETE CASCADE,
-    paper_id        TEXT,
-    paper_title     TEXT,
-    paper_doi       TEXT,
-    is_new          BOOLEAN NOT NULL DEFAULT true,
-    notified        BOOLEAN NOT NULL DEFAULT false,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_sub_results_sub ON subscription_results(subscription_id);
+CREATE INDEX idx_subscriptions_user ON subscriptions(user_id, is_active);
 ```
 
-### 2.14 Agent 事件
+> results 保留最近 50 条在 JSONB 内，历史结果写入 `event_logs`。
+
+### 3.15 share_requests — 细粒度共享
 
 ```sql
--- Agent 事件（Checkpoint 准备，Phase 4）
-CREATE TABLE agent_events (
-    id              TEXT PRIMARY KEY,           -- ev-xxx
+CREATE TABLE share_requests (
+    id              TEXT PRIMARY KEY,
+    from_user_id    TEXT NOT NULL REFERENCES users(id),
+    to_user_id      TEXT NOT NULL REFERENCES users(id),
+    resource_type   TEXT NOT NULL,                       -- paper | document | knowledge_chunk
+    resource_id     TEXT NOT NULL,
+    message         TEXT DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',     -- pending | accepted | rejected
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_share_from ON share_requests(from_user_id);
+CREATE INDEX idx_share_to ON share_requests(to_user_id);
+```
+
+### 3.16 hallucination_events — 反幻觉审计
+
+```sql
+CREATE TABLE hallucination_events (
+    id              TEXT PRIMARY KEY,
     user_id         TEXT NOT NULL REFERENCES users(id),
-    agent_id        TEXT NOT NULL,
-    event_type      TEXT NOT NULL,
-    payload         JSONB NOT NULL DEFAULT '{}',
+    session_id      TEXT,
+    event_type      TEXT NOT NULL,                       -- false_citation | claim_mismatch | fabricated_doi
+    llm_output      TEXT NOT NULL,
+    expected_output TEXT,
+    verified_result JSONB NOT NULL DEFAULT '{}',
+    action_taken    TEXT NOT NULL,                       -- keep | flag | delete | revise | reject
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE INDEX idx_ae_agent ON agent_events(agent_id);
-CREATE INDEX idx_ae_created ON agent_events(created_at);
+CREATE INDEX idx_he_user ON hallucination_events(user_id, created_at DESC);
+CREATE INDEX idx_he_type ON hallucination_events(event_type);
 ```
+
+### 3.17 event_logs — 通用事件日志
+
+```sql
+-- 合并: search_logs + rag_traces + agent_events + external_validations
+CREATE TABLE event_logs (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    session_id      TEXT,
+    event_type      TEXT NOT NULL,                       -- search | rag | agent_start | agent_end | tool_call | tool_result | summary_generated | external_validation
+    payload         JSONB NOT NULL DEFAULT '{}',         -- 按 event_type 存储不同字段
+    duration_ms     INTEGER,
+    error_text      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_el_user ON event_logs(user_id, created_at DESC);
+CREATE INDEX idx_el_type ON event_logs(event_type);
+```
+
+### 3.18 _schema_meta — Embedding 元数据
+
+```sql
+CREATE TABLE _schema_meta (
+    key     TEXT PRIMARY KEY,
+    value   JSONB NOT NULL
+);
+
+INSERT INTO _schema_meta (key, value) VALUES
+    ('embedding', '{"model": "doubao-embedding", "dim": 1024, "provider": "volcano"}'),
+    ('version', '{"schema": "4.1", "applied_at": "2026-07-18"}')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+```
+
+> 所有 `vector(1024)` 列必须在迁移时与 `_schema_meta.embedding.dim` 一致。换模型时先 CHECK 维度，不一致则 ALTER COLUMN + 重建索引。
 
 ---
 
-## 3. pgvector 向量存储设计
+## 4. pgvector 向量索引设计
 
-### 3.1 架构概览
+### 4.1 HNSW 索引（3 个）
 
-使用 PostgreSQL `pgvector` 扩展，在同一数据库实例中管理向量，消除 ChromaDB 的外部依赖：
-
-```
-PostgreSQL
-├── 业务表 (Section 2)
-├── pgvector 扩展
-│   ├── paper_chunks          # 论文语义切片
-│   ├── glossary_embeddings   # 术语 embedding
-│   ├── topic_embeddings      # 主题摘要
-│   └── session_summaries     # 会话摘要
-└── 事务一致性：业务表 JOIN 向量表在同一事务中
-```
-
-### 3.2 论文切片向量表
+| 表 | 索引 | 参数 | 查询场景 |
+|------|------|------|------|
+| `paper_chunks` | `idx_chunks_embedding_hnsw` | m=16, ef_construction=200 | RAG 论文语义检索 |
+| `captures` | `idx_captures_embedding_hnsw` | m=16, ef_construction=200 | 碎片知识语义检索 |
+| `glossary_terms` | `idx_glossary_embedding_hnsw` | m=12, ef_construction=100 | 术语模糊匹配（数据量小） |
 
 ```sql
--- 启用 pgvector
-CREATE EXTENSION IF NOT EXISTS vector;
+-- paper_chunks (最大数据量)
+CREATE INDEX idx_chunks_embedding_hnsw ON paper_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
 
--- 论文切片表
-CREATE TABLE paper_chunks (
-    id              TEXT PRIMARY KEY,           -- chk-xxx
-    paper_id        TEXT NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    
-    -- 内容
-    chunk_text      TEXT NOT NULL,               -- 切片原始文本
-    chunk_type      TEXT NOT NULL DEFAULT 'body', -- body / abstract / figure_caption / table
-    section_title   TEXT,                         -- 所属 section 标题
-    section_level   INTEGER,                     -- heading 层级（2=##, 3=###）
-    chunk_order     INTEGER NOT NULL,            -- 在论文中的顺序
-    
-    -- 向量（embedding 维度取决于模型，此处以 1024 为例）
-    embedding       vector(1024),                -- doubao-embedding / bge-large-zh 等
-    
-    -- 元数据
-    token_count     INTEGER,
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+-- captures（中等数据量）
+CREATE INDEX idx_captures_embedding_hnsw ON captures
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 200);
 
--- 向量索引（IVFFlat：适合 < 100万 条数据；HNSW：适合更大规模）
-CREATE INDEX idx_chunks_embedding_ivf 
-    ON paper_chunks 
-    USING ivfflat (embedding vector_cosine_ops) 
-    WITH (lists = 100);
+-- glossary_terms（最小数据量）
+CREATE INDEX idx_glossary_embedding_hnsw ON glossary_terms
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 12, ef_construction = 100);
+```
 
--- 可切换为 HNSW 以获得更好的查询性能
--- CREATE INDEX idx_chunks_embedding_hnsw 
---     ON paper_chunks 
---     USING hnsw (embedding vector_cosine_ops);
+**查询时动态设置 ef_search**：
 
--- 业务索引
-CREATE INDEX idx_chunks_paper ON paper_chunks(paper_id);
-CREATE INDEX idx_chunks_user ON paper_chunks(user_id);
-CREATE INDEX idx_chunks_type ON paper_chunks(chunk_type);
+```sql
+-- 查询前设置探针深度（越大精度越高、越慢）
+SET hnsw.ef_search = 50;   -- glossary
+SET hnsw.ef_search = 100;  -- captures
+SET hnsw.ef_search = 200;  -- paper_chunks
+```
 
--- 向量检索函数（注意：WHERE 子句使用裸距离比较以利用 IVFFlat/HNSW 索引）
-CREATE OR REPLACE FUNCTION search_paper_chunks(
+### 4.2 统一 RAG 检索函数（paper_chunks + captures）
+
+```sql
+CREATE OR REPLACE FUNCTION search_unified(
     query_embedding vector(1024),
     p_user_id TEXT,
     match_count INT DEFAULT 10,
     similarity_threshold REAL DEFAULT 0.5
 ) RETURNS TABLE (
-    chunk_id TEXT,
-    paper_id TEXT,
-    chunk_text TEXT,
-    section_title TEXT,
-    similarity REAL
+    source      TEXT,
+    chunk_id    TEXT,
+    content     TEXT,
+    title       TEXT,
+    similarity  REAL
 ) AS $$
-DECLARE
-    max_distance REAL := 1.0 - similarity_threshold;
 BEGIN
     RETURN QUERY
-    SELECT 
-        pc.id,
-        pc.paper_id,
-        pc.chunk_text,
-        pc.section_title,
-        1 - (pc.embedding <=> query_embedding) AS similarity
+    SELECT 'paper'::TEXT, pc.id, pc.chunk_text, p.title,
+           1 - (pc.embedding <=> query_embedding) AS similarity
     FROM paper_chunks pc
+    JOIN papers p ON pc.paper_id = p.id
     WHERE pc.user_id = p_user_id
-        AND pc.embedding <=> query_embedding < max_distance  -- 裸距离比较，走 IVFFlat/HNSW 索引
-    ORDER BY pc.embedding <=> query_embedding
+      AND pc.embedding <=> query_embedding < (1.0 - similarity_threshold)
+    UNION ALL
+    SELECT 'capture'::TEXT, c.id, c.content, c.title,
+           1 - (c.embedding <=> query_embedding) AS similarity
+    FROM captures c
+    WHERE c.user_id = p_user_id
+      AND c.status = 'active'
+      AND c.embedding <=> query_embedding < (1.0 - similarity_threshold)
+    ORDER BY similarity DESC
     LIMIT match_count;
 END;
 $$ LANGUAGE plpgsql;
 ```
 
-### 3.3 术语词表向量表
+### 4.3 术语检索函数
 
 ```sql
-CREATE TABLE glossary_embeddings (
-    id              TEXT PRIMARY KEY,           -- gle-xxx
-    glossary_term_id TEXT NOT NULL REFERENCES glossary_terms(id) ON DELETE CASCADE,
-    -- 注：无需 user_id（通过 glossary_term_id → glossary_terms 获取），避免冗余不一致
-    -- 向量化内容：中英文术语拼接
-    term_text       TEXT NOT NULL,               -- "adversarial attack 对抗攻击"
-    embedding       vector(1024),
-    
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_gle_embedding_ivf 
-    ON glossary_embeddings 
-    USING ivfflat (embedding vector_cosine_ops) 
-    WITH (lists = 50);
-
--- 模糊术语匹配函数（加入 glossary_terms 表以获取 user_id）
-CREATE OR REPLACE FUNCTION search_glossary(
-    query_text TEXT,
+CREATE OR REPLACE FUNCTION search_terms(
     query_embedding vector(1024),
     p_user_id TEXT,
     match_count INT DEFAULT 5
@@ -708,296 +515,181 @@ CREATE OR REPLACE FUNCTION search_glossary(
 ) AS $$
 BEGIN
     RETURN QUERY
-    SELECT 
-        gt.id,
-        gt.en_term,
-        gt.zh_term,
-        1 - (ge.embedding <=> query_embedding) AS similarity
-    FROM glossary_embeddings ge
-    JOIN glossary_terms gt ON ge.glossary_term_id = gt.id
-    WHERE gt.user_id = p_user_id        -- user_id 通过 JOIN glossary_terms 获取
-    ORDER BY ge.embedding <=> query_embedding
+    SELECT gt.id, gt.en_term, gt.zh_term,
+           1 - (gt.embedding <=> query_embedding) AS similarity
+    FROM glossary_terms gt
+    WHERE gt.user_id = p_user_id
+    ORDER BY gt.embedding <=> query_embedding
     LIMIT match_count;
 END;
 $$ LANGUAGE plpgsql;
 ```
 
-### 3.4 会话与主题摘要向量表
-
-```sql
--- 会话摘要（LangGraph Store episodes 对应表）
-CREATE TABLE session_summaries (
-    id              TEXT PRIMARY KEY,           -- ssum-xxx
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    session_id      TEXT NOT NULL REFERENCES sessions(id),
-    
-    summary_text    TEXT NOT NULL,
-    summary_type    TEXT NOT NULL,              -- rolling / topic / final
-    embedding       vector(1024),
-    
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_ssum_user ON session_summaries(user_id);
-CREATE INDEX idx_ssum_session ON session_summaries(session_id);
-
--- 研究方向主题摘要
-CREATE TABLE topic_embeddings (
-    id              TEXT PRIMARY KEY,           -- top-xxx
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    
-    topic_name      TEXT NOT NULL,
-    description     TEXT NOT NULL,
-    embedding       vector(1024),
-    
-    paper_count     INTEGER NOT NULL DEFAULT 0,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_topic_user ON topic_embeddings(user_id);
-```
-
-### 3.5 向量检索 SQL 示例
-
-> **注意**：`vector(1024)` 维度硬编码依赖当前 embedding 模型（doubao / bge-large-zh 均为 1024 维）。
-> 如更换模型（如 text-embedding-3-large 为 3072 维），需 `ALTER TABLE ... ALTER COLUMN embedding TYPE vector(3072)` 并重建索引。
-
-```sql
--- RAG 检索：根据用户查询找到最相关的论文 chunk
-SELECT pc.chunk_text, pc.section_title, p.title,
-       1 - (pc.embedding <=> $query_embedding) AS similarity
-FROM paper_chunks pc
-JOIN papers p ON pc.paper_id = p.id
-WHERE pc.user_id = $user_id
-  AND 1 - (pc.embedding <=> $query_embedding) > 0.5
-ORDER BY pc.embedding <=> $query_embedding
-LIMIT 10;
-
--- 跨语言检索：中文 query embedding → 英文论文 chunk
-SELECT pc.chunk_text, p.title, p.year,
-       1 - (pc.embedding <=> $zh_query_embedding) AS similarity
-FROM paper_chunks pc
-JOIN papers p ON pc.paper_id = p.id
-WHERE pc.user_id = $user_id
-ORDER BY pc.embedding <=> $zh_query_embedding
-LIMIT 20;
-
--- 术语模糊匹配
-SELECT gt.en_term, gt.zh_term,
-       1 - (ge.embedding <=> $term_embedding) AS similarity
-FROM glossary_embeddings ge
-JOIN glossary_terms gt ON ge.glossary_term_id = gt.id
-WHERE ge.user_id = $user_id
-  AND 1 - (ge.embedding <=> $term_embedding) > 0.7
-ORDER BY ge.embedding <=> $term_embedding
-LIMIT 5;
-
--- 混合检索：向量 + 全文搜索
-SELECT pc.chunk_text, p.title,
-       1 - (pc.embedding <=> $query_embedding) AS vec_similarity,
-       ts_rank(to_tsvector('english', pc.chunk_text), plainto_tsquery('english', $query_text)) AS text_rank
-FROM paper_chunks pc
-JOIN papers p ON pc.paper_id = p.id
-WHERE pc.user_id = $user_id
-  AND (
-    1 - (pc.embedding <=> $query_embedding) > 0.4
-    OR to_tsvector('english', pc.chunk_text) @@ plainto_tsquery('english', $query_text)
-  )
-ORDER BY (vec_similarity * 0.7 + text_rank * 0.3) DESC
-LIMIT 10;
-```
-
----
-
-## 4. Redis 数据结构
-
-### 4.1 Key 设计规范
-
-```
-{namespace}:{subsystem}:{identifier}
-```
-
-### 4.2 消息与通信
-
-| Key | 类型 | 用途 | TTL |
-|-----|------|------|-----|
-| `outbox:{user_id}` | List | 出站消息队列（BRPOP 消费） | 无 |
-| `agent:reports:{task_id}` | Pub/Sub Channel | 子 Agent → Main Agent 状态上报 | 无 |
-| `ws:connections:{user_id}` | Set | WebSocket 连接 ID 集合 | 无 |
-| `ws:session:{session_id}` | Hash | 当前在线 session→ws 映射 | 随连接断开 |
-
-### 4.3 缓存
-
-| Key | 类型 | 用途 | TTL |
-|-----|------|------|-----|
-| `glossary:hot:{user_id}:{domain}` | Sorted Set | 热点术语（按 usage_count） | 1h |
-| `glossary:user:{user_id}` | Hash | 用户术语词表摘要 | 1h |
-| `rag:cache:{query_hash}` | String (JSON) | LLM 回答缓存 | 1h |
-| `external:validation:{doi}` | String (JSON) | 外部验证结果缓存 | 30d |
-
-### 4.4 限流与锁
-
-| Key | 类型 | 用途 | TTL |
-|-----|------|------|-----|
-| `rate:{user_id}:{endpoint}` | String | 请求计数 | 1min |
-| `lock:ingest:{paper_id}` | String | 防重复入库锁 | 10min |
-| `lock:glossary:collect:{user_id}` | String | 术语收集防并发 | 5min |
-
-### 4.5 并行子 Agent 调度 [新增]
-
-| Key | 类型 | 用途 | TTL |
-|-----|------|------|-----|
-| `agent:context:pool:{session_id}` | Hash | 共享上下文池（子 Agent 间传递搜索结果/用户意图/术语列表） | 随 session 生命周期 |
-| `agent:parallel:group:{group_id}` | Hash | 并行组状态追踪（`{agent_id: status, ...}`） | 1h |
-| `agent:parallel:results:{group_id}` | List | 并行子 Agent 结果收集 | 1h |
-
-### 4.6 Celery 任务
-
-| Key | 类型 | 用途 | TTL |
-|-----|------|------|-----|
-| `celery:task:{celery_task_id}` | String (JSON) | Celery 任务状态缓存 | 1h |
-| `celery:beat:last_run:{task_name}` | String | Beat 上次执行时间 | 永久 |
-
 ---
 
 ## 5. 索引策略
 
-### 5.1 必须索引（P0）
+### 5.1 向量索引（HNSW × 3）
 
-| 表 | 索引 | 类型 | 原因 |
-|----|------|------|------|
-| papers | `user_id` | B-tree | 多用户隔离查询入口 |
-| papers | `title` (FTS) | GIN | 标题全文搜索 |
-| paper_chunks | `paper_id` | B-tree | chunk→paper 关联 |
-| paper_chunks | `embedding` | IVFFlat/HNSW | 向量检索 |
-| glossary_terms | `(user_id, en_term, zh_term)` | UNIQUE | 去重 |
-| glossary_terms | `(user_id, domain)` | B-tree | 按领域查询术语 |
-| glossary_embeddings | `embedding` | IVFFlat | 术语模糊检索 |
-| sessions | `(user_id, thread_id)` | B-tree | 会话恢复（复合索引） |
-| ws_messages | `(session_id, created_at)` | B-tree | 消息历史查询 |
-| agent_tasks | `(user_id, status)` | B-tree | 用户任务列表 |
+| 表 | 索引名 | 参数 |
+|------|------|------|
+| paper_chunks | idx_chunks_embedding_hnsw | m=16, ef_construction=200 |
+| captures | idx_captures_embedding_hnsw | m=16, ef_construction=200 |
+| glossary_terms | idx_glossary_embedding_hnsw | m=12, ef_construction=100 |
 
-### 5.2 推荐索引（P1）
+### 5.2 单列索引（Single-key B-tree × 7）
 
-| 表 | 索引 | 类型 | 原因 |
-|----|------|------|------|
-| papers | `doi` (partial) | B-tree | 外部引用快速查重 |
-| papers | `arxiv_id` (partial) | B-tree | 同上 |
-| papers | `(venue, year)` | B-tree | 按会议/年份筛选 |
-| citations | `paper_id` | B-tree | 论文→引用关系 |
-| search_logs | `created_at` | B-tree | 周度统计 |
+| 表 | 索引 | 查询场景 |
+|------|------|------|
+| agents | idx_agents_user (user_id) | API `/agents/me` |
+| agents | idx_agents_active (user_id, is_active) | Supervisor 扫描 |
+| projects | idx_projects_user (user_id) | 用户项目列表 |
+| sessions | idx_sessions_user (user_id) | 用户会话列表 |
+| paper_chunks | idx_chunks_paper (paper_id) | 论文→切片 |
+| paper_chunks | idx_chunks_user (user_id) | 用户隔离 |
+| papers | idx_papers_user (user_id) | 用户论文列表 |
 
-### 5.3 pgvector 索引选择
+### 5.3 复合索引（Multi-key B-tree × 15）
 
-| 场景 | 推荐索引 | 参数 | 说明 |
-|------|----------|------|------|
-| 开发/测试 (< 10万向量) | IVFFlat | lists = 行数 / 1000 | 构建快，查询可接受 |
-| 生产 (10万 - 100万) | IVFFlat | lists = 行数 / 1000 | 稳定可靠 |
-| 大规模 (> 100万) | HNSW | m=16, ef_construction=200 | 查询更快，构建更慢 |
+| 表 | 索引 | 列 | 查询场景 |
+|------|------|------|------|
+| users | idx_users_username | username (UNIQUE) | 登录 |
+| papers | idx_papers_doi | doi (partial) | DOI 查重 |
+| papers | idx_papers_arxiv | arxiv_id (partial) | arXiv 查重 |
+| project_papers | pk_project_paper | project_id, paper_id (UNIQUE) | 去重+关联 |
+| sessions | idx_sessions_thread | user_id, thread_id | LangGraph 恢复 |
+| ws_messages | idx_ws_session | session_id, created_at | 离线消息 |
+| ws_messages | idx_ws_user | user_id, created_at DESC | 审计 |
+| ws_messages | idx_ws_tool_dedup | session_id + payload tool_call_id (partial UNIQUE) | 去重 |
+| ws_messages | idx_ws_plan_dedup | session_id + payload plan_id (partial UNIQUE) | 去重 |
+| captures | idx_captures_type | user_id, capture_type | 按类型筛选 |
+| glossary_terms | idx_glossary_domain | user_id, domain | 按领域查术语 |
+| glossary_terms | idx_glossary_term | user_id, en_term, zh_term (UNIQUE) | 去重 |
+| documents | idx_documents_user | user_id, updated_at DESC | 文档列表 |
+| subscriptions | idx_subscriptions_user | user_id, is_active | Beat 订阅检查 |
+| event_logs | idx_el_user | user_id, created_at DESC | 事件日志 |
 
----
+### 5.4 全文索引（GIN × 3）
 
-## 6. 迁移方案（SQLite → PostgreSQL）
+| 表 | 索引 | 列 | 查询场景 |
+|------|------|------|------|
+| papers | idx_papers_fts | title + abstract | 中英文论文搜索 |
+| captures | idx_captures_fts | title + content | 碎片知识关键词搜索 |
+| glossary_terms | idx_glossary_fts | en_term | 英文术语匹配 |
 
-### 6.1 迁移步骤
+### 5.5 汇总
 
-```
-Phase 0: 准备
-  1. 部署 PostgreSQL 16+ + pgvector 扩展
-  2. 创建空 schema（执行所有 CREATE TABLE）
-  3. 验证 schema 正确性
-
-Phase 1: 数据迁移脚本
-  1. 读取 SQLite 数据（Python sqlite3）
-  2. 转换数据（id 格式 / JSON → JSONB / 时间格式）
-  3. 批量 INSERT 到 PostgreSQL（asyncpg / psycopg2 COPY）
-  4. 数据校验（行数对比 + 采样校验）
-
-Phase 2: 向量迁移 (ChromaDB → pgvector)
-  1. 遍历 ChromaDB collections
-  2. 逐个 collection 导出 embedding + metadata
-  3. 写入 pgvector 表（使用批量 INSERT）
-  4. 创建索引（迁移完成后统一创建）
-
-Phase 3: 切换
-  1. 修改 config.py 数据库连接
-  2. 灰度测试（单用户先切换）
-  3. 全量切换
-  4. 保留 SQLite 作为备份（30 天后删除）
-```
-
-### 6.2 迁移脚本结构
-
-```python
-# scripts/migrate_to_postgres.py
-class MigrationRunner:
-    async def run(self):
-        await self.migrate_users()
-        await self.migrate_papers()          # 包含 project_papers
-        await self.migrate_sessions()        # 包含 ws_messages
-        await self.migrate_glossary()
-        await self.migrate_templates()
-        await self.migrate_agent_tasks()     # 包含 task_steps
-        await self.migrate_vectors()         # ChromaDB → pgvector
-        await self.validate_counts()
-```
+| 类型 | 数量 | 说明 |
+|------|:---:|------|
+| HNSW 向量 | 3 | 论文 / 碎片 / 术语 |
+| Single-key B-tree | 7 | 高频单列 |
+| Multi-key B-tree | 15 | 复合条件 |
+| GIN 全文 | 3 | 文本搜索 |
+| **总计** | **28** | |
 
 ---
 
-## 7. 多用户数据隔离策略
+## 6. Redis 数据结构
 
-### 7.1 隔离层级
+### 6.1 消息与路由（v4.1 Supervisor 架构）
+
+| Key | 类型 | 写 | 读 | 用途 |
+|-----|------|:---:|:---:|------|
+| `agent:status` | Hash | Supervisor | API | 全量 Agent 状态 |
+| `agent:ws:{uid}` | List | API | Supervisor | 入站消息队列 |
+| `agent:outbox:{uid}` | List | Supervisor | API | 出站消息队列 |
+| `agent:control` | Pub/Sub | API | Supervisor | 控制指令（仅启停） |
+| `agent:ws:{uid}:parked` | List | Supervisor | Supervisor | 暂存未匹配消息 |
+
+### 6.2 缓存
+
+| Key | 类型 | 用途 | TTL |
+|-----|------|------|-----|
+| `glossary:hot:{uid}:{domain}` | Sorted Set | 热点术语 | 1h |
+| `rag:cache:{query_hash}` | String | LLM RAG 回答缓存 | 1h |
+| `external:validation:{doi}` | String | 外部验证缓存 | 30d |
+
+### 6.3 限流与锁
+
+| Key | 类型 | 用途 | TTL |
+|-----|------|------|-----|
+| `rate:{uid}:{endpoint}` | String | 请求计数 | 1min |
+| `lock:ingest:{paper_id}` | String | 防重复入库 | 10min |
+
+### 6.4 Celery 任务
+
+| Key | 类型 | 用途 | TTL |
+|-----|------|------|-----|
+| `celery:task:{celery_task_id}` | String | 任务状态缓存 | 1h |
+| `celery:beat:last_run:{task_name}` | String | Beat 上次执行 | 永久 |
+
+---
+
+## 7. 多用户数据隔离
 
 | 层级 | 机制 | 说明 |
 |------|------|------|
-| **应用层** | 所有查询强制带 `WHERE user_id = $user_id` | 由 DAO 层统一处理 |
-| **向量层** | `search_paper_chunks` 函数内置 `p_user_id` 过滤 | 防止跨用户向量检索 |
+| **应用层** | 所有查询强制 `WHERE user_id = $uid` | DAO 层统一处理 |
+| **向量层** | `search_unified()` 函数内置 `p_user_id` 过滤 | 防止跨用户向量检索 |
 | **缓存层** | Redis key 包含 `{user_id}` | 防止跨用户缓存读取 |
-| **可选** | PostgreSQL RLS (Row Level Security) | 数据库层面的兜底隔离 |
 
-### 7.2 课题组共享（Phase 2 预留）
+---
 
-```sql
--- 预留：课题组表
-CREATE TABLE research_groups (
-    id          TEXT PRIMARY KEY,           -- grp-xxx
-    name        TEXT NOT NULL,
-    created_by  TEXT NOT NULL REFERENCES users(id),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+## 8. 迁移映射（30→17 表）
 
-CREATE TABLE group_members (
-    group_id    TEXT NOT NULL REFERENCES research_groups(id),
-    user_id     TEXT NOT NULL REFERENCES users(id),
-    role        TEXT NOT NULL DEFAULT 'member', -- admin / member
-    joined_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (group_id, user_id)
-);
+```
+[保留，结构不变]
+  users, projects, project_papers, journal_ranks, hallucination_events
 
--- 共享论文表
-CREATE TABLE shared_papers (
-    id              TEXT PRIMARY KEY,       -- shr-xxx
-    paper_id        TEXT NOT NULL REFERENCES papers(id),
-    shared_by       TEXT NOT NULL REFERENCES users(id),
-    shared_with     TEXT,                    -- NULL = 全组共享
-    shared_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+[保留，结构微调]
+  papers (+figures/archives JSONB → 合并 paper_figures + paper_archives)
+  paper_chunks (不变)
+  glossary_terms (添加 embedding 列 → 合并 glossary_embeddings)
+  captures (+embedding → 合并 videos)
+  documents (+versions JSONB → 合并 document_versions)
+  agents (+state 列)
+  sessions (+summary JSONB → 合并 conversation_archive)
+  ws_messages (+priority → 去掉 priority_kind/role 冗余字段)
 
--- 论文的 pgvector RLS 示例
-ALTER TABLE paper_chunks ENABLE ROW LEVEL SECURITY;
-CREATE POLICY paper_chunks_isolation ON paper_chunks
-    USING (
-        user_id = current_setting('app.current_user_id')
-        OR paper_id IN (
-            SELECT sp.paper_id FROM shared_papers sp
-            WHERE sp.shared_with IS NULL  -- 全组共享
-               OR sp.shared_with = current_setting('app.current_user_id')
-        )
-    );
+[合并 → event_logs]
+  search_logs + rag_traces + agent_events + external_validations → event_logs
+
+[合并 → JSONB 字段]
+  subscription_results → subscriptions.results JSONB
+  user_configs → user_preferences.other JSONB
+  writing_templates → 系统配置 + preferences.other
+
+[新增]
+  share_requests, _schema_meta
+
+[删除 / 替代]
+  agent_tasks + task_steps → Celery 自身管理
+  topic_embeddings → paper_chunks 聚类替代（后续实现）
+  session_summaries → sessions.summary JSONB
+  session_scan_markers → Redis key
+  message_embeddings → 不需要（RAG 走 paper_chunks + captures）
+  citations → 后续按需加回
+  research_groups + group_members + shared_papers → share_requests
 ```
 
 ---
 
-> 本文档定义了 v3 的完整数据库架构。业务表 22 张（含 captures），向量表 4 张，Redis 数据结构 18 组。迁移从 SQLite+ChromaDB 到 PostgreSQL+pgvector。videos 表数据将在 Phase 1 一次性迁移到 captures 表后废弃。
+## 9. 架构审查
+
+审查于 2026-07-18，9 条意见全部有解决方案：
+
+| # | 审查意见 | 解决方案 | 状态 |
+|:---:|------|------|:---:|
+| 1 | ws_messages 去重索引缺失 | 2 个 partial UNIQUE 索引（tool_call_id + plan_id） | 已加入表设计 |
+| 2 | paper_chunks 缺向量索引 | HNSW 3 个（paper_chunks, captures, glossary_terms） | 已加入索引方案 |
+| 3 | documents.versions JSONB 写入膨胀 | jsonb_set 增量写 + 200 条上限 + ai_turn 5s 去重 | 已加入设计说明 |
+| 4 | subscriptions.results 无限增长 | 50 条限制 + 溢出 → event_logs | 已加入设计说明 |
+| 5 | vector 维度硬编码 | _schema_meta 表记录 embedding 模型 + 迁移 CHECK | 已加入表设计 |
+| 6 | captures + glossary 缺全文索引 | 3 个 GIN FTS 索引（papers, captures, glossary_terms） | 已加入索引方案 |
+| 7 | agents.state 高频写 DB | Redis Hash 为主 + DB 只写大变更 + 每 5min 批量同步 | 已加入设计说明 |
+| 8 | 会话摘要分析能力 | sessions.summary JSONB + event_logs 记录摘要生成事件 | 已加入设计 |
+| 9 | 迁移映射文档 | §8 迁移映射表 | 已加入文档 |
+
+---
+
+> 本文档定义了 v4.1 的数据库架构：17 张业务表 + 28 个索引 + 5 组 Redis Key。从 v3 的 30 张表精简到 17 张，覆盖用户/论文/项目/向量/碎片知识/术语/文档/偏好/订阅/共享/审计全部功能。
