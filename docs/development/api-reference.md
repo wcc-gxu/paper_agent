@@ -1,9 +1,10 @@
-# Paper Agent v4 — API 参考文档
+# Paper Agent v4.1 — API 参考文档
 
-> 更新: 2026-07-18 | 版本: 4.0.0 | LLM: DeepSeek v4 Pro + Flash
+> 更新: 2026-07-18 | 版本: 4.1.0 | LLM: DeepSeek v4 Pro + Flash
 >
-> 架构: Intent Classify (flash) → [chat→reply] | [ops→ops_plan→Celery] | [research→plan⇄clarify→review→Celery]
+> 架构: Agent Supervisor (daemon) → N 个 Agent 子进程 (stdin/stdout pipe) → Celery Worker
 >
+> v4.1 变更: Agent 子进程模型/3 层健康检测/agent:status Hash 替代心跳/控制指令走 Pub/Sub
 > v4.0 变更: Agent 生命周期/NEW Document CRUD/Preference/Share API。注册不再返回 agent_id。知识库按 user_id 隔离。
 >
 > 详见 [vue 客户端 API 参考](../../paper-agent-vue/docs/api-reference.md)
@@ -95,7 +96,7 @@ Base URL: `http://{host}:8000/api`
 }
 ```
 
-> **v4.0 变更**: 注册成功后服务端在后台自动创建 Agent 并启动。客户端应在登录后轮询 `GET /api/agents/me/status` 等待 Agent 就绪。
+> **v4.1 变更**: 注册后需调用 `POST /api/agents/me/start` 手动启动 Agent。客户端应在注册成功后提示用户启动 Agent，轮询 `GET /api/agents/me/status` 等待 `state: idle`。
 
 **Errors**: 400 (参数不合法) | 409 (用户名已存在)
 
@@ -152,14 +153,16 @@ Base URL: `http://{host}:8000/api`
 
 ---
 
-## 3. Agent 管理 (v4.0)
+## 3. Agent 管理 (v4.1)
+
+> v4.1: Supervisor 管理 Agent 子进程。API 通过 Redis Hash `agent:status` 查询状态，通过 Pub/Sub `agent:control` 发送启停命令。
 
 ### `GET /api/agents/me`
 
-获取当前用户 Agent 信息（DB + Redis 心跳合并）。
+获取当前用户 Agent 信息（DB + Redis Hash `agent:status` 合并）。
 
 ```json
-{"id": "agent-xxx", "user_id": "...", "system_prompt": "...", "status": "running", "active_turns": 0}
+{"id": "agent-xxx", "user_id": "...", "system_prompt": "...", "state": "idle", "node": null, "active_turns": 0}
 ```
 
 ### `PUT /api/agents/me`
@@ -168,11 +171,21 @@ Base URL: `http://{host}:8000/api`
 
 ### `GET /api/agents/me/status`
 
-轻量轮询。`{"status": "starting", "progress": 0.6, "active_turns": 0}`
+轻量轮询。查 Supervisor 维护的 `agent:status` Hash。
 
-### `POST /api/agents/me/start` / `POST /api/agents/me/stop`
+```json
+{"state": "idle", "node": null, "active_turns": 0, "pid": 1001, "started_at": "...", "updated_at": "..."}
+```
 
-异步启停，轮询确认。
+**state 取值**: `starting` | `idle` | `busy` | `stopping` | `stopped` | `crashed` | `stalled`
+
+### `POST /api/agents/me/start`
+
+Pub/Sub `agent:control {"cmd":"start","user_id":"..."}` → Supervisor 创建 Agent 子进程。客户端轮询 status 等待 `state: idle`。
+
+### `POST /api/agents/me/stop`
+
+Pub/Sub `agent:control {"cmd":"stop","user_id":"..."}` → Supervisor 发 SIGTERM。轮询确认 `state: stopped`。
 
 ---
 
