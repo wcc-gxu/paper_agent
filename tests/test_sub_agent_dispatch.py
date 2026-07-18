@@ -479,7 +479,7 @@ class TestRADQueryDispatch:
                    return_value=mock_chroma), \
              patch("paper_search.agent.knowledge.KnowledgeBase",
                    return_value=mock_kb) as mock_kb_cls, \
-             patch("paper_search.agent.graphs.rad_query_graph.RADQueryAgent",
+             patch("paper_search.agent.graphs.knowledge_graph.KnowledgeAgent",
                    return_value=mock_agent_inst) as mock_agent_cls:
 
             arguments = {
@@ -530,7 +530,7 @@ class TestRADQueryDispatch:
                    return_value=mock_chroma), \
              patch("paper_search.agent.knowledge.KnowledgeBase",
                    return_value=mock_kb), \
-             patch("paper_search.agent.graphs.rad_query_graph.RADQueryAgent",
+             patch("paper_search.agent.graphs.knowledge_graph.KnowledgeAgent",
                    return_value=mock_agent_inst):
 
             asyncio.run(_run_graph_agent_async(

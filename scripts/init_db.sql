@@ -1,13 +1,33 @@
 -- ============================================================
--- 智驭·研 v3 数据库初始化脚本
+-- 智驭·研 v4 数据库初始化脚本
 -- PostgreSQL 16+ + pgvector 0.8+
 -- 对应文档: docs/development/database-architecture.md
--- 日期: 2026-07-10
+-- 日期: 2026-07-18 (v4.0)
 -- ============================================================
 
 -- 启用扩展
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- ============================================================
+-- ID 生成函数
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION gen_agent_id() RETURNS TEXT AS $$
+BEGIN RETURN 'agent-' || LOWER(REPLACE(gen_random_uuid()::TEXT, '-', ''));
+END; $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION gen_doc_id() RETURNS TEXT AS $$
+BEGIN RETURN 'doc-' || LOWER(REPLACE(gen_random_uuid()::TEXT, '-', ''));
+END; $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION gen_ver_id() RETURNS TEXT AS $$
+BEGIN RETURN 'ver-' || LOWER(REPLACE(gen_random_uuid()::TEXT, '-', ''));
+END; $$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION gen_share_id() RETURNS TEXT AS $$
+BEGIN RETURN 'shr-' || LOWER(REPLACE(gen_random_uuid()::TEXT, '-', ''));
+END; $$ LANGUAGE plpgsql;
 
 -- ============================================================
 -- Section 2: 业务表 (22 张)
@@ -437,7 +457,56 @@ CREATE TABLE agent_events (
 CREATE INDEX idx_ae_agent ON agent_events(agent_id);
 CREATE INDEX idx_ae_created ON agent_events(created_at);
 
--- 2.15 RAG 检索追踪 (Phase 4)
+-- 2.15 v4.0 文档管理
+CREATE TABLE documents (
+    id              TEXT PRIMARY KEY DEFAULT gen_doc_id(),
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    title           VARCHAR(200) NOT NULL,
+    file_path       VARCHAR(500) NOT NULL,
+    is_auto_review  BOOLEAN DEFAULT FALSE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_documents_user ON documents(user_id);
+
+CREATE TABLE document_versions (
+    id              TEXT PRIMARY KEY DEFAULT gen_ver_id(),
+    document_id     TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    version_number  INT NOT NULL,
+    content         TEXT NOT NULL,
+    trigger         VARCHAR(32) CHECK (trigger IN ('manual_commit','ai_turn','auto_save','rollback')),
+    session_id      VARCHAR(64),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_versions_doc ON document_versions(document_id);
+
+-- 2.16 v4.0 用户偏好
+CREATE TABLE user_preferences (
+    user_id         TEXT PRIMARY KEY REFERENCES users(id),
+    research_domain VARCHAR(200) DEFAULT '',
+    writing_style   VARCHAR(100) DEFAULT 'APA',
+    language_pref   VARCHAR(50) DEFAULT 'zh',
+    mentor_quotes   TEXT DEFAULT '',
+    other           JSONB DEFAULT '{}',
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 2.17 v4.0 知识共享
+CREATE TABLE share_requests (
+    id              TEXT PRIMARY KEY DEFAULT gen_share_id(),
+    from_user_id    TEXT NOT NULL REFERENCES users(id),
+    to_user_id      TEXT NOT NULL REFERENCES users(id),
+    resource_type   VARCHAR(32) NOT NULL,
+    resource_id     VARCHAR(64) NOT NULL,
+    message         TEXT DEFAULT '',
+    status          VARCHAR(16) DEFAULT 'pending' CHECK (status IN ('pending','accepted','rejected')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_share_from ON share_requests(from_user_id);
+CREATE INDEX idx_share_to ON share_requests(to_user_id);
+
+-- 2.18 RAG 检索追踪 (Phase 4)
 CREATE TABLE rag_traces (
     id              TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL,
@@ -697,6 +766,11 @@ CREATE TABLE IF NOT EXISTS paper_archives (
 );
 CREATE INDEX IF NOT EXISTS idx_paper_archives_paper ON paper_archives(paper_id);
 CREATE INDEX IF NOT EXISTS idx_paper_archives_date ON paper_archives(archived_at);
+
+-- ============================================================
+-- v4.0 迁移: sessions 关联文档
+-- ============================================================
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS document_id TEXT REFERENCES documents(id);
 
 -- ============================================================
 -- 默认数据：创建默认用户（存量数据归属）

@@ -1018,10 +1018,340 @@ async def list_devices(agent_id: str, user_id: str = Depends(verify_api_key)):
             {
                 "platform": t["platform"],
                 "bundle_id": t.get("bundle_id", ""),
-                "token_prefix": (t["device_token"] or "")[:12],
-                "created_at": t["created_at"],
-                "last_seen_at": t["last_seen_at"],
-            }
-            for t in tokens
-        ],
-    }
+    "token_prefix": (t["device_token"] or "")[:12],
+            "created_at": t["created_at"],
+            "last_seen_at": t["last_seen_at"],
+        }
+        for t in tokens
+    ],
+}
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.0 Agent 便捷端点 (per-user)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/agents/me")
+async def get_my_agent(user_id: str = Depends(verify_api_key)):
+    """获取当前用户 Agent 信息（DB + Redis 心跳合并）。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    agent = db.get_default_agent(user_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="No agent found")
+    status_info = {"status": "unknown", "active_turns": 0}
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        hb = await r.get(f"agent:heartbeat:{user_id}")
+        if hb:
+            status_info.update(_json.loads(hb))
+        await r.aclose()
+    except Exception:
+        pass
+    return {"agent": agent, **status_info}
+
+
+@router.put("/agents/me")
+async def update_my_agent(req: dict, user_id: str = Depends(verify_api_key)):
+    """更新当前用户 Agent 的 system_prompt。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    agent = db.get_default_agent(user_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="No agent found")
+    db.update_agent(agent["id"], user_id=user_id, system_prompt=req.get("system_prompt", ""))
+    return {"agent_id": agent["id"], "status": "updated"}
+
+
+@router.get("/agents/me/status")
+async def get_my_agent_status(user_id: str = Depends(verify_api_key)):
+    """轻量轮询 Agent 状态（只读 Redis 心跳）。"""
+    import os
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        hb = await r.get(f"agent:heartbeat:{user_id}")
+        await r.aclose()
+        if hb:
+            return {"status": "running", **_json.loads(hb)}
+        return {"status": "stopped", "active_turns": 0}
+    except Exception:
+        return {"status": "unknown", "active_turns": 0}
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.0 Document CRUD
+# ═══════════════════════════════════════════════════════════════
+
+
+class DocumentCreateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    content: Optional[str] = None
+    mode: str = "create"  # create | upload | from_paper
+    paper_id: Optional[str] = None
+
+
+class DocumentUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    version: Optional[int] = None  # 乐观锁
+
+
+@router.get("/documents")
+async def list_documents(
+    search: Optional[str] = Query(None),
+    limit: int = Query(50, le=200),
+    user_id: str = Depends(verify_api_key),
+):
+    """列出当前用户的文档。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    docs = db.list_documents(user_id, search=search or "", limit=limit)
+    return {"total": len(docs), "documents": docs}
+
+
+@router.post("/documents")
+async def create_document(req: DocumentCreateRequest, user_id: str = Depends(verify_api_key)):
+    """创建文档。mode=create(新空白) / upload(MD上传) / from_paper(paper→MD)。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    oss_dir = Path(get_outputs_dir() or ".") / "oss" / "documents" / user_id
+    oss_dir.mkdir(parents=True, exist_ok=True)
+
+    if req.mode == "from_paper" and req.paper_id:
+        paper = db.get_paper(req.paper_id, user_id=user_id)
+        if not paper:
+            raise HTTPException(status_code=404, detail="Paper not found")
+        md_path = paper.get("md_path") or paper.get("markdown_path")
+        if md_path and Path(md_path).exists():
+            content = Path(md_path).read_text(encoding="utf-8")
+        else:
+            content = f"# {paper.get('title', 'Untitled')}\n\n{paper.get('abstract', '')}"
+        file_path = str(oss_dir / f"{req.title.replace(' ', '_')}.md")
+        Path(file_path).write_text(content, encoding="utf-8")
+    elif req.mode == "upload":
+        content = req.content or ""
+        file_path = str(oss_dir / f"{req.title.replace(' ', '_')}.md")
+        Path(file_path).write_text(content, encoding="utf-8")
+    else:
+        content = req.content or ""
+        file_path = str(oss_dir / f"{req.title.replace(' ', '_')}.md")
+        Path(file_path).write_text(content, encoding="utf-8")
+
+    doc_id = db.create_document(user_id, req.title, file_path)
+    if content:
+        db.create_document_version(doc_id, content, trigger="manual_commit")
+    return {"document_id": doc_id, "title": req.title, "status": "created"}
+
+
+@router.get("/documents/{doc_id}")
+async def get_document(doc_id: str, user_id: str = Depends(verify_api_key)):
+    """获取文档详情 + 当前版本内容。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    versions = db.list_document_versions(doc_id, limit=1)
+    current_content = versions[0]["content"] if versions else ""
+    current_version = versions[0]["version_number"] if versions else 0
+    return {"document": doc, "content": current_content, "version": current_version}
+
+
+@router.put("/documents/{doc_id}")
+async def update_document(doc_id: str, req: DocumentUpdateRequest,
+                          user_id: str = Depends(verify_api_key)):
+    """更新文档（乐观锁：version 与 DB 当前版本比对）。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    if req.version is not None:
+        current_ver = db.get_document_current_version(doc_id) or 0
+        if req.version != current_ver:
+            raise HTTPException(status_code=409, detail=f"Version conflict: expected {current_ver}, got {req.version}")
+
+    if req.title:
+        db.update_document(doc_id, user_id=user_id, title=req.title)
+    if req.content is not None:
+        db.create_document_version(doc_id, req.content, trigger="manual_commit")
+
+    return {"document_id": doc_id, "status": "updated"}
+
+
+@router.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, user_id: str = Depends(verify_api_key)):
+    """删除文档。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    db.delete_document(doc_id, user_id=user_id)
+    return {"document_id": doc_id, "status": "deleted"}
+
+
+@router.get("/documents/{doc_id}/download")
+async def download_document(doc_id: str, user_id: str = Depends(verify_api_key)):
+    """下载 MD 文件。"""
+    from ..agent.pgdb import PostgresAgentDB
+    from fastapi.responses import FileResponse
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    fp = doc.get("file_path", "")
+    if not fp or not Path(fp).exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(fp, media_type="text/markdown",
+                        filename=f"{doc.get('title', 'document')}.md")
+
+
+@router.get("/documents/{doc_id}/versions")
+async def list_document_versions(doc_id: str, limit: int = 20,
+                                 user_id: str = Depends(verify_api_key)):
+    """版本列表。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    versions = db.list_document_versions(doc_id, limit=limit)
+    return {"document_id": doc_id, "versions": versions}
+
+
+@router.post("/documents/{doc_id}/versions")
+async def create_document_version_endpoint(doc_id: str, req: dict,
+                                          user_id: str = Depends(verify_api_key)):
+    """手动提交新版本。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    ver_id = db.create_document_version(doc_id, req.get("content", ""),
+                                         trigger="manual_commit")
+    ver = db.get_document_version(ver_id)
+    return {"version_id": ver_id, "version": ver}
+
+
+@router.get("/documents/{doc_id}/versions/{ver_id}")
+async def get_document_version_endpoint(doc_id: str, ver_id: str,
+                                        user_id: str = Depends(verify_api_key)):
+    """版本内容。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    ver = db.get_document_version(ver_id)
+    if not ver:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return {"version": ver}
+
+
+@router.post("/documents/{doc_id}/revert/{ver_id}")
+async def revert_document(doc_id: str, ver_id: str,
+                          user_id: str = Depends(verify_api_key)):
+    """回滚到指定版本 → 创建新版本（trigger=rollback）。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    doc = db.get_document(doc_id, user_id=user_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    try:
+        new_ver_id = db.revert_document(doc_id, ver_id, user_id=user_id)
+        new_ver = db.get_document_version(new_ver_id)
+        return {"version_id": new_ver_id, "version": new_ver, "status": "reverted"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.0 用户偏好 (PG)
+# ═══════════════════════════════════════════════════════════════
+
+
+@router.get("/preferences/me")
+async def get_v4_preferences(user_id: str = Depends(verify_api_key)):
+    """获取用户偏好（研究领域/写作风格/语言/导师语录）。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    prefs = db.get_v4_preferences(user_id)
+    if not prefs:
+        prefs = {
+            "user_id": user_id, "research_domain": "", "writing_style": "APA",
+            "language_pref": "zh", "mentor_quotes": "", "other": {},
+        }
+    return {"preferences": prefs}
+
+
+@router.put("/preferences/me")
+async def update_v4_preferences(req: dict, user_id: str = Depends(verify_api_key)):
+    """部分更新用户偏好。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    db.upsert_v4_preferences(user_id, **req)
+    return {"status": "saved"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# v4.0 知识共享
+# ═══════════════════════════════════════════════════════════════
+
+
+class ShareRequest(BaseModel):
+    to_user_id: str = Field(..., min_length=1)
+    resource_type: str = Field(..., min_length=1)
+    resource_id: str = Field(..., min_length=1)
+    message: str = ""
+
+
+class ShareResponseRequest(BaseModel):
+    status: str = Field(..., pattern="^(accepted|rejected)$")
+
+
+@router.post("/share")
+async def create_share(req: ShareRequest, user_id: str = Depends(verify_api_key)):
+    """发起共享请求。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    share_id = db.create_share_request(
+        from_user_id=user_id,
+        to_user_id=req.to_user_id,
+        resource_type=req.resource_type,
+        resource_id=req.resource_id,
+        message=req.message,
+    )
+    return {"share_id": share_id, "status": "pending"}
+
+
+@router.get("/share/requests")
+async def list_share_requests(
+    direction: str = Query("inbound", pattern="^(inbound|outbound)$"),
+    user_id: str = Depends(verify_api_key),
+):
+    """列出共享请求。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    requests = db.list_share_requests(user_id, direction=direction)
+    return {"total": len(requests), "requests": requests}
+
+
+@router.put("/share/requests/{share_id}")
+async def respond_share_request(share_id: str, req: ShareResponseRequest,
+                                user_id: str = Depends(verify_api_key)):
+    """接受/拒绝共享请求。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    sr = db.get_share_request(share_id)
+    if not sr:
+        raise HTTPException(status_code=404, detail="Share request not found")
+    if sr["to_user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Not your share request")
+    db.update_share_request(share_id, req.status)
+    return {"share_id": share_id, "status": req.status}

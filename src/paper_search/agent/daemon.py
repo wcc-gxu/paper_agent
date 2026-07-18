@@ -113,6 +113,9 @@ class AgentManager:
         self.vector_store = vector_store
         self._agents: dict[str, "MainAgent"] = {}
         self._default_agent_id: str = ""
+        self._stopping = False
+        self._active_turn_count = 0
+        self._current_session_id = ""
 
     async def load_agents(self, graph_builder) -> None:
         """从 DB 加载该用户所有活跃智能体."""
@@ -262,13 +265,29 @@ class AgentManager:
 
         return get_user
 
+    async def _heartbeat_loop(self, r):
+        """独立心跳 Task — 每 10s 刷新 Redis heartbeat key（TTL 15s）。"""
+        key = f"agent:heartbeat:{self.user_id}"
+        while not self._stopping:
+            try:
+                await r.set(key, json.dumps({
+                    "status": "running",
+                    "active_turns": self._active_turn_count,
+                    "current_session": self._current_session_id,
+                }), ex=15)
+            except Exception as e:
+                logger.warning(f"Heartbeat set failed: {e}")
+            await asyncio.sleep(10)
+
     async def run(self):
-        """主循环：BRPOP agent:ws:{user_id} → dispatch to target agent."""
+        """主循环：BRPOP agent:ws:{user_id} → dispatch to target agent。"""
         import redis.asyncio as aioredis
         import json as _json
         r = aioredis.from_url(self.redis_url, decode_responses=True)
         ws_queue = f"agent:ws:{self.user_id}"
         parked_queue = f"agent:ws:{self.user_id}:parked"
+
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(r))
 
         logger.info("AgentManager running: user=%s queue=%s agents=%d",
                      self.user_id, ws_queue, len(self._agents))
@@ -305,14 +324,58 @@ class AgentManager:
                     continue
 
             session_id = msg_list[0].get("_session_id", "main")
-            # Combine message text for the agent
             user_content = agent._combine_user_text(msg_list)
             agent._correlation_id = str(uuid.uuid4())
             agent._current_session_id = session_id
+            self._current_session_id = session_id
+            self._active_turn_count += 1
             try:
                 await agent._run_turn(session_id, user_content)
             except Exception as e:
                 logger.error("Agent %s turn error: %s", agent._agent_id, e, exc_info=True)
+            finally:
+                self._active_turn_count = max(0, self._active_turn_count - 1)
+
+    async def plan_clarify_loop(self, planning_prompt: str, session_id: str,
+                                preferences: dict) -> dict:
+        """v4.0 Plan ⇄ Clarify 外循环 — daemon 层控制。"""
+        from .graphs.main_graph import MainGraph, MAX_CLARIFY_ROUNDS
+
+        MAX_OUTER_ROUNDS = int(os.getenv("MAX_PLAN_CLARIFY_OUTER", "5"))
+        recent_events = []
+        agent = self._agents.get(self._default_agent_id)
+        if not agent:
+            return {"plan": None}
+
+        for _ in range(MAX_OUTER_ROUNDS):
+            result = await agent._graph.ainvoke_plan_node(
+                planning_prompt=planning_prompt,
+                recent_events=recent_events,
+                preferences=preferences,
+                session_id=session_id,
+            )
+
+            if result.get("needs_clarification"):
+                clarify_result = await agent._graph._clarify(
+                    goal=result.get("clarification_goal", ""),
+                    suggested_tools=result.get("suggested_tools", []),
+                    max_rounds=MAX_CLARIFY_ROUNDS,
+                )
+                recent_events.append({"collected_info": clarify_result.get("collected_info", "")})
+                continue
+
+            plan = result.get("plan")
+            if not plan:
+                return {"plan": None}
+
+            approved = await agent._graph._gate_invoke(plan)
+            if approved:
+                return {"plan": plan, "approved": True}
+
+            feedback = approved if isinstance(approved, dict) else result.get("feedback", "")
+            recent_events.append({"feedback": feedback})
+
+        return {"plan": result.get("plan"), "max_rounds": True}
 
 
 async def _run_agent_manager(data_dir: Optional[str] = None, user_id: str = "default"):

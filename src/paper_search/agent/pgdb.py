@@ -310,7 +310,166 @@ class PostgresAgentDB:
         return row is not None
 
     # ═══════════════════════════════════════════════════════════════
-    # 用户偏好 (基于 user_configs 表)
+    # v4.0 文档管理
+    # ═══════════════════════════════════════════════════════════════
+
+    def create_document(self, user_id: str, title: str, file_path: str = "",
+                        is_auto_review: bool = False) -> str:
+        doc_id = _uuid("doc")
+        self._execute(
+            """INSERT INTO documents (id, user_id, title, file_path, is_auto_review)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (doc_id, user_id, title, file_path, is_auto_review),
+        )
+        return doc_id
+
+    def get_document(self, doc_id: str, user_id: str = None) -> Optional[dict]:
+        if user_id:
+            return self._fetchone(
+                "SELECT * FROM documents WHERE id = %s AND user_id = %s", (doc_id, user_id))
+        return self._fetchone("SELECT * FROM documents WHERE id = %s", (doc_id,))
+
+    def list_documents(self, user_id: str, search: str = "",
+                       limit: int = 50) -> list[dict]:
+        if search:
+            return self._fetchall(
+                "SELECT * FROM documents WHERE user_id = %s AND title ILIKE %s ORDER BY updated_at DESC LIMIT %s",
+                (user_id, f"%{search}%", limit))
+        return self._fetchall(
+            "SELECT * FROM documents WHERE user_id = %s ORDER BY updated_at DESC LIMIT %s",
+            (user_id, limit))
+
+    def update_document(self, doc_id: str, user_id: str = None, **kwargs) -> int:
+        if not kwargs:
+            return 0
+        kwargs["updated_at"] = _now()
+        sets = [f"{k} = %s" for k in kwargs]
+        values = list(kwargs.values())
+        where = "id = %s"
+        params = values + [doc_id]
+        if user_id:
+            where += " AND user_id = %s"
+            params.append(user_id)
+        self._execute(
+            f"UPDATE documents SET {', '.join(sets)} WHERE {where}", tuple(params))
+        return 1
+
+    def delete_document(self, doc_id: str, user_id: str = None) -> bool:
+        if user_id:
+            self._execute("DELETE FROM documents WHERE id = %s AND user_id = %s",
+                         (doc_id, user_id))
+        else:
+            self._execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+        return True
+
+    def get_document_current_version(self, doc_id: str) -> Optional[int]:
+        row = self._fetchone(
+            "SELECT MAX(version_number) as v FROM document_versions WHERE document_id = %s",
+            (doc_id,))
+        return row["v"] if row else None
+
+    def create_document_version(self, document_id: str, content: str,
+                                 trigger: str = "manual_commit",
+                                 session_id: str = None) -> str:
+        current = self.get_document_current_version(document_id) or 0
+        ver_num = current + 1
+        ver_id = _uuid("ver")
+        self._execute(
+            """INSERT INTO document_versions (id, document_id, version_number, content, trigger, session_id)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (ver_id, document_id, ver_num, content, trigger, session_id),
+        )
+        return ver_id
+
+    def get_document_version(self, ver_id: str) -> Optional[dict]:
+        return self._fetchone("SELECT * FROM document_versions WHERE id = %s", (ver_id,))
+
+    def get_document_version_by_number(self, doc_id: str, ver_num: int) -> Optional[dict]:
+        return self._fetchone(
+            "SELECT * FROM document_versions WHERE document_id = %s AND version_number = %s",
+            (doc_id, ver_num))
+
+    def list_document_versions(self, doc_id: str, limit: int = 20) -> list[dict]:
+        return self._fetchall(
+            "SELECT * FROM document_versions WHERE document_id = %s ORDER BY version_number DESC LIMIT %s",
+            (doc_id, limit))
+
+    def revert_document(self, doc_id: str, ver_id: str, user_id: str = None) -> str:
+        ver = self.get_document_version(ver_id)
+        if not ver:
+            raise ValueError(f"Version not found: {ver_id}")
+        return self.create_document_version(doc_id, ver["content"],
+                                            trigger="rollback",
+                                            session_id=str(ver_id))
+
+    # ═══════════════════════════════════════════════════════════════
+    # v4.0 用户偏好 (基于 user_preferences 表)
+    # ═══════════════════════════════════════════════════════════════
+
+    def get_v4_preferences(self, user_id: str) -> Optional[dict]:
+        return self._fetchone("SELECT * FROM user_preferences WHERE user_id = %s", (user_id,))
+
+    def upsert_v4_preferences(self, user_id: str, **kwargs) -> None:
+        allowed = {"research_domain", "writing_style", "language_pref", "mentor_quotes", "other"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        row = self.get_v4_preferences(user_id)
+        if row:
+            updates["updated_at"] = _now()
+            sets = [f"{k} = %s" for k in updates]
+            self._execute(
+                f"UPDATE user_preferences SET {', '.join(sets)} WHERE user_id = %s",
+                tuple(list(updates.values()) + [user_id]))
+        else:
+            self._execute(
+                """INSERT INTO user_preferences (user_id, research_domain, writing_style,
+                   language_pref, mentor_quotes, other)
+                   VALUES (%s, %s, %s, %s, %s, %s::jsonb)""",
+                (user_id,
+                 kwargs.get("research_domain", ""),
+                 kwargs.get("writing_style", "APA"),
+                 kwargs.get("language_pref", "zh"),
+                 kwargs.get("mentor_quotes", ""),
+                 json.dumps(kwargs.get("other", {}))),
+            )
+
+    # ═══════════════════════════════════════════════════════════════
+    # v4.0 知识共享
+    # ═══════════════════════════════════════════════════════════════
+
+    def create_share_request(self, from_user_id: str, to_user_id: str,
+                             resource_type: str, resource_id: str,
+                             message: str = "") -> str:
+        share_id = _uuid("shr")
+        self._execute(
+            """INSERT INTO share_requests (id, from_user_id, to_user_id, resource_type,
+               resource_id, message)
+               VALUES (%s, %s, %s, %s, %s, %s)""",
+            (share_id, from_user_id, to_user_id, resource_type, resource_id, message),
+        )
+        return share_id
+
+    def get_share_request(self, share_id: str) -> Optional[dict]:
+        return self._fetchone("SELECT * FROM share_requests WHERE id = %s", (share_id,))
+
+    def list_share_requests(self, user_id: str, direction: str = "inbound") -> list[dict]:
+        if direction == "outbound":
+            return self._fetchall(
+                "SELECT * FROM share_requests WHERE from_user_id = %s ORDER BY created_at DESC",
+                (user_id,))
+        return self._fetchall(
+            "SELECT * FROM share_requests WHERE to_user_id = %s ORDER BY created_at DESC",
+            (user_id,))
+
+    def update_share_request(self, share_id: str, status: str) -> bool:
+        self._execute(
+            "UPDATE share_requests SET status = %s, updated_at = now() WHERE id = %s",
+            (status, share_id))
+        return True
+
+    # ═══════════════════════════════════════════════════════════════
+    # 用户偏好 (基于 user_configs 表 — 兼容旧版)
     # ═══════════════════════════════════════════════════════════════
 
     def get_user_preferences(self, user_id: str) -> dict:

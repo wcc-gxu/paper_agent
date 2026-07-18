@@ -71,4 +71,7 @@ app.conf.beat_schedule = {
 }
 
 # 自动发现 tasks
-app.autodiscover_tasks(["paper_search.agent.celery_tasks"])
+app.autodiscover_tasks([
+    "paper_search.agent.celery_tasks",
+    "paper_search.agent.react_executor",
+])

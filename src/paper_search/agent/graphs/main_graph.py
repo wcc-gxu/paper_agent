@@ -337,7 +337,12 @@ class MainGraph:
                 "chat": "inline_reply",
             },
         )
-        builder.add_edge("intent_classify", "plan")
+        # v4.0: intent_classify routes to chat/ops/plan
+        builder.add_conditional_edges(
+            "intent_classify",
+            self._route_intent,
+            {"inline_reply": "inline_reply", "ops_plan": "ops_confirm", "plan": "plan"},
+        )
 
         # plan → clarify (ask_user) or plan_review (send for approval)
         builder.add_conditional_edges(
@@ -458,27 +463,50 @@ class MainGraph:
     # ═══════════════════════════════════════════════════════════
 
     async def _intent_classify(self, state: MainState) -> dict:
-        """Flash model, determines if the research intent needs detailed planning."""
+        """v4.0: Flash model, 7 意图独立打分 + planning_prompt 生成。"""
         user = state.get("user_content", "")
         session_id = state.get("session_id", "main")
 
         await self._push_status(session_id, "planning", "正在分析研究意图...")
 
+        from ...agent.main_agent_prompts import INTENT_CLASSIFY_PROMPT
+
         try:
             data = await self.llm.chat_json(
                 messages=[{"role": "user", "content": user}],
-                schema=FastTriageV31Result,  # reuse: returns chat/ops/research scores
-                system=build_fast_triage_v31_prompt(),
+                system=INTENT_CLASSIFY_PROMPT,
                 temperature=0.0,
-                node="intent_classify_v31",
+                node="intent_classify_v4",
             )
-            logger.info("Intent classify: research=%.2f", data.get("research", 0.0))
         except Exception as e:
-            logger.warning(f"intent_classify LLM failed: {e}")
-            await self._push_error(session_id, f"意图分类失败: {e}")
-            return {}  # Continue with plan using default
+            logger.warning(f"intent_classify LLM failed: {e}, fallback to survey")
+            return {
+                "v4_intents": [{"intent": "survey", "score": 0.8}],
+                "planning_prompt": user,
+                "should_plan": True,
+                "route": "plan",
+            }
 
-        return {}  # Intent already determined by triage; proceed to plan
+        intents = [i for i in data.get("intents", []) if i.get("score", 0) > 0.7]
+        should_plan = data.get("should_plan", True)
+        planning_prompt = data.get("planning_prompt", user)
+
+        if not should_plan:
+            return {"v4_intents": intents, "route": "chat"}
+
+        if all(i.get("intent") == "ops" for i in intents):
+            return {"v4_intents": intents, "planning_prompt": planning_prompt, "route": "ops"}
+
+        return {"v4_intents": intents, "planning_prompt": planning_prompt, "route": "plan"}
+
+    async def _route_intent(self, state: MainState) -> str:
+        """v4.0: 路由 intent_classify 结果。"""
+        route = state.get("route", "plan")
+        if route == "chat":
+            return "inline_reply"
+        if route == "ops":
+            return "ops_plan"  # maps to ops_confirm in conditional edges
+        return "plan"
 
     # ═══════════════════════════════════════════════════════════
     # Node: plan

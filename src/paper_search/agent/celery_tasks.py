@@ -752,7 +752,7 @@ async def _run_graph_agent_async(agent_type: str, arguments: dict, log_id: str,
         from .graphs.knowledge_graph import KnowledgeAgent
         chroma = PgVectorStore()
         kb = KnowledgeBase(db, chroma, llm)
-        agent = RADQueryAgent(kb, on_progress=on_progress)
+        agent = KnowledgeAgent(kb, on_progress=on_progress)
         graph = agent.compile()
         state = {
             "question": (arguments.get("question")

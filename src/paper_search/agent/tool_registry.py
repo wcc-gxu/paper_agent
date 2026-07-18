@@ -523,6 +523,14 @@ class ToolRegistry:
         # ── v3 Phase 4: 系统健康工具 ──
         self._register_system_health_tools()
 
+        # ── v4.0 文档编辑工具 6 ──
+        self._register_doc_read()
+        self._register_doc_write_section()
+        self._register_doc_append()
+        self._register_doc_diff_apply()
+        self._register_doc_generate_review()
+        self._register_doc_search_rag()
+
     # ══════════════════════════════════════════════════════════
     # 通用工具
     # ══════════════════════════════════════════════════════════
@@ -2621,3 +2629,153 @@ Text:
                 "imported": imported, "errors": errors[:10],
             }, ensure_ascii=False)
         return zotero_import
+
+    # ══════════════════════════════════════════════════════════
+    # v4.0 文档编辑工具
+    # ══════════════════════════════════════════════════════════
+
+    def _register_doc_read(self):
+        def doc_read(document_id: str, offset: int = 0, limit: int = 5000) -> str:
+            db = _get_db()
+            doc = db.get_document(document_id, user_id=_get_user_id())
+            if not doc:
+                return json.dumps({"error": f"Document not found: {document_id}"})
+            ver = db.get_document_current_version(document_id)
+            if not ver:
+                return json.dumps({"content": "", "version": 0})
+            v_row = db.get_document_version_by_number(document_id, ver)
+            content = v_row.get("content", "") if v_row else ""
+            lines = content.split("\n")
+            return json.dumps({
+                "document_id": document_id, "title": doc.get("title"),
+                "version": ver, "content": "\n".join(lines[offset:offset + limit]),
+            }, ensure_ascii=False)
+        self.register("doc_read",
+            "读取文档全文或指定部分。参数: document_id, offset, limit",
+            doc_read,
+            args_schema={
+                "document_id": {"type": "str", "description": "文档 ID"},
+                "offset": {"type": "int", "description": "起始行", "required": False},
+                "limit": {"type": "int", "description": "最大行数", "required": False},
+            }, metadata=ToolMetadata(category="document"))
+
+    def _register_doc_write_section(self):
+        def doc_write_section(document_id: str, section_title: str, content: str) -> str:
+            db = _get_db()
+            doc = db.get_document(document_id, user_id=_get_user_id())
+            if not doc:
+                return json.dumps({"error": f"Document not found: {document_id}"})
+            cur_ver = db.get_document_current_version(document_id) or 0
+            v_row = db.get_document_version_by_number(document_id, cur_ver)
+            old = v_row.get("content", "") if v_row else ""
+            header = f"## {section_title}"
+            if header in old:
+                parts = old.split(header, 1)
+                after = parts[1].split("\n## ", 1) if "\n## " in parts[1] else [parts[1], ""]
+                new_content = parts[0] + header + "\n" + content + ("\n## " + after[1] if after[1] else "")
+            else:
+                new_content = old + f"\n\n{header}\n{content}"
+            ver_id = db.create_document_version(document_id, new_content, trigger="ai_turn")
+            return json.dumps({"success": True, "document_id": document_id, "version_id": ver_id})
+        self.register("doc_write_section",
+            "覆盖文档指定 section。参数: document_id, section_title (如 '## Introduction'), content",
+            doc_write_section,
+            args_schema={
+                "document_id": {"type": "str", "description": "文档 ID"},
+                "section_title": {"type": "str", "description": "section 标题（不含 ##）"},
+                "content": {"type": "str", "description": "新的 section 内容"},
+            }, metadata=ToolMetadata(category="document"))
+
+    def _register_doc_append(self):
+        def doc_append(document_id: str, content: str) -> str:
+            db = _get_db()
+            doc = db.get_document(document_id, user_id=_get_user_id())
+            if not doc:
+                return json.dumps({"error": f"Document not found: {document_id}"})
+            cur_ver = db.get_document_current_version(document_id) or 0
+            v_row = db.get_document_version_by_number(document_id, cur_ver)
+            old = v_row.get("content", "") if v_row else ""
+            new_content = old + "\n" + content
+            ver_id = db.create_document_version(document_id, new_content, trigger="ai_turn")
+            return json.dumps({"success": True, "document_id": document_id, "version_id": ver_id})
+        self.register("doc_append",
+            "在文档末尾追加内容。参数: document_id, content",
+            doc_append,
+            args_schema={
+                "document_id": {"type": "str", "description": "文档 ID"},
+                "content": {"type": "str", "description": "要追加的内容"},
+            }, metadata=ToolMetadata(category="document"))
+
+    def _register_doc_diff_apply(self):
+        def doc_diff_apply(document_id: str, diff_json: str) -> str:
+            db = _get_db()
+            doc = db.get_document(document_id, user_id=_get_user_id())
+            if not doc:
+                return json.dumps({"error": f"Document not found: {document_id}"})
+            import difflib
+            try:
+                diff = json.loads(diff_json) if isinstance(diff_json, str) else diff_json
+            except (json.JSONDecodeError, TypeError):
+                return json.dumps({"error": "Invalid diff JSON"})
+            cur_ver = db.get_document_current_version(document_id) or 0
+            v_row = db.get_document_version_by_number(document_id, cur_ver)
+            old = v_row.get("content", "") if v_row else ""
+            new_content = diff.get("after", old)
+            ver_id = db.create_document_version(document_id, new_content, trigger="ai_turn")
+            return json.dumps({"success": True, "document_id": document_id, "version_id": ver_id})
+        self.register("doc_diff_apply",
+            "应用 diff 到文档。参数: document_id, diff_json ({\"before\":\"...\", \"after\":\"...\"})",
+            doc_diff_apply,
+            args_schema={
+                "document_id": {"type": "str", "description": "文档 ID"},
+                "diff_json": {"type": "str", "description": "diff JSON"},
+            }, metadata=ToolMetadata(category="document"))
+
+    def _register_doc_generate_review(self):
+        def doc_generate_review(document_id: str) -> str:
+            db = _get_db()
+            doc = db.get_document(document_id, user_id=_get_user_id())
+            if not doc:
+                return json.dumps({"error": f"Document not found: {document_id}"})
+            cur_ver = db.get_document_current_version(document_id) or 0
+            v_row = db.get_document_version_by_number(document_id, cur_ver)
+            content = v_row.get("content", "") if v_row else ""
+            word_count = len(content.split())
+            return json.dumps({
+                "success": True, "document_id": document_id, "version": cur_ver,
+                "word_count": word_count, "note": "文档综述需由 LLM 生成，工具返回当前状态",
+            }, ensure_ascii=False)
+        self.register("doc_generate_review",
+            "生成文档综述。参数: document_id",
+            doc_generate_review,
+            args_schema={
+                "document_id": {"type": "str", "description": "文档 ID"},
+            }, metadata=ToolMetadata(category="document"))
+
+    def _register_doc_search_rag(self):
+        def doc_search_rag(document_id: str, query: str, top_k: int = 5) -> str:
+            db = _get_db()
+            doc = db.get_document(document_id, user_id=_get_user_id())
+            if not doc:
+                return json.dumps({"error": f"Document not found: {document_id}"})
+            cur_ver = db.get_document_current_version(document_id) or 0
+            v_row = db.get_document_version_by_number(document_id, cur_ver)
+            content = v_row.get("content", "") if v_row else ""
+            paragraphs = [p for p in content.split("\n\n") if p.strip()]
+            if not paragraphs:
+                return json.dumps({"results": []})
+            matches = []
+            for p in paragraphs:
+                score = sum(1 for w in query.lower().split() if w in p.lower())
+                if score > 0:
+                    matches.append({"text": p[:500], "score": score / len(query.split())})
+            matches.sort(key=lambda x: x["score"], reverse=True)
+            return json.dumps({"results": matches[:top_k]}, ensure_ascii=False)
+        self.register("doc_search_rag",
+            "搜索文档内相关内容（基于关键词匹配）。参数: document_id, query, top_k",
+            doc_search_rag,
+            args_schema={
+                "document_id": {"type": "str", "description": "文档 ID"},
+                "query": {"type": "str", "description": "搜索关键词"},
+                "top_k": {"type": "int", "description": "返回数量", "required": False},
+            }, metadata=ToolMetadata(category="document", is_idempotent=True))

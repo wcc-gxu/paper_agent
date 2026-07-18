@@ -277,10 +277,39 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
 
     # ── Redis LPUSH helper (v3.2: user-scoped queue) ──────
     async def _push_to_redis(msg: dict):
-        """推送消息到 Redis 队列，失败重试 3 次。"""
+        """推送消息到 Redis 队列，失败重试 3 次。v4.0: 检测 heartbeat。"""
         msg["_session_id"] = session_id
         msg["_agent_id"] = _resolved_agent_id
-        msg["target_agent_id"] = _resolved_agent_id  # v3.2: daemon 路由用
+        msg["target_agent_id"] = _resolved_agent_id
+
+        # v4.0: Agent 心跳检测
+        try:
+            hb_raw = await _redis.get(f"agent:heartbeat:{_user_id}")
+            if not hb_raw and msg.get("type") in ("message", "ask_reply", "plan_approve", "plan_revise"):
+                await websocket.send_text(_json.dumps({
+                    "type": "error", "subType": "AGENT_NOT_RUNNING",
+                    "msg_id": str(uuid.uuid4()), "agentId": _resolved_agent_id,
+                    "sessionId": session_id,
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "priority": "urgent",
+                    "payload": {"code": "AGENT_NOT_RUNNING", "message": "Agent 未运行，请先启动"},
+                }, ensure_ascii=False))
+                return False
+
+            if hb_raw:
+                hb = _json.loads(hb_raw)
+                if int(hb.get("active_turns", 0)) > 0:
+                    await websocket.send_text(_json.dumps({
+                        "type": "status",
+                        "msg_id": str(uuid.uuid4()), "agentId": _resolved_agent_id,
+                        "sessionId": session_id,
+                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "priority": "normal",
+                        "payload": {"stage": "queued", "message": "Agent 处理中，消息已排队"},
+                    }, ensure_ascii=False))
+        except Exception:
+            pass  # Redis 不可用时不阻塞业务
+
         data = _json.dumps(msg, ensure_ascii=False, default=str)
         for attempt in range(3):
             try:
