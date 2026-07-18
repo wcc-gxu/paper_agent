@@ -7,6 +7,7 @@ services:
       POSTGRES_DB: paper_search
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
