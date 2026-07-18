@@ -70,6 +70,7 @@ all = [
     "pymupdf4llm",
     "pgvector>=0.3",
     "psycopg2-binary>=2.9",
+    "python-multipart>=0.0.20",
 ]
 
 [build-system]
