@@ -53,6 +53,9 @@ jobs:
             echo ""
             echo "=== Service status ==="
             docker compose ps
+            echo ""
+            echo "=== Cleanup old Docker images ==="
+            docker system prune -f
 
   deploy-prod:
     if: github.event.inputs.environment == 'production'
@@ -97,3 +100,6 @@ jobs:
             echo ""
             echo "=== Service status ==="
             docker compose ps
+            echo ""
+            echo "=== Cleanup old Docker images ==="
+            docker system prune -f
