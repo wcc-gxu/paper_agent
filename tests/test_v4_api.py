@@ -325,18 +325,12 @@ class TestAgentHeartbeat:
         assert data["status"] == "running"
         assert data["active_turns"] == 2
 
-    def test_agent_manager_has_heartbeat_fields(self):
-        from paper_search.agent.daemon import AgentManager
-        # _stopping/_active_turn_count/_current_session_id set in __init__
-        # verify they exist on an initialized instance
-        am = AgentManager(
-            user_id="test-user", redis_url="redis://localhost:6379/0",
-            db=MagicMock(), llm=MagicMock(), registry=MagicMock(),
-            memory=MagicMock(), vector_store=MagicMock(),
-        )
-        assert am._stopping == False
-        assert am._active_turn_count == 0
-        assert am._current_session_id == ""
+    def test_agent_heartbeat_uses_status_hash(self):
+        from paper_search.agent.daemon import AgentSupervisor
+        s = AgentSupervisor(redis_url="redis://localhost:6379/0")
+        assert s._agents == {}
+        assert s._status_cache == {}
+        assert s._stopping is False
 
 
 # ═══════════════════════════════════════════════════════════════

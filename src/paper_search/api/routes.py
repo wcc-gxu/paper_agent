@@ -1067,18 +1067,50 @@ async def update_my_agent(req: dict, user_id: str = Depends(verify_api_key)):
 
 @router.get("/agents/me/status")
 async def get_my_agent_status(user_id: str = Depends(verify_api_key)):
-    """轻量轮询 Agent 状态（只读 Redis 心跳）。"""
+    """v4.1: 查 Supervisor 维护的 agent:status Hash。"""
     import os
     try:
         import redis.asyncio as aioredis
         r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-        hb = await r.get(f"agent:heartbeat:{user_id}")
+        raw = await r.hget("agent:status", user_id)
         await r.aclose()
-        if hb:
-            return {"status": "running", **_json.loads(hb)}
-        return {"status": "stopped", "active_turns": 0}
+        if raw:
+            return _json.loads(raw)
+        return {"state": "stopped", "active_turns": 0}
     except Exception:
-        return {"status": "unknown", "active_turns": 0}
+        return {"state": "unknown", "active_turns": 0}
+
+
+@router.post("/agents/me/start")
+async def start_my_agent(user_id: str = Depends(verify_api_key)):
+    """v4.1: PUBLISH agent:control {cmd:start} → Supervisor 创建子进程。"""
+    import os
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        await r.publish("agent:control", _json.dumps({
+            "cmd": "start", "user_id": user_id,
+        }))
+        await r.aclose()
+        return {"status": "starting", "message": "Agent 启动指令已发送"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send start command: {e}")
+
+
+@router.post("/agents/me/stop")
+async def stop_my_agent(user_id: str = Depends(verify_api_key)):
+    """v4.1: PUBLISH agent:control {cmd:stop} → Supervisor 发 SIGTERM。"""
+    import os
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        await r.publish("agent:control", _json.dumps({
+            "cmd": "stop", "user_id": user_id,
+        }))
+        await r.aclose()
+        return {"status": "stopping", "message": "Agent 停止指令已发送"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send stop command: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════

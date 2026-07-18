@@ -1,14 +1,14 @@
-"""Agent 守护进程入口 — bootstrap + MainAgent。
+"""Agent Supervisor — 管理所有用户 Agent 子进程。
 
-Phase 5: 简化版守护进程
-  - AgentManifest: Agent 身份持久化（保留）
-  - AgentBootstrap: 创建/恢复 db + llm + tools + memory（不再编译 PlanGraph）
-  - 启动 MainAgent (5 节点显式状态机) 主循环
+v4.1: 替代旧的 AgentManager 单用户模型。
+  - 启动时扫描 agents 表，为每个活跃用户创建子进程
+  - 消息路由: BRPOP agent:ws:{uid} → stdin → 子进程
+  - 出站拦截: 子进程 stdout → LPUSH agent:outbox:{uid}
+  - 3 层健康检测: poll() / 队列积压 / stdout 超时
+  - 控制指令: SUBSCRIBE agent:control
+  - 状态维护: HSET agent:status Hash
 
-旧 AgentRunLoop 类已删除（事件循环现在在 MainAgent.run 里）。
-
-使用方式::
-
+使用方式:
     python -m paper_search.agent.daemon
     python -m paper_search.agent.daemon --data-dir /path
 """
@@ -21,618 +21,477 @@ import logging
 import os
 import signal
 import sys
-import uuid
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AGENT_ID = "agent-001"
-DEFAULT_DISPLAY_NAME = "Paper Agent"
-MANIFEST_VERSION = "1.0"
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Node timeout overrides for busy detection (seconds)
+NODE_TIMEOUTS = {
+    "intent_classify": 120,
+    "plan": 120,
+    "execute": 300,
+    "clarify": 300,
+    "gate": 600,
+    "ask_user": 600,
+    "evaluate": 120,
+    "inline_reply": 60,
+}
+DEFAULT_BUSY_TIMEOUT = 300
+QUEUE_STALE_SECONDS = 43200  # 0.5d — idle but queue is old
+STDOUT_SILENT_SECONDS = 15
 
 
-def _now() -> str:
+def _now_ts() -> float:
+    return _time.time()
+
+
+def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Manifest
+# AgentSupervisor
 # ═══════════════════════════════════════════════════════════════
 
 
-class AgentManifest:
-    """Agent 身份证 — JSON 序列化数据结构。
+class AgentSupervisor:
+    """管理所有用户 Agent 子进程的生命周期、消息路由、状态监控。
 
-    v3 Phase 1: 支持多用户，每个 user_id 独立 manifest 文件。
+    每个用户一个独立的 Python 子进程，通过 stdin/stdout pipe 通信。
+    Agent 子进程不直接连接 Redis。
     """
 
-    def __init__(self, data_dir: Path, user_id: str = "default"):
-        self.user_id = user_id
-        manifests_dir = data_dir / "manifests"
-        manifests_dir.mkdir(parents=True, exist_ok=True)
-        self.path = manifests_dir / f"{user_id}.json"
-        self.data: dict = {}
-        self._legacy_path = data_dir / "agent_manifest.json"
-
-    def exists(self) -> bool:
-        return self.path.exists()
-
-    def load(self) -> dict:
-        # 向后兼容：从旧 manifest 路径迁移
-        if not self.path.exists() and self._legacy_path.exists():
-            logger.info(f"Migrating legacy manifest from {self._legacy_path} to {self.path}")
-            old_data = json.loads(self._legacy_path.read_text(encoding="utf-8"))
-            old_data.setdefault("agent", {})["agent_id"] = f"agent-{self.user_id}"
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps(old_data, ensure_ascii=False, indent=2), encoding="utf-8",
-            )
-            # 保留旧文件作为备份，不删除
-        if self.path.exists():
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
-        return self.data
-
-    def save(self, data: dict):
-        self.data = data
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
-        logger.info(f"Manifest saved: {self.path}")
-
-    @property
-    def agent_id(self) -> str:
-        return (self.data.get("agent") or {}).get("agent_id", f"agent-{self.user_id}")
-
-    @property
-    def llm_provider(self) -> str:
-        return ((self.data.get("runtime") or {}).get("llm") or {}).get("provider", "deepseek")
-
-
-# ═══════════════════════════════════════════════════════════════
-# AgentManager — v3.2 多智能体路由
-# ═══════════════════════════════════════════════════════════════
-
-
-class AgentManager:
-    """管理一个用户的所有智能体实例。
-
-    v3.2: 一个 daemon 进程处理一个用户的所有智能体。
-    BRPOP agent:ws:{user_id} → 读 target_agent_id → 路由到对应 MainAgent。
-    """
-
-    def __init__(self, user_id: str, redis_url: str, db, llm, registry, memory, vector_store):
-        self.user_id = user_id
+    def __init__(self, redis_url: str = REDIS_URL):
         self.redis_url = redis_url
-        self.db = db
-        self.llm = llm
-        self.registry = registry
-        self.memory = memory
-        self.vector_store = vector_store
-        self._agents: dict[str, "MainAgent"] = {}
-        self._default_agent_id: str = ""
+        self.redis: Any = None
+        self._agents: dict[str, asyncio.subprocess.Process] = {}
+        self._agent_started: dict[str, float] = {}
+        self._status_cache: dict[str, dict] = {}
+        self._pid_to_uid: dict[int, str] = {}
         self._stopping = False
-        self._active_turn_count = 0
-        self._current_session_id = ""
+        self._data_dir: Optional[Path] = None
 
-    async def load_agents(self, graph_builder) -> None:
-        """从 DB 加载该用户所有活跃智能体."""
-        agents = self.db.list_user_agents(self.user_id)
-        if not agents:
-            logger.warning("No agents found for user=%s, creating default", self.user_id)
-            agent_id = self.db.create_agent(user_id=self.user_id, name="Default Agent")
-            agents = self.db.list_user_agents(self.user_id)
+    # ── Launch / Stop ──────────────────────────────────────
 
-        for ag in agents:
-            agent_id = ag["id"]
-            system_prompt = ag.get("system_prompt", "") or ""
-            llm_provider = ag.get("llm_provider", "deepseek")
-            logger.info("Loading agent: %s (name=%s provider=%s prompt_len=%d)",
-                        agent_id, ag.get("name", ""), llm_provider, len(system_prompt))
+    async def launch_agent(self, user_id: str) -> bool:
+        """启动一个用户 Agent 子进程。"""
+        if user_id in self._agents:
+            proc = self._agents[user_id]
+            if proc.returncode is None:
+                logger.info("Agent %s already running (pid=%d)", user_id, proc.pid)
+                return False
+            del self._agents[user_id]
 
-            from .main_agent import MainAgent
-            # Build graph with agent-specific system prompt
-            compiled_graph = graph_builder(
-                llm=self.llm,
-                registry=self.registry,
-                db=self.db,
-                push_fn=self._make_push_fn(agent_id),
-                get_user_fn=self._make_get_user_fn(),
-                agent_system_prompt=system_prompt,
+        cmd = [
+            sys.executable, "-m", "paper_search.agent.agent_worker",
+            "--user-id", user_id,
+        ]
+        logger.info("Launching agent: user=%s cmd=%s", user_id, " ".join(cmd))
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            ma = MainAgent(
-                agent_id=agent_id,
-                redis_url=self.redis_url,
-                user_id=self.user_id,
-                llm=self.llm,
-                db=self.db,
-                memory=self.memory,
-                registry=self.registry,
-                graph=compiled_graph,
-                system_prompt=system_prompt,
-            )
-            self._agents[agent_id] = ma
-            if self._default_agent_id == "":
-                self._default_agent_id = agent_id
+        except Exception as e:
+            logger.error("Failed to launch agent %s: %s", user_id, e)
+            await self._hsync_status(user_id, state="crashed", last_error=str(e))
+            return False
 
-        logger.info("AgentManager: loaded %d agents for user=%s (default=%s)",
-                     len(self._agents), self.user_id, self._default_agent_id)
+        self._agents[user_id] = proc
+        self._agent_started[user_id] = _now_ts()
+        if proc.pid:
+            self._pid_to_uid[proc.pid] = user_id
 
-    def get_agent(self, agent_id: str) -> "MainAgent":
-        """获取智能体实例，不存在则回退到默认智能体."""
-        return self._agents.get(agent_id) or self._agents.get(self._default_agent_id)
+        await self._hsync_status(
+            user_id, state="starting", pid=proc.pid or 0,
+            node=None, active_turns=0,
+        )
 
-    def _make_push_fn(self, agent_id: str):
-        """创建 push 回调 — 将消息推送到 user-scoped outbox."""
-        from .outbox import outbox_publish as _publish
+        # Start reading stdout in background
+        asyncio.create_task(self._read_agent_stdout(user_id, proc))
+        # Start reading stderr for crash logs
+        asyncio.create_task(self._read_agent_stderr(user_id, proc))
 
-        async def push(session_id, msg_type, sub_type, role, payload, priority_kind="normal"):
-            envelope = {
-                "type": msg_type,
-                "subType": sub_type,
-                "role": role,
-                "agentId": agent_id,
-                "sessionId": session_id,
-                "payload": payload,
-                "priorityKind": priority_kind,
-            }
-            import redis.asyncio as aioredis
-            r = aioredis.from_url(self.redis_url, decode_responses=True)
+        logger.info("Agent %s launched: pid=%d", user_id, proc.pid)
+        return True
+
+    async def stop_agent(self, user_id: str, graceful: bool = True) -> bool:
+        """停止一个用户 Agent。"""
+        proc = self._agents.get(user_id)
+        if proc is None or proc.returncode is not None:
+            await self._hsync_status(user_id, state="stopped")
+            return False
+
+        await self._hsync_status(user_id, state="stopping")
+        if graceful:
+            proc.send_signal(signal.SIGTERM)
             try:
-                await _publish(r, self.db, envelope, user_id=self.user_id)
-            finally:
-                await r.aclose()
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                logger.warning("Agent %s did not exit gracefully, force killing", user_id)
+                proc.kill()
+        else:
+            proc.kill()
 
-        return push
+        await self._hsync_status(user_id, state="stopped")
+        return True
 
-    def _make_get_user_fn(self):
-        """创建 get_user 回调 — 从 user-scoped 队列获取用户回复.
+    async def _relaunch_agent(self, user_id: str):
+        """Agent 崩溃后自动重启。"""
+        logger.info("Auto-restarting agent %s", user_id)
+        await self.launch_agent(user_id)
 
-        Handles multiple reply types:
-          - ask_reply: user response to ask card (clarification/choice)
-          - plan_approve: user approves a plan
-          - plan_revise: user requests plan revision with feedback
+    # ── Message Ingress (BRPOP → stdin) ────────────────────
 
-        Matches by session_id and ask_id/review_id.
-        Non-matching messages are parked for later processing.
-        Returns None on timeout.
-        """
+    async def _ingress_loop(self):
+        """BRPOP 所有用户队列 → route to agent subprocess stdin."""
         import redis.asyncio as aioredis
-        import json as _json
-        import asyncio as _asyncio
+        self.redis = aioredis.from_url(self.redis_url, decode_responses=True)
 
-        async def get_user(session_id, ask_id="", timeout=60):
-            ws_key = f"agent:ws:{self.user_id}"
-            parked_key = f"agent:ws:{self.user_id}:parked"
-            deadline = _asyncio.get_event_loop().time() + timeout
-
-            r = aioredis.from_url(self.redis_url, decode_responses=True)
-            try:
-                while True:
-                    remaining = deadline - _asyncio.get_event_loop().time()
-                    if remaining <= 0:
-                        return None
-                    # Check parked first
-                    raw = await r.rpop(parked_key)
-                    if raw is None:
-                        raw = await r.brpop(ws_key, timeout=int(min(remaining, 30)))
-                        if raw is None:
-                            continue
-                        raw = raw[1] if isinstance(raw, (list, tuple)) else raw
-
-                    try:
-                        msg = _json.loads(raw)
-                    except _json.JSONDecodeError:
-                        continue
-
-                    p = msg.get("payload") or {}
-                    msg_type = msg.get("type", "")
-
-                    # Match: ask_reply — matching session and ask_id
-                    if (msg_type == "ask_reply"
-                            and msg.get("_session_id") == session_id
-                            and p.get("ask_id") == ask_id):
-                        p["_type"] = "ask_reply"
-                        return p
-
-                    # Match: plan_approve — matching session and review_id
-                    if (msg_type == "plan_approve"
-                            and msg.get("_session_id") == session_id
-                            and p.get("plan_id", "")):
-                        review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
-                        if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
-                            p["_type"] = "plan_approve"
-                            return p
-
-                    # Match: plan_revise — matching session and review_id
-                    if (msg_type == "plan_revise"
-                            and msg.get("_session_id") == session_id
-                            and p.get("plan_id", "")):
-                        review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
-                        if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
-                            p["_type"] = "plan_revise"
-                            return p
-
-                    # Not matching — park it for the main loop to pick up later
-                    try:
-                        await r.lpush(parked_key, raw)
-                    except Exception:
-                        pass
-            finally:
-                await r.aclose()
-
-        return get_user
-
-    async def _heartbeat_loop(self, r):
-        """独立心跳 Task — 每 10s 刷新 Redis heartbeat key（TTL 15s）。"""
-        key = f"agent:heartbeat:{self.user_id}"
+        logger.info("Ingress loop started")
         while not self._stopping:
-            try:
-                await r.set(key, json.dumps({
-                    "status": "running",
-                    "active_turns": self._active_turn_count,
-                    "current_session": self._current_session_id,
-                }), ex=15)
-            except Exception as e:
-                logger.warning(f"Heartbeat set failed: {e}")
-            await asyncio.sleep(10)
-
-    async def run(self):
-        """主循环：BRPOP agent:ws:{user_id} → dispatch to target agent。"""
-        import redis.asyncio as aioredis
-        import json as _json
-        r = aioredis.from_url(self.redis_url, decode_responses=True)
-        ws_queue = f"agent:ws:{self.user_id}"
-        parked_queue = f"agent:ws:{self.user_id}:parked"
-
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(r))
-
-        logger.info("AgentManager running: user=%s queue=%s agents=%d",
-                     self.user_id, ws_queue, len(self._agents))
-
-        while True:
-            try:
-                raw = await r.brpop(ws_queue, timeout=0)
-            except Exception as e:
-                logger.error("AgentManager BRPOP error: %s, retrying...", e)
+            if not self._agents:
                 await asyncio.sleep(1)
                 continue
 
-            msg_list = [_json.loads(raw[1])]
-            # Drain backlog
-            while True:
-                more = await r.rpop(ws_queue)
-                if more is None:
-                    break
-                msg_list.append(_json.loads(more))
-            # Drain parked
-            while True:
-                more = await r.rpop(parked_queue)
-                if more is None:
-                    break
-                msg_list.append(_json.loads(more))
+            # Build list of active queues
+            queues = [f"agent:ws:{uid}" for uid in self._agents
+                      if self._agents[uid].returncode is None]
 
-            target_agent_id = msg_list[0].get("target_agent_id", "")
-            agent = self.get_agent(target_agent_id)
-            if agent is None:
-                logger.warning("No agent for target=%s, using default=%s",
-                              target_agent_id, self._default_agent_id)
-                agent = self._agents.get(self._default_agent_id)
-                if agent is None:
-                    continue
-
-            session_id = msg_list[0].get("_session_id", "main")
-            user_content = agent._combine_user_text(msg_list)
-            agent._correlation_id = str(uuid.uuid4())
-            agent._current_session_id = session_id
-            self._current_session_id = session_id
-            self._active_turn_count += 1
-            try:
-                await agent._run_turn(session_id, user_content)
-            except Exception as e:
-                logger.error("Agent %s turn error: %s", agent._agent_id, e, exc_info=True)
-            finally:
-                self._active_turn_count = max(0, self._active_turn_count - 1)
-
-    async def plan_clarify_loop(self, planning_prompt: str, session_id: str,
-                                preferences: dict) -> dict:
-        """v4.0 Plan ⇄ Clarify 外循环 — daemon 层控制。"""
-        from .graphs.main_graph import MainGraph, MAX_CLARIFY_ROUNDS
-
-        MAX_OUTER_ROUNDS = int(os.getenv("MAX_PLAN_CLARIFY_OUTER", "5"))
-        recent_events = []
-        agent = self._agents.get(self._default_agent_id)
-        if not agent:
-            return {"plan": None}
-
-        for _ in range(MAX_OUTER_ROUNDS):
-            result = await agent._graph.ainvoke_plan_node(
-                planning_prompt=planning_prompt,
-                recent_events=recent_events,
-                preferences=preferences,
-                session_id=session_id,
-            )
-
-            if result.get("needs_clarification"):
-                clarify_result = await agent._graph._clarify(
-                    goal=result.get("clarification_goal", ""),
-                    suggested_tools=result.get("suggested_tools", []),
-                    max_rounds=MAX_CLARIFY_ROUNDS,
-                )
-                recent_events.append({"collected_info": clarify_result.get("collected_info", "")})
+            if not queues:
+                await asyncio.sleep(0.5)
                 continue
 
-            plan = result.get("plan")
-            if not plan:
-                return {"plan": None}
-
-            approved = await agent._graph._gate_invoke(plan)
-            if approved:
-                return {"plan": plan, "approved": True}
-
-            feedback = approved if isinstance(approved, dict) else result.get("feedback", "")
-            recent_events.append({"feedback": feedback})
-
-        return {"plan": result.get("plan"), "max_rounds": True}
-
-
-async def _run_agent_manager(data_dir: Optional[str] = None, user_id: str = "default"):
-    """AgentManager 入口 — user-scoped 队列，支持多智能体路由。"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    os.environ.setdefault("DEBUG_PROTOCOL", "1")
-    logger.info("DEBUG_PROTOCOL enabled")
-
-    path = Path(data_dir) if data_dir else None
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    user_id = os.getenv("PAPER_USER_ID", user_id)
-
-    bs = AgentBootstrap(data_dir=path, user_id=user_id)
-    result = await bs.bootstrap()
-
-    manifest = result["manifest"]
-    agent_id = manifest["agent"]["agent_id"]
-    logger.info("Bootstrap complete: agent_id=%s user_id=%s", agent_id, user_id)
-
-    from .graphs.main_graph import build_main_graph
-
-    manager = AgentManager(
-        user_id=user_id,
-        redis_url=redis_url,
-        db=result["db"],
-        llm=result["llm"],
-        registry=result["tools"],
-        memory=result["memory"],
-        vector_store=None,
-    )
-
-    await manager.load_agents(build_main_graph)
-
-    report_task = asyncio.create_task(
-        _consume_agent_reports(manager, redis_url),
-        name="agent-report-consumer",
-    )
-
-    stop_event = asyncio.Event()
-
-    def _sig_handler():
-        logger.info("Received shutdown signal")
-        stop_event.set()
-
-    try:
-        loop_evt = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                loop_evt.add_signal_handler(sig, _sig_handler)
-            except (NotImplementedError, RuntimeError):
+                result = await self.redis.brpop(queues, timeout=1)
+            except Exception:
+                await asyncio.sleep(0.5)
+                continue
+
+            if result is None:
+                continue
+
+            queue_name = result[0]
+            raw_msg = result[1]
+            uid = queue_name.replace("agent:ws:", "")
+
+            proc = self._agents.get(uid)
+            if proc is None or proc.returncode is not None:
+                # Agent not running — park the message
+                try:
+                    await self.redis.rpush(f"agent:ws:{uid}:parked", raw_msg)
+                except Exception:
+                    pass
+                continue
+
+            try:
+                proc.stdin.write((raw_msg + "\n").encode())
+                await proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as e:
+                logger.warning("Agent %s stdin broken: %s", uid, e)
+                await self._handle_exit(uid, proc)
+
+    # ── Message Egress (stdout → LPUSH) ─────────────────────
+
+    async def _read_agent_stdout(self, uid: str, proc: asyncio.subprocess.Process):
+        """持续读取 Agent 子进程 stdout，解析 JSON → 路由到 Redis。"""
+        logger.info("Egress reader started for %s (pid=%d)", uid, proc.pid)
+        try:
+            while proc.returncode is None:
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=60)
+                except asyncio.TimeoutError:
+                    continue
+
+                if not line:
+                    break
+
+                try:
+                    msg = json.loads(line.decode("utf-8").strip())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    logger.debug("Agent %s stdout non-JSON: %s", uid, line[:100])
+                    continue
+
+                msg_type = msg.get("type", "")
+
+                if msg_type == "state":
+                    node = msg.get("node", "")
+                    state = msg.get("state", "idle")
+                    active = msg.get("active_turns", 0)
+                    self._status_cache[uid] = {
+                        "state": state, "node": node,
+                        "active_turns": active, "pid": proc.pid or 0,
+                        "updated_at": _now_ts(),
+                    }
+                    await self._hsync_status(
+                        uid, state=state, node=node,
+                        active_turns=active, pid=proc.pid or 0,
+                    )
+
+                elif msg_type == "reply":
+                    # Pass through to outbox
+                    content = msg.get("content", "")
+                    envelope = {
+                        "type": "message",
+                        "subType": "reply",
+                        "agentId": f"agent-{uid}",
+                        "sessionId": msg.get("session_id", "main"),
+                        "priority": "high",
+                        "payload": {"content": content},
+                        "timestamp": _now_iso(),
+                    }
+                    try:
+                        await self.redis.lpush(f"agent:outbox:{uid}",
+                                               json.dumps(envelope, ensure_ascii=False))
+                    except Exception as e:
+                        logger.error("Failed to push outbox for %s: %s", uid, e)
+
+                elif msg_type in ("tool", "status", "tool_execution",
+                                   "plan_todo_update", "error"):
+                    # Pass through other message types
+                    try:
+                        msg["agentId"] = msg.get("agentId", f"agent-{uid}")
+                        await self.redis.lpush(f"agent:outbox:{uid}",
+                                               json.dumps(msg, ensure_ascii=False))
+                    except Exception as e:
+                        logger.error("Failed to push outbox for %s: %s", uid, e)
+
+        except Exception as e:
+            logger.error("Agent %s stdout reader error: %s", uid, e)
+        finally:
+            logger.info("Agent %s stdout closed (pid=%d)", uid, proc.pid)
+            await self._handle_exit(uid, proc)
+
+    async def _read_agent_stderr(self, uid: str, proc: asyncio.subprocess.Process):
+        """读取 Agent stderr → 记日志。"""
+        try:
+            while proc.returncode is None:
+                try:
+                    line = await asyncio.wait_for(proc.stderr.readline(), timeout=60)
+                except asyncio.TimeoutError:
+                    continue
+                if not line:
+                    break
+                logger.error("Agent %s stderr: %s", uid,
+                             line.decode("utf-8", errors="replace").rstrip())
+        except Exception:
+            pass
+
+    async def _handle_exit(self, uid: str, proc: asyncio.subprocess.Process):
+        """处理 Agent 退出。"""
+        # Wait for process to fully exit if not already
+        if proc.returncode is None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
                 pass
-    except RuntimeError:
-        pass
 
-    run_task = asyncio.create_task(manager.run(), name="agent-manager-run")
-    stop_task = asyncio.create_task(stop_event.wait(), name="stop-waiter")
+        rc = proc.returncode
+        if rc == 0:
+            await self._hsync_status(uid, state="stopped")
+            logger.info("Agent %s exited normally (pid=%s)", uid,
+                        self._agent_started.get(uid, "?"))
+        else:
+            await self._hsync_status(uid, state="crashed",
+                                     last_error=f"exit_code={rc}")
+            logger.error("Agent %s crashed: rc=%d", uid, rc)
+            # Auto-restart if not manually stopped
+            if not self._stopping:
+                asyncio.create_task(self._relaunch_agent(uid))
 
-    try:
-        done, pending = await asyncio.wait(
-            {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
-        )
-    except asyncio.CancelledError:
-        pass
-    finally:
-        run_task.cancel()
-        report_task.cancel()
+        # Clean up stale parked messages (return to main queue on relaunch)
+        if uid in self._agents:
+            try:
+                parked = await self.redis.lrange(f"agent:ws:{uid}:parked", 0, -1)
+                for msg in parked:
+                    await self.redis.lpush(f"agent:ws:{uid}", msg)
+                await self.redis.delete(f"agent:ws:{uid}:parked")
+            except Exception:
+                pass
+
+    # ── Health Monitor (3 layers) ───────────────────────────
+
+    async def _monitor_loop(self):
+        """每 10s 检测所有 Agent 健康状态。"""
+        await asyncio.sleep(5)  # Let agents initialize first
+        logger.info("Health monitor started")
+        while not self._stopping:
+            for uid, proc in list(self._agents.items()):
+                # Layer 1: OS process check
+                rc = proc.returncode
+                if rc is not None:
+                    await self._handle_exit(uid, proc)
+                    continue
+
+                info = self._status_cache.get(uid, {})
+                state = info.get("state", "starting")
+                node = info.get("node", "")
+                last_update = info.get("updated_at", 0)
+                now = _now_ts()
+
+                # Layer 2: Busy timeout (per node)
+                if state == "busy" and last_update > 0:
+                    timeout = NODE_TIMEOUTS.get(node, DEFAULT_BUSY_TIMEOUT)
+                    if now - last_update > timeout:
+                        if node in ("gate", "ask_user"):
+                            # Don't kill — agent is waiting for user input
+                            logger.warning("Agent %s stuck waiting for user: node=%s age=%.0fs",
+                                          uid, node, now - last_update)
+                        else:
+                            logger.error("Agent %s busy timeout: node=%s age=%.0fs → SIGTERM",
+                                        uid, node, now - last_update)
+                            proc.send_signal(signal.SIGTERM)
+                            await self._hsync_status(uid, state="crashed",
+                                                     last_error=f"stuck_in_{node}")
+
+                # Layer 2: Idle queue staleness
+                if state == "idle":
+                    try:
+                        if self.redis:
+                            oldest_raw = await self.redis.xrange(
+                                f"agent:ws:{uid}", count=1)
+                            if oldest_raw:
+                                oldest_id = oldest_raw[0][0]
+                                oldest_ms = int(oldest_id.split("-")[0])
+                                age = (now * 1000 - oldest_ms) / 1000
+                                if age > QUEUE_STALE_SECONDS:
+                                    logger.warning(
+                                        "Agent %s stalled: state=idle queue_oldest=%.0fs",
+                                        uid, age)
+                                    await self._hsync_status(uid, state="stalled")
+                    except Exception:
+                        pass
+
+                # Layer 3: Stdout silence
+                if last_update > 0 and now - last_update > STDOUT_SILENT_SECONDS:
+                    logger.warning("Agent %s stdout silent for %.0fs (state=%s node=%s)",
+                                  uid, now - last_update, state, node)
+
+            await asyncio.sleep(10)
+
+    # ── Control Channel (Pub/Sub) ───────────────────────────
+
+    async def _control_listener(self):
+        """SUBSCRIBE agent:control — 接收 API 启停命令。"""
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(self.redis_url, decode_responses=True)
+        pubsub = r.pubsub()
+        await pubsub.subscribe("agent:control")
+        logger.info("Control listener started: agent:control")
+
         try:
-            await run_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        try:
-            await report_task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    logger.info("AgentManager stopped, exiting daemon.")
-
-
-async def _consume_agent_reports(manager: "AgentManager", redis_url: str):
-    """订阅 agent:reports channels 并推入对应 MainAgent 的错误队列。"""
-    import redis.asyncio as aioredis
-
-    base_channel = f"agent:reports:{manager.user_id}"
-
-    while True:
-        sub_redis = aioredis.from_url(redis_url, decode_responses=True)
-        pubsub = None
-        try:
-            pubsub = sub_redis.pubsub()
-            pattern = base_channel + ":*"
-            await pubsub.psubscribe(pattern)
-            await pubsub.subscribe(base_channel)
-            logger.info("Agent report consumer started: %s + %s", base_channel, pattern)
-
             async for message in pubsub.listen():
                 if message.get("type") != "message":
                     continue
                 try:
-                    data = json.loads(message.get("data", "{}"))
+                    cmd = json.loads(message.get("data", "{}"))
                 except json.JSONDecodeError:
                     continue
 
-                msg_type = data.get("type", "")
-                target_agent_id = data.get("agent_id", "")
-                agent = manager.get_agent(target_agent_id) if target_agent_id else None
+                action = cmd.get("cmd", "")
+                uid = cmd.get("user_id", "")
 
-                if msg_type == "agent_error" and agent:
-                    agent.push_agent_error(data)
-                elif msg_type == "agent_retry":
-                    logger.info(
-                        "[RETRY] agent=%s node=%s retry=%s/%s reason=%s",
-                        data.get("agent", "?"),
-                        data.get("node", "?"),
-                        data.get("retry_count", "?"),
-                        data.get("max_retries", "?"),
-                        data.get("reason", "")[:100],
-                    )
+                if action == "start":
+                    logger.info("Control: start agent %s", uid)
+                    await self.launch_agent(uid)
+                elif action == "stop":
+                    logger.info("Control: stop agent %s", uid)
+                    await self.stop_agent(uid)
+                elif action == "restart":
+                    logger.info("Control: restart agent %s", uid)
+                    await self.stop_agent(uid)
+                    await self.launch_agent(uid)
+                elif action == "shutdown":
+                    logger.info("Control: supervisor shutdown requested")
+                    self._stopping = True
+                else:
+                    logger.warning("Control: unknown command %s", action)
         except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.error("Agent report consumer crashed: %s, reconnecting in 5s", e, exc_info=True)
+            pass
         finally:
-            if pubsub is not None:
-                try:
-                    await pubsub.punsubscribe(pattern)
-                    await pubsub.unsubscribe(base_channel)
-                except Exception:
-                    pass
+            await pubsub.unsubscribe("agent:control")
+            await r.aclose()
+
+    # ── Status helpers ──────────────────────────────────────
+
+    async def _hsync_status(self, uid: str, **fields):
+        """HSET agent:status {uid} JSON."""
+        base = self._status_cache.get(uid, {
+            "state": "starting", "pid": 0,
+            "node": None, "active_turns": 0,
+            "started_at": _now_iso(),
+        })
+        base.update(fields)
+        base["updated_at"] = _now_iso()
+        self._status_cache[uid] = base
+        if self.redis:
             try:
-                await sub_redis.aclose()
-            except Exception:
-                pass
-        await asyncio.sleep(5)
+                await self.redis.hset("agent:status", uid,
+                                      json.dumps(base, ensure_ascii=False))
+            except Exception as e:
+                logger.error("HSET agent:status failed for %s: %s", uid, e)
 
+    def _should_restart(self, uid: str, exit_code: int) -> bool:
+        """判断是否应自动重启 Agent（非手动 stop，非正常 exit 0）。"""
+        if self._stopping:
+            return False
+        if exit_code == 0:
+            return False
+        # Restart on crash (too many crashed signals → maybe stop?)
+        return True
 
-# ═══════════════════════════════════════════════════════════════
-# Bootstrap
-# ═══════════════════════════════════════════════════════════════
+    # ── Bootstrap (shared resources) ────────────────────────
 
+    async def bootstrap(self, data_dir: Optional[Path] = None):
+        """初始化 DB/LLM/Tools — 子进程共享同一组后端。"""
+        self._data_dir = data_dir
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        os.environ.setdefault("DEBUG_PROTOCOL", "1")
+        logger.info("AgentSupervisor bootstrapping...")
 
-class AgentBootstrap:
-    """Agent 引导程序 — 启动时调用的唯一入口。
+    # ── Run ─────────────────────────────────────────────────
 
-    v3 Phase 1 重构：支持多用户（user_id 参数）。
+    async def run(self):
+        """主入口 — 启动 Supervisor 所有循环。"""
+        import redis.asyncio as aioredis
+        self.redis = aioredis.from_url(self.redis_url, decode_responses=True)
 
-    构建 4 个核心组件:
-      - AgentDB / PostgresAgentDB
-      - LLMClientV2
-      - ToolRegistry
-      - MemoryManager (含 ChromaStore/PgVectorStore 可选)
-    """
-
-    def __init__(self, data_dir: Optional[Path] = None, user_id: str = "default"):
-        if data_dir is None:
-            from ..config import get_data_dir
-            data_dir = get_data_dir()
-        self.data_dir = Path(data_dir)
-        self.user_id = user_id
-        self.manifest = AgentManifest(self.data_dir, user_id=user_id)
-
-        # 惰性初始化的组件
-        self._db = None
-        self._llm = None
-        self._tools = None
-        self._memory = None
-
-    async def bootstrap(self) -> dict:
-        """主入口 — 创建或恢复 Agent。
-
-        Returns:
-            {"manifest": dict, "db": AgentDB, "llm": LLMClientV2,
-             "tools": ToolRegistry, "memory": MemoryManager}
-        """
-        if self.manifest.exists():
-            logger.info(f"Resuming agent from manifest: {self.manifest.path}")
-            return await self._resume()
-        logger.info("First boot — creating main agent")
-        return await self._create()
-
-    # ── 核心组件构建（创建/恢复共用） ─────────────────
-
-    async def _build_core(self, manifest_data: dict, llm_provider: str = "deepseek"):
-        """统一构建 db / llm / tools / memory，避免 _create/_resume 重复代码。"""
-
-        # 1. DB: PostgreSQL (DATABASE_URL 必须设置)
-        from ..agent.pgdb import PostgresAgentDB
-        self._db = PostgresAgentDB()
-        logger.info("Database: PostgreSQL")
-
-        # 2. LLMClientV2 — via singleton (shared across daemon, tools, celery)
-        from ..agent.llm_client_v2 import get_llm_client
-        self._llm = get_llm_client(provider=llm_provider)
-        logger.info("LLM client initialized (singleton, provider=%s)", llm_provider)
-
-        # 3. ToolRegistry — inject DB singleton
-        from ..agent.tool_registry import ToolRegistry, set_db
-        set_db(self._db, user_id=self.user_id)  # 替代 66 处惰性 AgentDB() 调用
-        self._tools = ToolRegistry.get_instance()
-        logger.info(f"ToolRegistry: {len(self._tools.tool_names)} tools")
-
-        # 4. MemoryManager (含向量存储, 可选)
-        from ..agent.memory import MemoryManager
-        chroma = None
+        # Scan DB for active agents and launch subprocesses
+        from .pgdb import PostgresAgentDB
+        db = PostgresAgentDB()
         try:
-            from ..agent.pgvector_store import PgVectorStore
-            chroma = PgVectorStore(user_id=self.user_id)
-            logger.info("PgVectorStore initialized")
+            active_agents = db._fetchall(
+                "SELECT DISTINCT user_id FROM agents WHERE is_active = true")
+            logger.info("Found %d active users in DB", len(active_agents))
         except Exception as e:
-            logger.warning(f"Vector store unavailable (knowledge tools degrade): {e}")
-        self._memory = MemoryManager(self._db, chroma)
+            logger.error("Failed to scan agents table: %s", e)
+            active_agents = []
+        finally:
+            db.close()
 
-    async def _resume(self) -> dict:
-        """从已有的 manifest 恢复 Agent。"""
-        manifest_data = self.manifest.load()
-        llm_provider = ((manifest_data.get("runtime") or {}).get("llm") or {}).get("provider", "deepseek")
-        await self._build_core(manifest_data, llm_provider=llm_provider)
-        # 更新 manifest 状态
-        manifest_data.setdefault("agent", {})["status"] = "active"
-        manifest_data["agent"]["updated_at"] = _now()
-        self.manifest.save(manifest_data)
-        return {
-            "manifest": manifest_data,
-            "db": self._db, "llm": self._llm,
-            "tools": self._tools, "memory": self._memory,
-        }
+        # Launch all agents
+        for row in active_agents:
+            uid = row.get("user_id", "")
+            if uid and uid != "user-default":
+                asyncio.create_task(self.launch_agent(uid))
 
-    async def _create(self) -> dict:
-        """首次启动 — 从头创建 Agent。"""
-        now = _now()
-        agent_id = f"agent-{self.user_id}" if self.user_id != "default" else DEFAULT_AGENT_ID
-
-        manifest_data = {
-            "manifest_version": MANIFEST_VERSION,
-            "agent": {
-                "agent_id": agent_id,
-                "type": "main",
-                "display_name": DEFAULT_DISPLAY_NAME,
-                "user_id": self.user_id,
-                "created_at": now,
-                "updated_at": now,
-                "status": "active",
-            },
-            "runtime": {
-                "llm": {"provider": "deepseek"},
-            },
-        }
-        await self._build_core(manifest_data, llm_provider="deepseek")
-        self._db.create_session(agent_id, "main", title="新对话", user_id=self.user_id)
-        self.manifest.save(manifest_data)
-        return {
-            "manifest": manifest_data,
-            "db": self._db, "llm": self._llm,
-            "tools": self._tools, "memory": self._memory,
-        }
+        # Start 4 background loops
+        await asyncio.gather(
+            self._ingress_loop(),
+            self._monitor_loop(),
+            self._control_listener(),
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -640,253 +499,12 @@ class AgentBootstrap:
 # ═══════════════════════════════════════════════════════════════
 
 
-async def main(data_dir: Optional[str] = None, redis_url: Optional[str] = None,
-               user_id: str = "default"):
-    """daemon 主入口 — bootstrap + MainAgent。
-
-    Args:
-        data_dir: 数据目录路径。
-        redis_url: Redis 连接 URL。
-        user_id: 用户 ID（v3 多用户支持）。
-    """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    # Enable debug protocol: pushes LLM thinking + tool call details to WS client
-    os.environ.setdefault("DEBUG_PROTOCOL", "1")
-    logger.info("DEBUG_PROTOCOL enabled — LLM thinking + tool calls will be pushed to clients")
-
+async def main(data_dir: Optional[str] = None):
+    """Supervisor 主入口。"""
     path = Path(data_dir) if data_dir else None
-    redis = redis_url or os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-    # 从环境变量读取 user_id（可选覆盖）
-    user_id = os.getenv("PAPER_USER_ID", user_id)
-
-    # Bootstrap
-    bs = AgentBootstrap(data_dir=path, user_id=user_id)
-    result = await bs.bootstrap()
-
-    manifest = result["manifest"]
-    agent_id = manifest["agent"]["agent_id"]
-    logger.info(f"Agent {agent_id} (user={user_id}) ready, starting MainAgent...")
-
-    # v3.1: Build LangGraph MainGraph
-    from .graphs.main_graph import build_main_graph
-    from .outbox import outbox_publish
-    import redis.asyncio as aioredis
-
-    # Create Redis client for graph outbox pushes
-    _redis_client = aioredis.from_url(redis, decode_responses=True)
-
-    async def _graph_push(session_id: str, msg_type: str, subtype: str,
-                          role: str, payload: dict = None,
-                          priority_kind: str = "normal") -> None:
-        """Adapter: graph node push → outbox_publish."""
-        envelope = {
-            "type": msg_type, "subType": subtype, "role": role,
-            "agentId": agent_id, "sessionId": session_id,
-            "payload": payload or {},
-            "priority": priority_kind,
-        }
-        await outbox_publish(_redis_client, result["db"], envelope)
-
-    async def _graph_get_user(session_id: str, ask_id: str,
-                               timeout: int = 1800) -> dict | None:
-        """Wait for user reply to an ask/plan_review card via Redis BRPOP.
-
-        Handles multiple reply types:
-          - ask_reply: user response to ask card (clarification/choice)
-          - plan_approve: user approves a plan
-          - plan_revise: user requests plan revision with feedback
-
-        Matches by session_id and ask_id/review_id.
-        Returns payload dict with _type field set to distinguish reply types.
-        Non-matching messages are parked for later processing.
-        Returns None on timeout.
-        """
-        ws_queue = f"agent:ws:{agent_id}"
-        parked_queue = f"agent:ws:{agent_id}:parked"
-        deadline = asyncio.get_event_loop().time() + timeout
-
-        while True:
-            remaining = deadline - asyncio.get_event_loop().time()
-            if remaining <= 0:
-                logger.info("get_user timed out for ask_id=%s", ask_id)
-                return None
-            try:
-                raw = await _redis_client.brpop(
-                    ws_queue, timeout=int(min(remaining, 30)),
-                )
-            except Exception:
-                await asyncio.sleep(0.5)
-                continue
-            if raw is None:
-                continue
-            try:
-                msg = json.loads(raw[1])
-            except json.JSONDecodeError:
-                continue
-
-            p = msg.get("payload") or {}
-            msg_type = msg.get("type", "")
-
-            # Match: ask_reply type, matching session and ask_id
-            if (msg_type == "ask_reply"
-                    and msg.get("_session_id") == session_id
-                    and p.get("ask_id") == ask_id):
-                p["_type"] = "ask_reply"
-                return p
-
-            # Match: plan_approve type, matching session and review_id (plan_review→approve)
-            if (msg_type == "plan_approve"
-                    and msg.get("_session_id") == session_id
-                    and p.get("plan_id", "")):
-                # review_id format: review-plan-{plan_id}
-                review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
-                if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
-                    p["_type"] = "plan_approve"
-                    return p
-
-            # Match: plan_revise type, matching session and review_id (plan_review→revise)
-            if (msg_type == "plan_revise"
-                    and msg.get("_session_id") == session_id
-                    and p.get("plan_id", "")):
-                review_plan_id = ask_id.replace("review-", "") if ask_id.startswith("review-") else ""
-                if p.get("plan_id") == review_plan_id or ask_id.startswith(f"review-{p.get('plan_id')}"):
-                    p["_type"] = "plan_revise"
-                    return p
-
-            # Not matching — park it for the main loop to pick up later
-            try:
-                await _redis_client.lpush(parked_queue, raw[1])
-            except Exception:
-                pass
-
-    compiled_graph = build_main_graph(
-        llm=result["llm"],
-        registry=result["tools"],
-        db=result["db"],
-        push_fn=_graph_push,
-        get_user_fn=_graph_get_user,
-    )
-
-    # MainAgent (v3.1: delegates to compiled_graph)
-    from .main_agent import MainAgent
-    main_agent = MainAgent(
-        agent_id=agent_id,
-        redis_url=redis,
-        llm=result["llm"],
-        db=result["db"],
-        memory=result["memory"],
-        registry=result["tools"],
-        graph=compiled_graph,
-    )
-
-    # ── Agent Error Report 消费者 ─────────────────────────
-    # 订阅 agent:reports:{agent_id} Pub/Sub channel，
-    # 消费子 agent / tool 通过 Reporter.publish_agent_error() 上报的错误，
-    # 推入 MainAgent._error_queue 供当前 turn 检查
-
-    async def _consume_agent_reports():
-        """Background task: subscribe to agent error reports from Redis Pub/Sub.
-
-        Redis 闪断（如容器重建）时自动重连，而不是永久退出。
-        """
-        import redis.asyncio as aioredis
-
-        channel_name = f"agent:reports:{agent_id}"
-
-        while True:
-            sub_redis = aioredis.from_url(redis, decode_responses=True)
-            pubsub = None
-            try:
-                pubsub = sub_redis.pubsub()
-                await pubsub.subscribe(channel_name)
-                logger.info("Agent error report consumer started on channel: %s", channel_name)
-
-                async for message in pubsub.listen():
-                    if message.get("type") != "message":
-                        continue
-                    try:
-                        data = json.loads(message.get("data", "{}"))
-                    except json.JSONDecodeError:
-                        continue
-
-                    msg_type = data.get("type", "")
-                    if msg_type == "agent_error":
-                        # 推入 MainAgent 的错误队列
-                        main_agent.push_agent_error(data)
-                    elif msg_type == "agent_retry":
-                        logger.info(
-                            "[RETRY] agent=%s node=%s retry=%s/%s reason=%s",
-                            data.get("agent", "?"),
-                            data.get("node", "?"),
-                            data.get("retry_count", "?"),
-                            data.get("max_retries", "?"),
-                            data.get("reason", "")[:100],
-                        )
-            except asyncio.CancelledError:
-                return
-            except Exception as e:
-                logger.error(f"Agent report consumer crashed: {e}, reconnecting in 5s", exc_info=True)
-            finally:
-                if pubsub is not None:
-                    try:
-                        await pubsub.unsubscribe(channel_name)
-                    except Exception:
-                        pass
-                try:
-                    await sub_redis.aclose()
-                except Exception:
-                    pass
-            await asyncio.sleep(5)
-
-    report_consumer_task = asyncio.create_task(
-        _consume_agent_reports(), name="agent-report-consumer",
-    )
-
-    # 信号处理（优雅退出）
-    stop_event = asyncio.Event()
-
-    def _sig_handler():
-        logger.info("Received shutdown signal")
-        stop_event.set()
-
-    try:
-        loop_evt = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop_evt.add_signal_handler(sig, _sig_handler)
-            except (NotImplementedError, RuntimeError):
-                pass  # Windows 不支持
-    except RuntimeError:
-        pass
-
-    run_task = asyncio.create_task(main_agent.run(), name="main-agent-run")
-    stop_task = asyncio.create_task(stop_event.wait(), name="stop-waiter")
-
-    try:
-        done, pending = await asyncio.wait(
-            {run_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
-        )
-    except asyncio.CancelledError:
-        pass
-    finally:
-        run_task.cancel()
-        report_consumer_task.cancel()
-        try:
-            await run_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        try:
-            await report_consumer_task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    logger.info("MainAgent stopped, exiting daemon.")
-    return result
+    supervisor = AgentSupervisor()
+    await supervisor.bootstrap(data_dir=path)
+    await supervisor.run()
 
 
 if __name__ == "__main__":
@@ -898,5 +516,4 @@ if __name__ == "__main__":
         if arg.startswith("--data-dir="):
             data_dir = arg.split("=", 1)[1]
             break
-
-    asyncio.run(_run_agent_manager(data_dir=data_dir))
+    asyncio.run(main(data_dir=data_dir))

@@ -35,6 +35,7 @@ jobs:
             tests/test_subscription.py \
             tests/test_video_agent.py \
             tests/test_v4_api.py \
+            tests/test_v5_supervisor.py \
             -v --tb=short
 
   build-dev:
