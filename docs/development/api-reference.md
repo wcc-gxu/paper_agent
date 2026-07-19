@@ -61,7 +61,7 @@ REFRESH_TOKEN_EXPIRE_DAYS=7                  # 默认
 
 ## 2. 认证端点
 
-Base URL: `http://{host}:8000/api`
+Base URL: `http://{host}/api`
 
 ### `POST /api/auth/register`
 

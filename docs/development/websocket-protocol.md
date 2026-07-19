@@ -26,7 +26,7 @@ v10 围绕**小屏 iOS** 与 **Web SPA** 的交互范式重构,核心三条:
 ### 1.1 WebSocket 地址
 
 ```
-ws://{host}:{port}/ws/chat/{agent_id}/{session_id}?token=<jwt>
+ws://{host}/ws/chat/{agent_id}/{session_id}?token=<jwt>
 ```
 
 | 参数 | 说明 |

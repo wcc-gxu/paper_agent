@@ -149,7 +149,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Paper Agent API",
     description="学术论文搜索与科研助理 API — 多源搜索、自动下载、知识库管理",
-    version="3.0.0",
+    version="4.1.0",
     lifespan=lifespan,
 )
 
