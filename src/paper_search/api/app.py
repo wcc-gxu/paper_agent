@@ -154,13 +154,8 @@ app = FastAPI(
 )
 
 # CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# nginx 处理 CORS — 不加 FastAPI 中间件（避免双 Access-Control-Allow-Origin 头冲突）
+
 
 # Routes
 app.include_router(router)
