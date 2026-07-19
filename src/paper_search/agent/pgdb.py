@@ -246,9 +246,9 @@ class PostgresAgentDB:
         return self._fetchone("SELECT * FROM agents WHERE id = %s", (agent_id,))
 
     def get_default_agent(self, user_id: str) -> Optional[dict]:
-        """获取用户的默认智能体（最早创建且非 stopped 状态）。v4.1: 去掉 agent_type/is_active。"""
+        """获取用户的默认智能体（最早创建）。v4.1: 不按 state 过滤。"""
         return self._fetchone(
-            "SELECT * FROM agents WHERE user_id = %s AND state != 'stopped' ORDER BY created_at LIMIT 1",
+            "SELECT * FROM agents WHERE user_id = %s ORDER BY created_at LIMIT 1",
             (user_id,),
         )
 
