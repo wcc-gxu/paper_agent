@@ -1071,6 +1071,10 @@ async def get_my_agent(user_id: str = Depends(verify_api_key)):
     db = PostgresAgentDB()
     agent = db.get_default_agent(user_id)
     if not agent:
+        # 自动创建（兼容旧用户注册时 create_agent 失败）
+        agent_id = db.create_agent(user_id=user_id)
+        agent = db.get_agent(agent_id)
+    if not agent:
         raise HTTPException(status_code=404, detail="No agent found")
     status_info = {"state": "unknown", "active_turns": 0}
     try:
