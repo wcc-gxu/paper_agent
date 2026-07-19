@@ -105,11 +105,12 @@ jobs:
             fi
             echo ""
             echo "=== CORS check ==="
+            sleep 3
             echo "Test 1: OPTIONS preflight"
-            CORS_PREFLIGHT=$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS http://localhost:8080/api/health \
+            curl -sv -X OPTIONS http://localhost:8080/api/health \
               -H "Origin: http://localhost:3000" \
-              -H "Access-Control-Request-Method: GET" 2>/dev/null || echo "000")
-            echo "OPTIONS status: $CORS_PREFLIGHT"
+              -H "Access-Control-Request-Method: GET" 2>&1 | head -20
+            echo ""
             echo "Test 2: GET with CORS header"
             CORS_HEADER=$(curl -sI http://localhost:8080/api/health \
               -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
@@ -117,7 +118,10 @@ jobs:
             if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
               echo "CORS check passed"
             else
-              echo "ERROR: CORS check failed — no Access-Control-Allow-Origin header"
+              echo "ERROR: CORS check failed — raw response:"
+              curl -sI http://localhost:8080/api/health 2>/dev/null || echo "(no response)"
+              docker compose ps nginx
+              docker compose logs --tail 10 nginx
               exit 1
             fi
             echo ""
