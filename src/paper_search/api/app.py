@@ -14,10 +14,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .routes import router
 from .ws import ws_manager
@@ -162,6 +164,49 @@ app.add_middleware(
 
 # Routes
 app.include_router(router)
+
+# ═══════════════════════════════════════════════════════════════
+# 全局异常处理 — 所有未捕获异常 + Pydantic 校验错误 → 日志
+# ═══════════════════════════════════════════════════════════════
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Pydantic 请求校验失败 → 422 + 记录请求体。"""
+    body = None
+    try:
+        body = await request.body()
+    except Exception:
+        pass
+    logger.warning(
+        "Validation error | %s %s | errors=%s | body=%s",
+        request.method, request.url.path,
+        exc.errors(),
+        (body.decode()[:500] if body else "N/A"),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """HTTP 异常 → 记录非 4xx 的错误。"""
+    if exc.status_code >= 500:
+        logger.error(
+            "HTTP %d | %s %s | detail=%s",
+            exc.status_code, request.method, request.url.path, exc.detail,
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """未捕获异常兜底 → 500 + 完整 traceback。"""
+    logger.error(
+        "Unhandled exception | %s %s",
+        request.method, request.url.path,
+        exc_info=True,
+    )
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
 
 # ── Docs 静态文件服务 ──────────────────────────────────────
 _docs_dir = Path(__file__).parent.parent.parent.parent / "docs"
@@ -359,7 +404,7 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
             )
             break
         except Exception as e:
-            logger.warning(f"WS recv error: {e}, continuing...")
+            logger.warning("WS recv error: %s, continuing...", e, exc_info=True)
             await _asyncio.sleep(0.5)
             continue
 
