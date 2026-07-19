@@ -859,3 +859,28 @@ class PostgresAgentDB:
                event.get("details", "{}"))
         except Exception:
             pass  # Best-effort audit
+
+    def get_final_state_messages(self, session_id: str, since_ts: str = "",
+                                  limit: int = 200) -> list[dict]:
+        """获取 session 去重后的最终状态消息列表。
+
+        去重: 同一 tool_call_id 保留最新，同一 plan_id 保留最新 plan_todo_update。
+        silent 消息不返回。
+        """
+        if since_ts:
+            rows = self._fetchall(
+                """SELECT * FROM ws_messages
+                   WHERE session_id = %s AND created_at > %s
+                     AND priority NOT IN ('silent', '')
+                   ORDER BY created_at DESC LIMIT %s""",
+                (session_id, since_ts, limit),
+            )
+        else:
+            rows = self._fetchall(
+                """SELECT * FROM ws_messages
+                   WHERE session_id = %s
+                     AND priority NOT IN ('silent', '')
+                   ORDER BY created_at DESC LIMIT %s""",
+                (session_id, limit),
+            )
+        return [dict(r) for r in rows]

@@ -335,6 +335,21 @@ async def admin_system_health(user_id: str = Depends(verify_super_admin)):
 # ═══════════════════════════════════════════════════════════════
 
 
+@router.get("/sessions")
+async def list_sessions(
+    limit: int = Query(50, le=200),
+    user_id: str = Depends(verify_api_key),
+):
+    """列出当前用户的会话。"""
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    rows = db._fetchall(
+        "SELECT * FROM sessions WHERE user_id = %s AND status = 'active' ORDER BY updated_at DESC LIMIT %s",
+        (user_id, limit),
+    )
+    return {"total": len(rows), "sessions": [dict(r) for r in rows]}
+
+
 @router.get("/sessions/{session_id}/messages")
 async def get_session_messages(
     session_id: str,
@@ -1051,19 +1066,19 @@ async def list_devices(agent_id: str, user_id: str = Depends(verify_api_key)):
 
 @router.get("/agents/me")
 async def get_my_agent(user_id: str = Depends(verify_api_key)):
-    """获取当前用户 Agent 信息（DB + Redis 心跳合并）。"""
+    """获取当前用户 Agent 信息（DB + Redis agent:status Hash）。"""
     from ..agent.pgdb import PostgresAgentDB
     db = PostgresAgentDB()
     agent = db.get_default_agent(user_id)
     if not agent:
         raise HTTPException(status_code=404, detail="No agent found")
-    status_info = {"status": "unknown", "active_turns": 0}
+    status_info = {"state": "unknown", "active_turns": 0}
     try:
         import redis.asyncio as aioredis
         r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-        hb = await r.get(f"agent:heartbeat:{user_id}")
-        if hb:
-            status_info.update(_json.loads(hb))
+        raw = await r.hget("agent:status", user_id)
+        if raw:
+            status_info.update(_json.loads(raw))
         await r.aclose()
     except Exception:
         pass
