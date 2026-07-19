@@ -54,46 +54,45 @@ class AgentWorker:
         self._current_session_id: str = ""
 
     async def bootstrap(self) -> bool:
-        """初始化 DB / LLM / Tools / Memory / LangGraph."""
-        # DB
-        from ..agent.pgdb import PostgresAgentDB
-        self._db = PostgresAgentDB()
+        """初始化 DB / LLM / Tools / Memory / LangGraph。"""
+        try:
+            # DB
+            from ..agent.pgdb import PostgresAgentDB
+            self._db = PostgresAgentDB()
 
-        # LLM
-        from ..agent.llm_client_v2 import get_llm_client
-        self._llm = get_llm_client()
+            # LLM
+            from ..agent.llm_client_v2 import get_llm_client
+            self._llm = get_llm_client()
 
-        # Tools
-        from ..agent.tool_registry import ToolRegistry, set_db
-        set_db(self._db, user_id=self.user_id)
-        self._tools = ToolRegistry.get_instance()
-        logger.info("Worker %s: %d tools loaded", self.user_id,
-                     len(self._tools.tool_names))
+            # Tools
+            from ..agent.tool_registry import ToolRegistry, set_db
+            set_db(self._db, user_id=self.user_id)
+            self._tools = ToolRegistry.get_instance()
+            logger.info("Worker %s: %d tools loaded", self.user_id,
+                         len(self._tools.tool_names))
 
-        # Build MainGraph
-        from .graphs.main_graph import build_main_graph
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        import redis.asyncio as aioredis
-        _redis = aioredis.from_url(redis_url, decode_responses=True)
+            # Build MainGraph — Agent 不连 Redis，push_fn 走 stdout
+            from .graphs.main_graph import build_main_graph
 
-        async def _graph_push(session_id, msg_type, subtype, role,
-                              payload=None, priority_kind="normal"):
-            """Graph push → stdout → Supervisor → outbox."""
-            envelope = {"type": msg_type, "subType": subtype,
-                        "sessionId": session_id,
-                        "payload": payload or {}}
-            supervisor_send(msg_type, **envelope.get("payload", {}),
-                            session_id=session_id)
+            async def _graph_push(session_id, msg_type, subtype, role,
+                                   payload=None, priority_kind="normal"):
+                supervisor_send(msg_type, session_id=session_id,
+                                **(payload or {}))
 
-        self._compiled_graph = build_main_graph(
-            llm=self._llm, registry=self._tools, db=self._db,
-            push_fn=_graph_push,
-        )
-        logger.info("Worker %s: graph compiled", self.user_id)
+            self._compiled_graph = build_main_graph(
+                llm=self._llm, registry=self._tools, db=self._db,
+                push_fn=_graph_push,
+            )
+            logger.info("Worker %s: graph compiled", self.user_id)
 
-        supervisor_send("state", state="idle", node=None,
-                        active_turns=0, agent_id=self.agent_id)
-        return True
+            supervisor_send("state", state="idle", node=None,
+                            active_turns=0, agent_id=self.agent_id)
+            return True
+        except Exception as e:
+            logger.error("Bootstrap failed: %s", e, exc_info=True)
+            supervisor_send("error", subType="INTERNAL_ERROR",
+                            message=f"Bootstrap failed: {e}")
+            return False
 
     async def process_message(self, raw_msg: str) -> str:
         """Process one user message → return reply content."""

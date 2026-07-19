@@ -261,8 +261,8 @@ class PostgresAgentDB:
         """创建智能体，返回 agent_id。v4.1: 去掉 name/display_name/agent_type 冗余列。"""
         agent_id = _uuid("agent")
         self._execute(
-            """INSERT INTO agents (id, user_id, system_prompt, llm_provider)
-               VALUES (%s, %s, %s, %s)""",
+            """INSERT INTO agents (id, user_id, system_prompt, llm_provider, state)
+               VALUES (%s, %s, %s, %s, 'starting')""",
             (agent_id, user_id, system_prompt, llm_provider),
         )
         return agent_id

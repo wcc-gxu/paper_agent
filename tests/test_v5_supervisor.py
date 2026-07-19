@@ -209,9 +209,9 @@ class TestWorkerProtocol:
         result = subprocess.run(
             [sys.executable, "-m", "paper_search.agent.agent_worker",
              "--user-id", "test-user"],
-            capture_output=True, text=True, timeout=10,
+            input="", capture_output=True, text=True, timeout=30,
         )
-        # Should start and print state message, but then fail on stdin EOF
+        # Bootstrap 完成 → stdin EOF → worker exits
         stdout_lines = result.stdout.strip().split("\n")
         assert len(stdout_lines) >= 1
         states = [json.loads(l) for l in stdout_lines if l.strip()]

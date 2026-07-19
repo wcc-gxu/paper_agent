@@ -110,6 +110,17 @@ class AgentSupervisor:
         if proc.pid:
             self._pid_to_uid[proc.pid] = user_id
 
+        # 更新 DB state（Supervisor 管理）
+        try:
+            from .pgdb import PostgresAgentDB
+            db = PostgresAgentDB()
+            db.update_agent(
+                db.get_default_agent(user_id)["id"],
+                user_id=user_id, state="starting")
+            db.close()
+        except Exception as e:
+            logger.warning("Failed to update DB state for %s: %s", user_id, e)
+
         await self._hsync_status(
             user_id, state="starting", pid=proc.pid or 0,
             node=None, active_turns=0,
@@ -142,6 +153,16 @@ class AgentSupervisor:
             proc.kill()
 
         await self._hsync_status(user_id, state="stopped")
+        # 更新 DB
+        try:
+            from .pgdb import PostgresAgentDB
+            db = PostgresAgentDB()
+            agent = db.get_default_agent(user_id)
+            if agent:
+                db.update_agent(agent["id"], user_id=user_id, state="stopped")
+            db.close()
+        except Exception as e:
+            logger.warning("Failed to update DB state for %s: %s", user_id, e)
         return True
 
     async def _relaunch_agent(self, user_id: str):
@@ -295,17 +316,25 @@ class AgentSupervisor:
                 pass
 
         rc = proc.returncode
-        if rc == 0:
-            await self._hsync_status(uid, state="stopped")
-            logger.info("Agent %s exited normally (pid=%s)", uid,
-                        self._agent_started.get(uid, "?"))
-        else:
-            await self._hsync_status(uid, state="crashed",
-                                     last_error=f"exit_code={rc}")
-            logger.error("Agent %s crashed: rc=%d", uid, rc)
-            # Auto-restart if not manually stopped
-            if not self._stopping:
-                asyncio.create_task(self._relaunch_agent(uid))
+        state = "stopped" if rc == 0 else "crashed"
+        await self._hsync_status(uid, state=state,
+                                 last_error=f"exit_code={rc}" if rc != 0 else "")
+        logger.info("Agent %s %s (pid=%s rc=%d)", uid, state,
+                    self._agent_started.get(uid, "?"), rc)
+
+        # 更新 DB
+        try:
+            from .pgdb import PostgresAgentDB
+            db = PostgresAgentDB()
+            agent = db.get_default_agent(uid)
+            if agent:
+                db.update_agent(agent["id"], user_id=uid, state=state)
+            db.close()
+        except Exception as e:
+            logger.warning("Failed to update DB state for %s: %s", uid, e)
+
+        if state == "crashed" and not self._stopping:
+            asyncio.create_task(self._relaunch_agent(uid))
 
         # Clean up stale parked messages (return to main queue on relaunch)
         if uid in self._agents:
