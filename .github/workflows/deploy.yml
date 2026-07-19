@@ -26,6 +26,9 @@ jobs:
             set -e
             cd /home/ubuntu/paper_agant
             export IMAGE_TAG=dev
+            echo "=== Git pull ==="
+            git pull origin develop
+            echo ""
             echo "=== Pulling images ==="
             docker compose pull api worker beat daemon
             echo ""
@@ -73,6 +76,9 @@ jobs:
             set -e
             cd /home/ubuntu/paper_agant
             export IMAGE_TAG=latest
+            echo "=== Git pull ==="
+            git pull origin develop
+            echo ""
             echo "=== Pulling images ==="
             docker compose pull api worker beat daemon
             echo ""
