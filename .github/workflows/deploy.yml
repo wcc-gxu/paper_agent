@@ -57,14 +57,13 @@ jobs:
             echo ""
             echo "=== CORS check ==="
             sleep 3
-            CORS_HEADER=$(docker compose exec nginx curl -sI http://localhost/api/health \
+            CORS_HEADER=$(docker compose exec api curl -sI http://nginx/api/health \
               -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
             if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
               echo "CORS check passed: $CORS_HEADER"
             else
               echo "ERROR: CORS check failed"
               docker compose ps nginx
-              docker compose logs --tail 10 nginx
               exit 1
             fi
             echo ""
@@ -121,14 +120,13 @@ jobs:
             echo ""
             echo "=== CORS check ==="
             sleep 3
-            CORS_HEADER=$(docker compose exec nginx curl -sI http://localhost/api/health \
+            CORS_HEADER=$(docker compose exec api curl -sI http://nginx/api/health \
               -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
             if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
               echo "CORS check passed: $CORS_HEADER"
             else
               echo "ERROR: CORS check failed"
               docker compose ps nginx
-              docker compose logs --tail 10 nginx
               exit 1
             fi
             echo ""
