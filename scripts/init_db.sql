@@ -56,7 +56,7 @@ CREATE TABLE agents (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_agents_user ON agents(user_id);
-CREATE INDEX idx_agents_active ON agents(user_id, is_active);
+CREATE INDEX idx_agents_active ON agents(user_id, state);
 
 -- ============================================================
 -- 3. papers — 论文 (figures/archives 存为 JSONB)
@@ -198,7 +198,24 @@ CREATE TABLE journal_ranks (
 );
 
 -- ============================================================
--- 10. sessions — 会话 (summary / document_id 存为 JSONB)
+-- 10. documents — 文档 (含版本历史 JSONB)
+-- ============================================================
+
+CREATE TABLE documents (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    title           TEXT NOT NULL,
+    file_path       TEXT NOT NULL,
+    is_auto_review  BOOLEAN DEFAULT FALSE,
+    versions        JSONB DEFAULT '[]',
+    current_version INTEGER DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_documents_user ON documents(user_id, updated_at DESC);
+
+-- ============================================================
+-- 11. sessions — 会话 (summary / document_id 存为 JSONB)
 -- ============================================================
 
 CREATE TABLE sessions (
@@ -218,49 +235,8 @@ CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE INDEX idx_sessions_thread ON sessions(user_id, thread_id);
 
 -- ============================================================
--- 11. ws_messages — WebSocket 消息 (Outbox 持久化)
+-- 12. ws_messages — WebSocket 消息 (Outbox 持久化)
 -- ============================================================
-
-CREATE TABLE ws_messages (
-    id              TEXT PRIMARY KEY,
-    session_id      TEXT NOT NULL REFERENCES sessions(id),
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    seq             INTEGER NOT NULL,
-    direction       TEXT NOT NULL,
-    msg_type        TEXT NOT NULL,
-    subtype         TEXT,
-    payload         JSONB NOT NULL DEFAULT '{}',
-    priority        TEXT NOT NULL DEFAULT 'normal',
-    msg_id          TEXT,
-    correlation_id  TEXT,
-    is_delivered    BOOLEAN NOT NULL DEFAULT false,
-    delivered_at    TIMESTAMPTZ,
-    apns_sent_at    TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_ws_session ON ws_messages(session_id, created_at);
-CREATE INDEX idx_ws_user ON ws_messages(user_id, created_at DESC);
-CREATE UNIQUE INDEX idx_ws_tool_dedup ON ws_messages (session_id, (payload->>'tool_call_id'))
-    WHERE msg_type = 'tool' AND payload->>'tool_call_id' IS NOT NULL;
-CREATE UNIQUE INDEX idx_ws_plan_dedup ON ws_messages (session_id, (payload->>'plan_id'))
-    WHERE msg_type = 'plan_todo_update' AND payload->>'plan_id' IS NOT NULL;
-
--- ============================================================
--- 12. documents — 文档 (含版本历史 JSONB)
--- ============================================================
-
-CREATE TABLE documents (
-    id              TEXT PRIMARY KEY,
-    user_id         TEXT NOT NULL REFERENCES users(id),
-    title           TEXT NOT NULL,
-    file_path       TEXT NOT NULL,
-    is_auto_review  BOOLEAN DEFAULT FALSE,
-    versions        JSONB DEFAULT '[]',
-    current_version INTEGER DEFAULT 0,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_documents_user ON documents(user_id, updated_at DESC);
 
 -- ============================================================
 -- 13. user_preferences — 用户偏好
