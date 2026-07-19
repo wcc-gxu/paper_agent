@@ -86,7 +86,7 @@ class PgVectorStore:
 
     COLLECTION_ABSTRACT = "papers_abstract"   # 映射到 paper_chunks (chunk_type='abstract')
     COLLECTION_FULLTEXT = "papers_fulltext"   # 映射到 paper_chunks (chunk_type='body')
-    COLLECTION_TERMS = "glossary_terms"       # 映射到 glossary_embeddings
+    COLLECTION_TERMS = "glossary_terms"       # 映射到 glossary_terms (via embedding column)
 
     def __init__(self, user_id: str = "anonymous", dsn: str = None):
         """初始化 pgvector 存储。
@@ -473,7 +473,7 @@ class PgVectorStore:
     # ── 术语词表 ────────────────────────────────────────
 
     def add_terms_batch(self, terms: list[dict]) -> int:
-        """批量添加术语到 glossary_embeddings 表。
+        """批量添加术语到 glossary_terms (via embedding column) 表。
 
         Args:
             terms: [{"en_term": "...", "zh_term": "...", "context": "..."}, ...]
@@ -503,7 +503,7 @@ class PgVectorStore:
             for (en, zh, ctx), emb in zip(valid_terms, embeddings):
                 gle_id = f"gle-{hashlib.md5(en.encode()).hexdigest()[:16]}"
                 cur.execute(
-                    """INSERT INTO glossary_embeddings (id, glossary_term_id, term_text, embedding)
+                    """INSERT INTO glossary_terms (via embedding column) (id, glossary_term_id, term_text, embedding)
                        VALUES (%s, NULL, %s, %s::vector)
                        ON CONFLICT (id) DO UPDATE SET
                        term_text=EXCLUDED.term_text, embedding=EXCLUDED.embedding""",
@@ -523,7 +523,7 @@ class PgVectorStore:
 
     # ── 消息向量召回 (Phase 4) ──────────────────────────
 
-    def add_message_embedding(self, session_id: str, msg_id: str,
+    def _add_message_embedding_deprecated(self, session_id: str, msg_id: str,
                                text: str, user_id: str) -> bool:
         """将 message/reply 文本嵌入并存入 message_embeddings 表。
 
@@ -545,7 +545,7 @@ class PgVectorStore:
             emb_id = f"meb-{msg_id}"
             cur = self.conn.cursor()
             cur.execute(
-                """INSERT INTO message_embeddings (id, session_id, msg_id, user_id, content_text, embedding)
+                """-- INSERT INTO message_embeddings (removed) (id, session_id, msg_id, user_id, content_text, embedding)
                    VALUES (%s, %s, %s, %s, %s, %s::vector)
                    ON CONFLICT (id) DO UPDATE SET
                    content_text=EXCLUDED.content_text, embedding=EXCLUDED.embedding""",
@@ -603,7 +603,7 @@ class PgVectorStore:
             cur.execute(
                 f"""SELECT msg_id, session_id, content_text,
                        {similarity_expr} AS similarity
-                   FROM message_embeddings
+                   -- FROM message_embeddings (removed, see paper_chunks)
                    WHERE user_id = %s
                      AND 1 - (embedding <=> %s::vector) >= %s
                    ORDER BY embedding <=> %s::vector

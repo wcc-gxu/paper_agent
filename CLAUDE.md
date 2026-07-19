@@ -129,24 +129,27 @@ proc = await asyncio.create_subprocess_exec(
 # Agent 不直接连 Redis，所有 IO 通过 Supervisor stdin/stdout pipe 中转
 ```
 
-## PostgreSQL 关键表
+## PostgreSQL 关键表 (v4.1, 17 张)
 
 | 表 | 用途 |
 |---|---|
-| `users` / `sessions` | 账户 + 会话 |
-| `agents` | 多 Agent 身份 |
+| `users` | 账户 |
+| `agents` | Agent 身份 + 状态 |
 | `projects` / `papers` / `project_papers` | 论文项目 |
-| `ws_messages` | 出站消息持久化 |
-| `message_embeddings` | 消息向量召回 (pgvector) |
-| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | LangGraph Checkpointer |
-| `store_data` | LangGraph Store |
-| `paper_chunks` / `glossary_embeddings` / `session_summaries` / `topic_embeddings` | 向量索引 (pgvector) |
-| `conversation_archive` | 摘要归档 |
+| `paper_chunks` | 论文切片向量 (pgvector) |
+| `captures` | 碎片知识 (含 embedding + 统一 RAG) |
+| `glossary_terms` | 术语库 (含 embedding) |
+| `journal_ranks` | CCF/SCI 分级缓存 |
+| `sessions` / `ws_messages` | 会话 + 消息持久化 |
+| `documents` | 文档 CRUD (含版本历史 JSONB) |
+| `user_preferences` | 用户偏好 |
+| `subscriptions` | 订阅 (含结果 JSONB) |
+| `share_requests` | 细粒度共享 |
 | `hallucination_events` | 反幻觉审计 |
-| `rag_traces` | RAG 可观测性 |
-| `agent_tasks` / `task_steps` | 任务跟踪 |
-| `external_validations` | 引用验证 |
-| `subscriptions` / `subscription_results` | 订阅管理 |
+| `event_logs` | 通用事件日志 |
+| `checkpoints` / `checkpoint_blobs` / `checkpoint_writes` | LangGraph Checkpointer (自动管理) |
+| `store_data` | LangGraph Store (自动管理) |
+
 
 ## Redis Key 清单
 

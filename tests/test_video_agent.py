@@ -467,7 +467,7 @@ class TestVideoAgentCompilation:
 
 
 class TestVideoDB:
-    """videos 表 CRUD 测试。"""
+    """captures 表 CRUD 测试。"""
 
     @pytest.fixture
     def db(self):

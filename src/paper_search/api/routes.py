@@ -844,7 +844,7 @@ async def delete_project(project_id: str, keep_pdfs: bool = True, user_id: str =
     db = _get_db()
     if keep_pdfs:
         db.conn.execute("DELETE FROM project_papers WHERE project_id = ?", (project_id,))
-        db.conn.execute("DELETE FROM search_logs WHERE project_id = ?", (project_id,))
+        db.conn.execute("DELETE FROM event_logs WHERE project_id = ?", (project_id,))
         db.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     else:
         # 也删除关联论文
@@ -852,7 +852,7 @@ async def delete_project(project_id: str, keep_pdfs: bool = True, user_id: str =
             "SELECT paper_id FROM project_papers WHERE project_id = ?", (project_id,)
         ).fetchall()]
         db.conn.execute("DELETE FROM project_papers WHERE project_id = ?", (project_id,))
-        db.conn.execute("DELETE FROM search_logs WHERE project_id = ?", (project_id,))
+        db.conn.execute("DELETE FROM event_logs WHERE project_id = ?", (project_id,))
         db.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
         for pid in paper_ids:
             db.conn.execute("DELETE FROM papers WHERE id = ?", (pid,))

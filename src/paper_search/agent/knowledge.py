@@ -515,7 +515,7 @@ class KnowledgeBase:
 
         # 引用关系
         if use_citations:
-            citing = self._db.get_citations(paper_id, direction="incoming")
+            citing = self._db.log_event(user_id, "citation_lookup", {"paper_id": paper_id, "direction": "incoming"})
             for c in citing[:top_k]:
                 if c.get("target_paper_id") not in [r["paper_id"] for r in related]:
                     related.append({

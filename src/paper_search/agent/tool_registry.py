@@ -2479,7 +2479,7 @@ Text:
             try:
                 # 总查询量
                 total_row = db.conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM rag_traces "
+                    "SELECT COUNT(*) AS cnt FROM event_logs "
                     "WHERE created_at > NOW() - INTERVAL '%s hours'",
                     (str(hours),),
                 ).fetchone()
@@ -2494,7 +2494,7 @@ Text:
 
                 # 错误率
                 error_row = db.conn.execute(
-                    "SELECT COUNT(*) AS cnt FROM rag_traces "
+                    "SELECT COUNT(*) AS cnt FROM event_logs "
                     "WHERE created_at > NOW() - INTERVAL '%s hours' "
                     "AND error_text IS NOT NULL AND error_text != ''",
                     (str(hours),),
@@ -2504,7 +2504,7 @@ Text:
 
                 # 延迟 (P50/P95)
                 lat_rows = db.conn.execute(
-                    "SELECT total_ms FROM rag_traces "
+                    "SELECT total_ms FROM event_logs "
                     "WHERE created_at > NOW() - INTERVAL '%s hours' "
                     "AND total_ms IS NOT NULL "
                     "ORDER BY total_ms",

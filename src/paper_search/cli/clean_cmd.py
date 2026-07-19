@@ -52,8 +52,8 @@ async def _main():
             # 删除 project_papers 关联
             db.conn.execute("DELETE FROM project_papers WHERE project_id=?",
                             (args.project_id,))
-            # 删除 search_logs
-            db.conn.execute("DELETE FROM search_logs WHERE project_id=?",
+            # 删除 event_logs
+            db.conn.execute("DELETE FROM event_logs WHERE project_id=?",
                             (args.project_id,))
             # 删除 project
             db.conn.execute("DELETE FROM projects WHERE id=?",
@@ -68,7 +68,7 @@ async def _main():
         if args.keep_pdfs:
             # 清空所有表但保留 PDF/MD 文件
             db.conn.execute("DELETE FROM project_papers")
-            db.conn.execute("DELETE FROM search_logs")
+            db.conn.execute("DELETE FROM event_logs")
             db.conn.execute("DELETE FROM papers")
             db.conn.execute("DELETE FROM projects")
             db.conn.execute("DELETE FROM journal_ranks")
@@ -90,7 +90,7 @@ async def _main():
             # 完全清空
             db.conn.executescript("""
                 DELETE FROM project_papers;
-                DELETE FROM search_logs;
+                DELETE FROM event_logs;
                 DELETE FROM papers;
                 DELETE FROM projects;
                 DELETE FROM journal_ranks;

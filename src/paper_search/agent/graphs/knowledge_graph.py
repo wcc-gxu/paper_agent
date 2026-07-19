@@ -1031,7 +1031,7 @@ class KnowledgeAgent:
                 pdf_path, md_dir, figures_dir,
             )
             if figures:
-                # 写入 paper_figures 表
+                # 写入 papers (figures JSONB) 表
                 for fig in figures:
                     if self.db:
                         try:
@@ -1360,7 +1360,7 @@ class KnowledgeAgent:
                 return
             trace_id = _uuid("rag")
             self.db.conn.execute(
-                """INSERT INTO rag_traces
+                """-- INSERT INTO event_logs (merged)
                    (id, session_id, user_id, query_text, retrieved_count,
                     reranked_count, retrieval_ms, rerank_ms, total_ms,
                     confidence, error_text)

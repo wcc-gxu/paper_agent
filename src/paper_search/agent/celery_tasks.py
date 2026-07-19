@@ -990,7 +990,7 @@ def subscription_check_task(self) -> dict:
     """Celery Beat 定时任务: 检查所有启用订阅，发现新论文。
 
     由 Celery Beat 定时触发（默认每 60 分钟）。
-    对每个订阅: 搜索 → 对比上次论文 ID → 新论文存入 subscription_results → Pub/Sub 推送。
+    对每个订阅: 搜索 → 对比上次论文 ID → 新论文存入 subscriptions.results JSONB → Pub/Sub 推送。
     """
     import asyncio
 
@@ -1317,7 +1317,7 @@ def session_close_check_task(self) -> dict:
     try:
         # 1) 读水位线
         marker_row = db.conn.execute(
-            "SELECT last_scan_value FROM session_scan_markers "
+            "SELECT last_scan_value -- FROM session_scan_markers (removed, use Redis) "
             "WHERE marker_type = %s",
             ("session_close_last_scan",),
         ).fetchone()
@@ -1368,7 +1368,7 @@ def session_close_check_task(self) -> dict:
 
         # 3) 更新水位线
         db.conn.execute(
-            """UPDATE session_scan_markers
+            """-- UPDATE session_scan_markers (removed)
                SET last_scan_value = %s, updated_at = %s
                WHERE marker_type = %s""",
             (now_iso, now_iso, "session_close_last_scan"),

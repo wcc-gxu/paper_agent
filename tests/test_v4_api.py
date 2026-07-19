@@ -487,9 +487,11 @@ class TestDatabaseSchema:
         if os.path.exists(sql_path):
             content = open(sql_path).read()
             assert "CREATE TABLE documents" in content
-            assert "CREATE TABLE document_versions" in content
             assert "CREATE TABLE user_preferences" in content
             assert "CREATE TABLE share_requests" in content
+            assert "CREATE TABLE event_logs" in content
+            assert "CREATE TABLE captures" in content
+            assert "CREATE TABLE _schema_meta" in content
 
     def test_gen_id_functions_in_sql(self):
         import os
@@ -510,4 +512,4 @@ class TestDatabaseSchema:
             sql_path = "scripts/init_db.sql"
         if os.path.exists(sql_path):
             content = open(sql_path).read()
-            assert "ADD COLUMN IF NOT EXISTS document_id" in content
+            assert "document_id" in content

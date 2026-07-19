@@ -849,7 +849,7 @@ class MainAgent:
         )
 
     def _record_event(self, session_id: str, event_type: str, payload: dict):
-        """Phase 4: 写入 agent_events 表用于 crash recovery。"""
+        """Phase 4: 写入 event_logs 表用于 crash recovery。"""
         if self._db is None or not self._correlation_id:
             return
         try:

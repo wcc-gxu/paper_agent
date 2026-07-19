@@ -8,7 +8,7 @@
 1. 保留最新 SUMMARY_KEEP_RECENT (10) 条不动
 2. 把更老的 K 条交给 LLM 总结成 1 条 SystemMessage
 3. K > SUMMARY_BATCH_MAX (100) 时用 map-reduce 递归
-4. 原 K 条 messages 归档到 conversation_archive 表 (可回溯)
+4. 原 K 条 messages 归档到 sessions (summary JSONB) 表 (可回溯)
 
 成本: 每次触发 1 次 LLM (map-reduce 时 N 次)
 语义: 保语义 + 压长度, 仍 thread-scoped
@@ -141,7 +141,7 @@ class SummarizationNode:
                     reason=reason or f"trigger_count_{len(messages)}",
                 )
         except Exception as e:
-            logger.warning(f"conversation_archive write/skip failed: {e}")
+            logger.warning(f"sessions (summary JSONB) write/skip failed: {e}")
 
         # 拼回去
         summary_block = SystemMessage(
@@ -205,7 +205,7 @@ class SummarizationNode:
         """检查是否已有相同数量的归档记录（去重）."""
         try:
             row = self.db.conn.execute(
-                """SELECT id FROM conversation_archive
+                """SELECT id FROM sessions (summary JSONB)
                    WHERE session_id = %s AND original_count = %s
                    ORDER BY created_at DESC LIMIT 1""",
                 (thread_id, original_count),
@@ -222,7 +222,7 @@ class SummarizationNode:
         original_messages: list[BaseMessage],
         reason: str,
     ) -> None:
-        """把原始 messages 写入 conversation_archive 表 (PostgreSQL schema).
+        """把原始 messages 写入 sessions (summary JSONB) 表 (PostgreSQL schema).
 
         兼容 init_db.sql DDL: id, session_id, user_id, summary_text, summary_type,
         start_msg_id, end_msg_id, metadata (JSONB), thread_id, agent_id, 等.
@@ -244,7 +244,7 @@ class SummarizationNode:
         }, ensure_ascii=False)
 
         self.db.conn.execute(
-            """INSERT INTO conversation_archive
+            """INSERT INTO sessions (summary JSONB)
                (id, session_id, user_id, summary_text, summary_type,
                 start_msg_id, end_msg_id, metadata,
                 thread_id, agent_id, archived_at, summary_msg_id,
