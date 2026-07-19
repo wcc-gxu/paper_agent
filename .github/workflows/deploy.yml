@@ -55,6 +55,16 @@ jobs:
               exit 1
             fi
             echo ""
+            echo "=== CORS check ==="
+            CORS_HEADER=$(curl -sI http://localhost:8080/api/health \
+              -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
+            if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
+              echo "CORS check passed: $CORS_HEADER"
+            else
+              echo "ERROR: CORS check failed"
+              exit 1
+            fi
+            echo ""
             echo "=== Service status ==="
             docker compose ps
             echo ""
@@ -103,6 +113,16 @@ jobs:
               echo "ERROR: Health check failed after 10 retries"
               echo "=== API logs (last 30 lines) ==="
               docker compose logs --tail 30 api
+              exit 1
+            fi
+            echo ""
+            echo "=== CORS check ==="
+            CORS_HEADER=$(curl -sI http://localhost:8080/api/health \
+              -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
+            if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
+              echo "CORS check passed: $CORS_HEADER"
+            else
+              echo "ERROR: CORS check failed"
               exit 1
             fi
             echo ""
