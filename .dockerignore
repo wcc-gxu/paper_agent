@@ -9,6 +9,7 @@ __pycache__
 
 tests/
 scripts/
+!scripts/migrations/
 
 .claude/
 .codegraph/
