@@ -39,7 +39,7 @@ jobs:
             sleep 5
             HEALTH_OK=false
             for i in 1 2 3 4 5 6 7 8 9 10; do
-              if curl -sf http://localhost:8080/api/health; then
+              if docker compose exec api curl -sf http://localhost:8000/api/health; then
                 echo "Health check passed"
                 HEALTH_OK=true
                 break
@@ -89,7 +89,7 @@ jobs:
             sleep 5
             HEALTH_OK=false
             for i in 1 2 3 4 5 6 7 8 9 10; do
-              if curl -sf http://localhost:8080/api/health; then
+              if docker compose exec api curl -sf http://localhost:8000/api/health; then
                 echo "Health check passed"
                 HEALTH_OK=true
                 break
