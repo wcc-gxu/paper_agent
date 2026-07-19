@@ -108,6 +108,16 @@ async def lifespan(app: FastAPI):
 
     logger.info("Paper Agent API starting...")
 
+    # v4.1: 自动增量数据库迁移
+    try:
+        from ..agent.migrate import run_migrations
+        db = get_db()
+        applied = run_migrations(db)
+        if applied:
+            logger.info("DB migrations applied: %s", applied)
+    except Exception as e:
+        logger.warning("DB migrations skipped: %s", e)
+
     # 启动订阅通知监听器 (Redis Pub/Sub → WebSocket 桥接)
     try:
         from .ws import start_notification_listener
