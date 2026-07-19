@@ -47,7 +47,7 @@ NODE_TIMEOUTS = {
 DEFAULT_BUSY_TIMEOUT = 300
 QUEUE_STALE_SECONDS = 43200
 STDOUT_SILENT_SECONDS = 15
-WORKER_READY_TIMEOUT = 15  # 等待 worker 上报 idle 的最大秒数
+WORKER_READY_TIMEOUT = 120  # 等待 worker 上报 idle 的最大秒数（bootstrap 可能需要 >15s）
 
 
 def _now_ts() -> float:
@@ -406,8 +406,10 @@ class AgentSupervisor:
         if to_state == "crashed" and not self._stopping:
             asyncio.create_task(self._relaunch_agent(uid))
 
-        # Clean up ready event
-        self._ready_events.pop(agent_id, None)
+        # Clean up ready event — trigger it so any waiter unblocks
+        evt = self._ready_events.pop(agent_id, None)
+        if evt:
+            evt.set()
 
         # Re-push parked messages
         if uid in self._agents:
@@ -616,15 +618,22 @@ class AgentSupervisor:
 
         if ready:
             state = await self._state_mgr.get(agent_id)
-            self._lifecycle.launch_success(agent_id, user_id,
-                                           self._agents.get(agent_uid, type(None)).pid
-                                           if hasattr(self._agents.get(agent_uid, None), 'pid')
-                                           else 0,
-                                           elapsed_ms)
-            return {
-                "status": "ok",
-                "agent_state": state.to_dict() if state else {},
-            }
+            if state and state.state == "idle":
+                pid = self._agents.get(agent_uid)
+                pid = pid.pid if hasattr(pid, 'pid') and pid else 0
+                self._lifecycle.launch_success(agent_id, user_id, pid, elapsed_ms)
+                return {
+                    "status": "ok",
+                    "agent_state": state.to_dict(),
+                }
+            else:
+                # 进程在 bootstrap 期间退出/crash
+                error = state.last_error if state else "Agent exited during bootstrap"
+                self._lifecycle.launch_failed(agent_id, user_id, error)
+                return {
+                    "status": "error",
+                    "error": f"Agent failed to start: {error}",
+                }
         else:
             await self._state_mgr.transition(
                 agent_id, "crashed",
