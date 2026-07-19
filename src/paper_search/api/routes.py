@@ -1284,6 +1284,105 @@ async def stop_my_agent(user_id: str = Depends(verify_api_key)):
 
 
 # ═══════════════════════════════════════════════════════════════
+# v4.2 SSE 事件流端点 — 实时推送 Agent 生命周期事件
+# ═══════════════════════════════════════════════════════════════
+
+from fastapi.responses import StreamingResponse
+
+
+async def _sse_control_stream(user_id: str, cmd: str) -> StreamingResponse:
+    """通用 SSE 控制流 — 发送指令给 Supervisor，流式返回进度事件。
+
+    Args:
+        user_id: 用户 ID
+        cmd: "start" | "stop" | "restart"
+    """
+    import redis.asyncio as aioredis
+
+    agent_id = f"agent-{user_id}"
+    correlation_id = str(uuid.uuid4())
+    channel = f"agent:sse:{correlation_id}"
+
+    async def event_generator():
+        r = aioredis.from_url(
+            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+        )
+        pubsub = r.pubsub()
+        try:
+            await pubsub.subscribe(channel)
+            await asyncio.sleep(0.1)
+
+            # 发送控制指令
+            await r.publish("agent:control", _json.dumps({
+                "cmd": cmd,
+                "agent_id": agent_id,
+                "user_id": user_id,
+                "correlation_id": correlation_id,
+            }))
+
+            # 流式转发 Supervisor 事件
+            async for msg in pubsub.listen():
+                if msg.get("type") != "message":
+                    continue
+                try:
+                    payload = _json.loads(msg["data"])
+                except _json.JSONDecodeError:
+                    continue
+
+                event_type = payload.get("event", "message")
+                data = payload.get("data", {})
+
+                if event_type == "done":
+                    yield f"event: done\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                    return
+                elif event_type == "error":
+                    yield f"event: error\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+                    return
+                else:
+                    yield f"event: {event_type}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.aclose()
+                await r.aclose()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/agents/me/start/stream")
+async def start_my_agent_stream(user_id: str = Depends(verify_api_key)):
+    """v4.2 SSE: 启动 Agent，实时推送进度事件。
+
+    连接保持直到 done/error 或客户端断开，无超时限制。
+    事件类型: state | progress | done | error
+    """
+    return await _sse_control_stream(user_id, "start")
+
+
+@router.get("/agents/me/stop/stream")
+async def stop_my_agent_stream(user_id: str = Depends(verify_api_key)):
+    """v4.2 SSE: 停止 Agent，实时推送进度事件。"""
+    return await _sse_control_stream(user_id, "stop")
+
+
+@router.get("/agents/me/restart/stream")
+async def restart_my_agent_stream(user_id: str = Depends(verify_api_key)):
+    """v4.2 SSE: 重启 Agent，实时推送进度事件。"""
+    return await _sse_control_stream(user_id, "restart")
+
+
+# ═══════════════════════════════════════════════════════════════
 # v4.0 Document CRUD
 # ═══════════════════════════════════════════════════════════════
 

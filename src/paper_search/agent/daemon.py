@@ -522,13 +522,13 @@ class AgentSupervisor:
 
                 if action == "start":
                     logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
-                    result = await self._handle_start(agent_id, user_id)
+                    result = await self._handle_start(agent_id, user_id, correlation_id)
                 elif action == "stop":
                     logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
-                    result = await self._handle_stop(agent_id, user_id)
+                    result = await self._handle_stop(agent_id, user_id, correlation_id)
                 elif action == "restart":
                     logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
-                    result = await self._handle_restart(agent_id, user_id)
+                    result = await self._handle_restart(agent_id, user_id, correlation_id)
                 elif action == "shutdown":
                     logger.info("Control: supervisor shutdown requested")
                     self._stopping = True
@@ -553,24 +553,44 @@ class AgentSupervisor:
             await pubsub.unsubscribe("agent:control")
             await r.aclose()
 
+    # ── SSE helper ────────────────────────────────────────
+
+    async def _sse_publish(self, corr_id: str, event: str, data: dict):
+        """向 SSE channel 发布事件。"""
+        if not corr_id or not self.redis:
+            return
+        try:
+            await self.redis.publish(
+                f"agent:sse:{corr_id}",
+                json.dumps({"event": event, "data": data}, ensure_ascii=False),
+            )
+        except Exception as e:
+            logger.error("SSE publish failed for %s: %s", corr_id, e)
+
     # ── Control handlers ───────────────────────────────────
 
-    async def _handle_start(self, agent_id: str, user_id: str) -> dict:
+    async def _handle_start(self, agent_id: str, user_id: str,
+                             corr_id: str = "") -> dict:
         """处理 start 指令。
 
         Returns:
             {"status": "ok"|"already_running"|"error", "agent_state": {...}}
+        
+        如果传入 corr_id，每个步骤都会通过 SSE 推送进度事件。
         """
         # 1. 获取或创建 agent 状态
         state = await self._state_mgr.get_or_create(agent_id, user_id)
 
         if not state:
+            await self._sse_publish(corr_id, "error", {"error": "Failed to get or create agent state"})
             return {"status": "error", "error": "Failed to get or create agent state"}
 
         current_state = state.state
 
         # 2. 已在运行中
         if current_state in ("idle", "busy"):
+            await self._sse_publish(corr_id, "done",
+                                     {"status": "already_running", "agent_id": agent_id})
             return {
                 "status": "already_running",
                 "agent_state": state.to_dict(),
@@ -578,16 +598,22 @@ class AgentSupervisor:
 
         # 3. 正在启动中 — 等待就绪
         if current_state == "starting":
+            await self._sse_publish(corr_id, "progress",
+                                     {"stage": "ready_wait", "message": "Agent 正在启动中，等待就绪..."})
             agent_uid = user_id or agent_id.replace("agent-", "")
             ready = await self.wait_agent_ready(agent_id, timeout=WORKER_READY_TIMEOUT)
             if ready:
                 state = await self._state_mgr.get(agent_id)
+                await self._sse_publish(corr_id, "done",
+                                         {"status": "already_running", "agent_id": agent_id})
                 return {
                     "status": "already_running",
                     "agent_state": state.to_dict() if state else {},
                 }
             else:
                 self._lifecycle.launch_timeout(agent_id, user_id, WORKER_READY_TIMEOUT)
+                await self._sse_publish(corr_id, "error",
+                                         {"error": f"Agent startup timed out after {WORKER_READY_TIMEOUT}s"})
                 return {
                     "status": "error",
                     "error": f"Agent startup timed out after {WORKER_READY_TIMEOUT}s",
@@ -596,6 +622,11 @@ class AgentSupervisor:
         # 4. 启动新 agent
         self._lifecycle.launch_start(agent_id, user_id)
         await self._state_mgr.transition(agent_id, "starting")
+        await self._sse_publish(corr_id, "state",
+                                 {"from": current_state, "to": "starting", "agent_id": agent_id})
+
+        await self._sse_publish(corr_id, "progress",
+                                 {"stage": "launch", "message": "正在启动 Agent 子进程..."})
 
         agent_uid = user_id or agent_id.replace("agent-", "")
         launched = await self.launch_agent(agent_uid)
@@ -606,12 +637,17 @@ class AgentSupervisor:
                 last_error="Failed to spawn subprocess")
             self._lifecycle.launch_failed(agent_id, user_id,
                                           "Failed to spawn subprocess")
+            await self._sse_publish(corr_id, "error",
+                                     {"error": "Failed to spawn agent subprocess"})
             return {
                 "status": "error",
                 "error": "Failed to spawn agent subprocess",
             }
 
         # 5. 等待 worker 就绪
+        await self._sse_publish(corr_id, "progress",
+                                 {"stage": "bootstrap", "message": "Worker 初始化中 (DB+LLM+Tools+Graph)..."})
+
         t0 = _now_ts()
         ready = await self.wait_agent_ready(agent_id, timeout=WORKER_READY_TIMEOUT)
         elapsed_ms = (_now_ts() - t0) * 1000
@@ -622,6 +658,10 @@ class AgentSupervisor:
                 pid = self._agents.get(agent_uid)
                 pid = pid.pid if hasattr(pid, 'pid') and pid else 0
                 self._lifecycle.launch_success(agent_id, user_id, pid, elapsed_ms)
+                await self._sse_publish(corr_id, "state",
+                                         {"from": "starting", "to": "idle", "agent_id": agent_id, "pid": pid})
+                await self._sse_publish(corr_id, "done",
+                                         {"status": "started", "agent_id": agent_id, "elapsed_ms": int(elapsed_ms)})
                 return {
                     "status": "ok",
                     "agent_state": state.to_dict(),
@@ -630,6 +670,7 @@ class AgentSupervisor:
                 # 进程在 bootstrap 期间退出/crash
                 error = state.last_error if state else "Agent exited during bootstrap"
                 self._lifecycle.launch_failed(agent_id, user_id, error)
+                await self._sse_publish(corr_id, "error", {"error": f"Agent failed to start: {error}"})
                 return {
                     "status": "error",
                     "error": f"Agent failed to start: {error}",
@@ -639,46 +680,77 @@ class AgentSupervisor:
                 agent_id, "crashed",
                 last_error=f"Startup timeout after {WORKER_READY_TIMEOUT}s")
             self._lifecycle.launch_timeout(agent_id, user_id, WORKER_READY_TIMEOUT)
+            await self._sse_publish(corr_id, "error",
+                                     {"error": f"Agent startup timed out after {WORKER_READY_TIMEOUT}s"})
             return {
                 "status": "error",
                 "error": f"Agent startup timed out after {WORKER_READY_TIMEOUT}s",
             }
 
-    async def _handle_stop(self, agent_id: str, user_id: str) -> dict:
+    async def _handle_stop(self, agent_id: str, user_id: str,
+                            corr_id: str = "") -> dict:
         """处理 stop 指令。"""
         state = await self._state_mgr.get(agent_id)
         if not state:
+            await self._sse_publish(corr_id, "error", {"error": "Agent not found"})
             return {"status": "error", "error": "Agent not found"}
 
         if state.state in ("stopped", "crashed"):
+            await self._sse_publish(corr_id, "done",
+                                     {"status": "already_stopped", "agent_id": agent_id})
             return {"status": "already_stopped", "agent_state": state.to_dict()}
 
+        from_state = state.state
         self._lifecycle.stop_requested(agent_id, user_id)
         await self._state_mgr.transition(agent_id, "stopping")
+        await self._sse_publish(corr_id, "state",
+                                 {"from": from_state, "to": "stopping", "agent_id": agent_id})
+
+        await self._sse_publish(corr_id, "progress",
+                                 {"stage": "stopping", "message": "正在发送停止信号..."})
 
         agent_uid = user_id or agent_id.replace("agent-", "")
         stopped = await self.stop_agent(agent_uid, graceful=True)
 
         if stopped:
+            await self._sse_publish(corr_id, "progress",
+                                     {"stage": "stopped", "message": "Agent 已停止"})
             await self._state_mgr.transition(agent_id, "stopped")
             uptime = _now_ts() - (self._agent_started.get(agent_uid, _now_ts()))
             self._lifecycle.stop_success(agent_id, user_id, uptime)
         else:
             await self._state_mgr.transition(agent_id, "stopped")
 
+        await self._sse_publish(corr_id, "state",
+                                 {"from": "stopping", "to": "stopped", "agent_id": agent_id})
+        await self._sse_publish(corr_id, "done",
+                                 {"status": "stopped", "agent_id": agent_id})
+
         state = await self._state_mgr.get(agent_id)
         return {"status": "ok", "agent_state": state.to_dict() if state else {}}
 
-    async def _handle_restart(self, agent_id: str, user_id: str) -> dict:
+    async def _handle_restart(self, agent_id: str, user_id: str,
+                               corr_id: str = "") -> dict:
         """处理 restart 指令。"""
-        # 先停止再启动
-        stop_result = await self._handle_stop(agent_id, user_id)
+        await self._sse_publish(corr_id, "progress",
+                                 {"stage": "stopping", "message": "正在停止 Agent..."})
+
+        stop_result = await self._handle_stop(agent_id, user_id, corr_id)
         if stop_result.get("status") == "error":
             return stop_result
 
-        # 短暂等待进程完全退出
         await asyncio.sleep(1)
-        return await self._handle_start(agent_id, user_id)
+
+        await self._sse_publish(corr_id, "progress",
+                                 {"stage": "launch", "message": "正在重新启动 Agent..."})
+
+        start_result = await self._handle_start(agent_id, user_id, corr_id)
+        if start_result.get("status") in ("ok", "already_running"):
+            state = start_result.get("agent_state", {})
+            await self._sse_publish(corr_id, "done",
+                                     {"status": "restarted", "agent_id": agent_id})
+            return {"status": "ok", "agent_state": state}
+        return start_result
 
     # ── Backward-compatible helpers ────────────────────────
 

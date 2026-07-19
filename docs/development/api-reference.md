@@ -1,7 +1,8 @@
-# Paper Agent v4.1 — API 参考文档
+# Paper Agent v4.2 — API 参考文档
 
-> 更新: 2026-07-18 | 版本: 4.1.0 | LLM: DeepSeek v4 Pro + Flash
+> 更新: 2026-07-19 | 版本: 4.2.0 | LLM: DeepSeek v4 Pro + Flash
 >
+> v4.2 新增: SSE 实时事件流 + 双向控制协议 + 结构化生命周期日志
 > v4.1 变动: Agent 需手动启动 / status 响应新增 state/node 字段
 > v4.0 新增: Agent 生命周期 / Document CRUD / Preference / Share API
 >
@@ -13,7 +14,10 @@
 
 - [1. 认证 (JWT)](#1-认证-jwt)
 - [2. 认证端点](#2-认证端点)
-- [3. Agent 管理 (v4.0)](#3-agent-管理-v40)
+- [3. Agent 管理 (v4.2)](#3-agent-管理-v42)
+  - [3.1 REST 端点](#31-rest-端点)
+  - [3.2 SSE 事件流端点](#32-sse-事件流端点)
+  - [3.3 SSE 事件协议](#33-sse-事件协议)
 - [4. 搜索与论文](#4-搜索与论文)
 - [5. 知识库](#5-知识库)
 - [6. 项目管理](#6-项目管理)
@@ -151,37 +155,264 @@ Base URL: `http://{host}/api`
 
 ---
 
-## 3. Agent 管理 (v4.1)
+## 3. Agent 管理 (v4.2)
 
-### `GET /api/agents/me`
+v4.2 新增 SSE 事件流端点，替代旧的轮询方式。客户端通过 SSE 实时接收 Agent 状态变更和启动进度，无需设置超时。
 
-获取当前用户 Agent 信息。
+### 3.1 REST 端点
 
-```json
-{"id": "agent-xxx", "user_id": "...", "system_prompt": "...", "state": "idle", "active_turns": 0}
-```
+#### `GET /api/agents/me`
 
-### `PUT /api/agents/me`
-
-更新系统提示词。`{"system_prompt": "..."}`
-
-### `GET /api/agents/me/status`
-
-轮询 Agent 状态。
+获取当前用户 Agent 完整信息（配置 + 运行时状态）。
 
 ```json
-{"state": "idle", "node": null, "active_turns": 0, "pid": 1001, "started_at": "...", "updated_at": "..."}
+{
+  "agent_id": "agent-user-xxx",
+  "user_id": "user-xxx",
+  "agent_type": "main",
+  "display_name": "我的科研助理",
+  "system_prompt": "",
+  "llm_provider": "deepseek",
+  "llm_model": "deepseek-v4-pro",
+  "state": "idle",
+  "pid": 12345,
+  "current_node": "",
+  "active_turns": 0,
+  "started_at": "2026-07-19T10:00:00Z",
+  "last_active_at": "2026-07-19T10:30:00Z",
+  "created_at": "2026-07-19T09:00:00Z"
+}
 ```
 
-**state 取值**: `starting` | `idle` | `busy` | `stopping` | `stopped` | `crashed` | `stalled`
+| 字段 | 说明 |
+|------|------|
+| `state` | `pending` \| `starting` \| `idle` \| `busy` \| `stopping` \| `stopped` \| `crashed` \| `stalled` |
+| `pid` | OS 进程 ID（stopped/crashed/pending 时为 0） |
+| `active_turns` | 当前活跃的对话轮数 |
+| `current_node` | LangGraph 当前所在节点 |
 
-### `POST /api/agents/me/start`
+#### `PUT /api/agents/me`
 
-启动 Agent。返回后客户端轮询 `GET /api/agents/me/status` 等待 `state: idle`。
+更新系统提示词。`{"system_prompt": "...", "llm_provider": "deepseek"}`。同步写入 Redis + DB。
 
-### `POST /api/agents/me/stop`
+#### `GET /api/agents/me/status`
 
-停止 Agent。轮询确认 `state: stopped`。
+快速查询运行时状态（轻量，仅返回运行时字段）。
+
+```json
+{"state": "idle", "pid": 12345, "active_turns": 0, "current_node": "", "last_active_at": "..."}
+```
+
+#### `POST /api/agents/me/start` (兼容保留)
+
+同步启动 Agent，超时 180s。返回启动结果。**新客户端建议使用 SSE 端点**。
+
+#### `POST /api/agents/me/stop` (兼容保留)
+
+同步停止 Agent，超时 30s。返回停止结果。**新客户端建议使用 SSE 端点**。
+
+---
+
+### 3.2 SSE 事件流端点
+
+SSE 端点通过长连接实时推送 Agent 生命周期事件。**无超时限制**，连接保持直到操作完成或客户端断开。
+
+#### `GET /api/agents/me/start/stream`
+
+启动 Agent 并流式返回进度。
+
+```
+GET /api/agents/me/start/stream
+Authorization: Bearer <token>
+Accept: text/event-stream
+```
+
+响应示例（`text/event-stream`）：
+
+```
+event: state
+data: {"from":"pending","to":"starting","agent_id":"agent-xxx","timestamp":"..."}
+
+event: progress
+data: {"stage":"launch","message":"正在启动 Agent 子进程...","timestamp":"..."}
+
+event: progress
+data: {"stage":"bootstrap","message":"Worker 初始化中 (DB+LLM+Tools+Graph)...","elapsed_ms":1200,"timestamp":"..."}
+
+event: state
+data: {"from":"starting","to":"idle","agent_id":"agent-xxx","pid":12345,"timestamp":"..."}
+
+event: done
+data: {"status":"started","agent_state":{...},"timestamp":"..."}
+```
+
+#### `GET /api/agents/me/stop/stream`
+
+停止 Agent 并流式返回进度。
+
+```
+event: state
+data: {"from":"idle","to":"stopping","agent_id":"agent-xxx"}
+
+event: progress
+data: {"stage":"stopping","message":"正在发送 SIGTERM..."}
+
+event: state
+data: {"from":"stopping","to":"stopped","agent_id":"agent-xxx"}
+
+event: done
+data: {"status":"stopped","uptime_seconds":3600}
+```
+
+#### `GET /api/agents/me/restart/stream`
+
+重启 Agent（等价于 stop + start）。
+
+```
+event: state
+data: {"from":"idle","to":"stopping"}
+
+event: state
+data: {"from":"stopping","to":"stopped"}
+
+event: done
+data: {"status":"stopped","phase":"stop_complete"}
+
+event: state
+data: {"from":"stopped","to":"starting"}
+
+event: progress
+data: {"stage":"launch","message":"正在启动 Agent 子进程..."}
+
+event: state
+data: {"from":"starting","to":"idle","pid":12346}
+
+event: done
+data: {"status":"restarted","agent_state":{...}}
+```
+
+---
+
+### 3.3 SSE 事件协议
+
+所有 SSE 事件遵循统一格式：
+
+| 事件类型 | `event` 字段 | `data` 字段 | 说明 |
+|----------|-------------|-------------|------|
+| 状态转移 | `state` | `{from, to, agent_id, pid?, node?}` | Agent 状态机变更 |
+| 进度更新 | `progress` | `{stage, message, elapsed_ms?}` | 操作进度 |
+| 操作成功 | `done` | `{status, agent_state?, ...}` | 操作完成，连接关闭 |
+| 操作失败 | `error` | `{error, agent_state?}` | 操作失败，连接关闭 |
+
+**`state` 事件** — 每次状态转移触发一次：
+
+```json
+{
+  "event": "state",
+  "data": {
+    "from": "pending",
+    "to": "starting",
+    "agent_id": "agent-user-xxx",
+    "pid": 0,
+    "node": null,
+    "timestamp": "2026-07-19T10:00:00Z"
+  }
+}
+```
+
+**`progress` 事件** — 操作中的阶段性进度：
+
+```json
+{
+  "event": "progress",
+  "data": {
+    "stage": "bootstrap",
+    "message": "Worker 初始化中...",
+    "elapsed_ms": 1200,
+    "timestamp": "2026-07-19T10:00:01Z"
+  }
+}
+```
+
+`stage` 取值：`launch` | `bootstrap` | `ready_wait` | `stopping` | `stopped`
+
+**`done` 事件** — 操作完成时的最终事件，发送后 SSE 连接关闭：
+
+```json
+{
+  "event": "done",
+  "data": {
+    "status": "started",
+    "agent_state": { /* 完整 AgentState */ },
+    "elapsed_ms": 3200,
+    "timestamp": "2026-07-19T10:00:03Z"
+  }
+}
+```
+
+`status` 取值：`started` | `stopped` | `restarted` | `already_running` | `already_stopped`
+
+**`error` 事件** — 操作失败时的最终事件，发送后 SSE 连接关闭：
+
+```json
+{
+  "event": "error",
+  "data": {
+    "error": "Failed to spawn agent subprocess",
+    "agent_state": { /* 当前状态 */ },
+    "timestamp": "2026-07-19T10:00:02Z"
+  }
+}
+```
+
+#### 客户端使用示例
+
+```javascript
+// 原生 EventSource
+const es = new EventSource('/api/agents/me/start/stream', {
+  // Note: EventSource doesn't support custom headers
+  // Use fetch + ReadableStream or pass token via query param
+});
+
+es.addEventListener('state', (e) => {
+  const { from, to } = JSON.parse(e.data);
+  console.log(`State: ${from} → ${to}`);
+});
+
+es.addEventListener('progress', (e) => {
+  const { message, elapsed_ms } = JSON.parse(e.data);
+  console.log(`Progress: ${message} (${elapsed_ms}ms)`);
+});
+
+es.addEventListener('done', (e) => {
+  const { status, agent_state } = JSON.parse(e.data);
+  console.log(`Done: ${status}`);
+  es.close();
+});
+
+es.addEventListener('error', (e) => {
+  // Either a network error or server-sent error event
+  console.error('Error:', e.data || 'Network error');
+  es.close();
+});
+```
+
+```javascript
+// fetch + ReadableStream (支持 Authorization header)
+async function startAgent(token) {
+  const response = await fetch('/api/agents/me/start/stream', {
+    headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'text/event-stream' }
+  });
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += value;
+    // Parse SSE events from buffer...
+  }
+}
+```
 
 ---
 

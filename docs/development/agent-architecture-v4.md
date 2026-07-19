@@ -52,7 +52,8 @@ Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout
 入站: API → LPUSH agent:ws:{uid} → Supervisor BRPOP → Agent stdin
 出站: Agent stdout → Supervisor → LPUSH agent:outbox:{uid} → API BRPOP → WS
 状态: Agent stdout {"type":"state","state":"busy"} → Supervisor → HSET agent:state:{agent_id}
-控制 (v4.2): API SUBSCRIBE agent:control:resp:{corr_id} → PUBLISH agent:control → Supervisor 处理 → PUBLISH agent:control:resp:{corr_id}
+控制 (v4.2 REST): API SUBSCRIBE agent:control:resp → PUBLISH agent:control → Supervisor → PUBLISH resp
+控制 (v4.2 SSE):  API SUBSCRIBE agent:sse:{corr_id} → PUBLISH agent:control → Supervisor → PUBLISH event* → done
 ```
 
 ### 1.3 关键设计变更
@@ -67,8 +68,72 @@ Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout
 | 状态管理 | DB + Redis 双写 | Supervisor 写 Redis | **AgentStateManager 统一管理** | Redis + DB + lifecycle 日志三方一致 |
 | 创建 Agent | 注册时创建 | 注册时创建 | **Supervisor 自动创建** | API 发 start 时 Redis/DB 无记录自动建 |
 | 生命周期日志 | 无 | 无 | **JSONL 结构化日志** | agent.create/launch/crash/stop 全事件可追踪 |
+| 客户端连接 | 轮询 status | 轮询 status | **SSE 事件流** | start/stop/restart 实时推送进度，无超时 |
 
-### 1.4 7 种子意图（不变）
+### 1.4 SSE 控制流 (v4.2 新增)
+
+替代原有的同步 HTTP 请求-响应模式。API 通过 SSE 长连接将 Supervisor 的生命周期事件实时推送给客户端。
+
+```
+┌─ SSE 启动流程 ──────────────────────────────────────────────────────────┐
+│                                                                         │
+│  Client                     API                        Supervisor       │
+│   │                          │                            │             │
+│   │ GET /.../start/stream    │                            │             │
+│   │  Authorization: Bearer   │                            │             │
+│   │  Accept: text/event-     │                            │             │
+│   │          stream          │                            │             │
+│   │ ─────────────────────────→                            │             │
+│   │                          │ SUBSCRIBE agent:sse:{corr} │             │
+│   │                          │ PUBLISH agent:control      │             │
+│   │                          │ ───────────────────────────→             │
+│   │                          │                            │             │
+│   │                          │◄─── agent:sse:{corr} ──────│             │
+│   │ event: state             │   {"event":"state",        │             │
+│   │ data: {"to":"starting"}  │    "to":"starting"}        │             │
+│   │ ◄────────────────────────┤                            │             │
+│   │                          │◄─── agent:sse:{corr} ──────│             │
+│   │ event: progress          │   {"event":"progress",     │             │
+│   │ data: {"stage":"launch"} │    "stage":"launch"}       │             │
+│   │ ◄────────────────────────┤                            │             │
+│   │                          │◄─── agent:sse:{corr} ──────│             │
+│   │ event: state             │   {"event":"state",        │             │
+│   │ data: {"to":"idle"}      │    "to":"idle","pid":123}  │             │
+│   │ ◄────────────────────────┤                            │             │
+│   │                          │◄─── agent:sse:{corr} ──────│             │
+│   │ event: done              │   {"event":"done",         │             │
+│   │ data: {"status":"started"}│  "status":"started"}      │             │
+│   │ ◄────────────────────────┤                            │             │
+│   │ (连接关闭)                │                            │             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**SSE 事件类型**：
+
+| event | data | 触发时机 | 连接关闭 |
+|-------|------|---------|:---:|
+| `state` | `{from, to, agent_id, pid?}` | 状态机任意转移 | 否 |
+| `progress` | `{stage, message, elapsed_ms?}` | 操作中的阶段性进度 | 否 |
+| `done` | `{status, agent_state?, ...}` | 操作成功完成 | **是** |
+| `error` | `{error, agent_state?}` | 操作失败 | **是** |
+
+**端点**：
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/api/agents/me/start/stream` | GET | 启动 Agent → SSE 流 |
+| `/api/agents/me/stop/stream` | GET | 停止 Agent → SSE 流 |
+| `/api/agents/me/restart/stream` | GET | 重启 Agent → SSE 流 |
+| `/api/agents/me/start` | POST | 同步启动（兼容保留） |
+| `/api/agents/me/stop` | POST | 同步停止（兼容保留） |
+
+**协议特点**：
+- **不设超时** — SSE 连接持续打开直到 done/error 或客户端断开
+- **透明透传** — API 不作处理，直接转发 Supervisor 事件
+- **幂等安全** — 重复 start/stop 返回 `already_running` / `already_stopped`
+
+### 1.5 7 种子意图（不变）
 
 | 类型 | 子意图 | 工具范围 | 说明 |
 |------|--------|---------|------|
@@ -335,7 +400,8 @@ results = await asyncio.gather(
 | `agent:ws:{uid}` | **List** | API | Supervisor | 入站消息队列 |
 | `agent:outbox:{uid}` | **List** | Supervisor | API outbox_poller | 出站消息队列 |
 | `agent:control` | **Pub/Sub** | API | Supervisor | 控制指令 (cmd, agent_id, user_id, correlation_id) |
-| `agent:control:resp:{corr_id}` | **Pub/Sub** | Supervisor | API | 控制响应 (一次性，API subscribe → receive → unsubscribe) |
+| `agent:control:resp:{corr_id}` | **Pub/Sub** | Supervisor | API | 控制响应 (REST 同步模式) |
+| `agent:sse:{corr_id}` | **Pub/Sub** | Supervisor | API | SSE 事件流 (新) — 操作进度实时推送 |
 | `agent:ws:{uid}:parked` | **List** | Supervisor | Supervisor | 未匹配消息暂存 |
 
 ### agent:state:{agent_id} Hash 结构 (v4.2)
@@ -418,13 +484,18 @@ Supervisor 自动维护：`transition()` 到 terminal 时 `SREM`，离开 termin
 │  Agent: print({"type":"state","state":"busy"})                        │
 │  Supervisor → AgentStateManager.transition("busy") →                  │
 │  HSET agent:state:{agent_id} + lifecycle.jsonl + DB(异步)             │
-├─ 控制 (v4.2 双向) ─────────────────────────────────────────────────────┤
-│  API: SUBSCRIBE agent:control:resp:{corr_id}                          │
-│  API: PUBLISH agent:control {cmd, agent_id, user_id, correlation_id}  │
-│  Supervisor: 处理 → AgentStateManager.transition() →                  │
-│  Supervisor: PUBLISH agent:control:resp:{corr_id} {status, agent_state}│
-│  API: 收到响应 → UNSUBSCRIBE → return to client                       │
-└────────────────────────────────────────────────────────────────────────┘
+├─ 控制 (v4.2 REST 同步) ────────────────────────────────────────────────────┤
+│  API: SUBSCRIBE agent:control:resp:{corr_id}                              │
+│  API: PUBLISH agent:control {cmd, agent_id, user_id, correlation_id}      │
+│  Supervisor: 处理 → AgentStateManager.transition() →                      │
+│  Supervisor: PUBLISH agent:control:resp:{corr_id} {status, agent_state}   │
+│  API: 收到响应 → UNSUBSCRIBE → return to client                           │
+├─ 控制 (v4.2 SSE 实时) ─────────────────────────────────────────────────────┤
+│  API: SUBSCRIBE agent:sse:{corr_id}                                       │
+│  API: PUBLISH agent:control {cmd, agent_id, user_id, correlation_id}      │
+│  Supervisor: 处理 → 每步 PUBLISH agent:sse:{corr_id} {event, data}        │
+│  API: stream SSE event → Client (不设超时，连接保持直到 done/error)       │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -449,6 +520,7 @@ Supervisor 自动维护：`transition()` 到 terminal 时 `SREM`，离开 termin
 | 8 | Supervisor 自动创建 Agent（Redis/DB 无记录时） | 2026-07-19 | v4.2 |
 | 9 | 结构化生命周期日志 (agent_lifecycle.jsonl) | 2026-07-19 | v4.2 |
 | 10 | API 启停同步等待确认 (start 180s / stop 30s 超时) | 2026-07-19 | v4.2 |
+| 11 | SSE 事件流替代轮询 — start/stop/restart 实时推送进度，无超时 | 2026-07-19 | v4.2 |
 | 7 | Celery 进度上报经 Agent stdout 中继，不直接写 outbox | 2026-07-18 |
 | 8 | Intent classify 7 意图独立打分，Flash 优先 | 2026-07-18 |
 | 9 | Plan ⇄ Clarify 外循环不限轮次，内循环 ≤5 轮 | 2026-07-18 |
