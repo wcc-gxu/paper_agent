@@ -472,7 +472,7 @@ class AgentSupervisor:
         db = PostgresAgentDB()
         try:
             active_agents = db._fetchall(
-                "SELECT DISTINCT user_id FROM agents WHERE is_active = true")
+                "SELECT DISTINCT user_id FROM agents WHERE state != 'stopped'")
             logger.info("Found %d active users in DB", len(active_agents))
         except Exception as e:
             logger.error("Failed to scan agents table: %s", e)

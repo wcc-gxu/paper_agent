@@ -196,6 +196,10 @@ class PostgresAgentDB:
     def get_user(self, user_id: str) -> Optional[dict]:
         return self._fetchone("SELECT * FROM users WHERE id = %s", (user_id,))
 
+    def get_user_by_token(self, token: str) -> Optional[dict]:
+        """Deprecated: v4.1 去掉 api_token，仅 JWT 认证。保留向后兼容。"""
+        return None
+
     def get_user_by_username(self, username: str) -> Optional[dict]:
         """按用户名查找用户（用于登录）。"""
         return self._fetchone(
@@ -230,8 +234,8 @@ class PostgresAgentDB:
     # ═══════════════════════════════════════════════════════════════
 
     def list_user_agents(self, user_id: str, include_inactive: bool = False) -> list[dict]:
-        """列出用户的所有智能体."""
-        extra = "" if include_inactive else " AND is_active = true"
+        """列出用户的所有智能体。v4.1: is_active → state."""
+        extra = "" if include_inactive else " AND state != 'stopped'"
         return self._fetchall(
             f"SELECT * FROM agents WHERE user_id = %s{extra} ORDER BY created_at",
             (user_id,),
@@ -242,27 +246,24 @@ class PostgresAgentDB:
         return self._fetchone("SELECT * FROM agents WHERE id = %s", (agent_id,))
 
     def get_default_agent(self, user_id: str) -> Optional[dict]:
-        """获取用户的默认智能体（最早创建的活跃 main 类型）。"""
+        """获取用户的默认智能体（最早创建且非 stopped 状态）。v4.1: 去掉 agent_type/is_active。"""
         return self._fetchone(
-            "SELECT * FROM agents WHERE user_id = %s AND agent_type = 'main' AND is_active = true ORDER BY created_at LIMIT 1",
+            "SELECT * FROM agents WHERE user_id = %s AND state != 'stopped' ORDER BY created_at LIMIT 1",
             (user_id,),
         )
 
     def create_agent(
         self,
         user_id: str,
-        name: str = "My Agent",
-        display_name: str = "Paper Agent",
         system_prompt: str = "",
         llm_provider: str = "deepseek",
-        agent_type: str = "main",
     ) -> str:
-        """创建智能体，返回 agent_id."""
+        """创建智能体，返回 agent_id。v4.1: 去掉 name/display_name/agent_type 冗余列。"""
         agent_id = _uuid("agent")
         self._execute(
-            """INSERT INTO agents (id, user_id, name, display_name, agent_type, system_prompt, llm_provider)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-            (agent_id, user_id, name, display_name, agent_type, system_prompt, llm_provider),
+            """INSERT INTO agents (id, user_id, system_prompt, llm_provider)
+               VALUES (%s, %s, %s, %s)""",
+            (agent_id, user_id, system_prompt, llm_provider),
         )
         return agent_id
 
@@ -270,7 +271,7 @@ class PostgresAgentDB:
         """更新智能体配置。user_id 可选用于权限校验."""
         if not kwargs:
             return False
-        allowed = {"name", "display_name", "system_prompt", "llm_provider", "config", "is_active"}
+        allowed = {"system_prompt", "llm_provider", "state"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
@@ -290,8 +291,8 @@ class PostgresAgentDB:
         return True
 
     def deactivate_agent(self, agent_id: str, user_id: str = None) -> bool:
-        """软删除智能体."""
-        return self.update_agent(agent_id, user_id=user_id, is_active=False)
+        """软删除智能体。v4.1: 改为设 state='stopped'。"""
+        return self.update_agent(agent_id, user_id=user_id, state="stopped")
 
     def agent_belongs_to_user(self, agent_id: str, user_id: str) -> bool:
         """验证智能体是否属于该用户."""

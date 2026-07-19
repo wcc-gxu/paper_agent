@@ -261,12 +261,7 @@ def auth_register(username: str, password: str, display_name: str = "") -> dict:
     role = "super_admin" if username == "wcc" else "researcher"
     user_id = db.create_user(username, display, role=role, password_hash=pwd_hash)
 
-    agent_id = db.create_agent(
-        user_id=user_id,
-        name="Default Agent",
-        display_name="Paper Agent",
-        agent_type="main",
-    )
+    agent_id = db.create_agent(user_id=user_id)
 
     access_token = _create_jwt(user_id, username, "access", agent_id=agent_id)
     refresh_token = _create_jwt(user_id, username, "refresh", agent_id=agent_id)
@@ -311,12 +306,7 @@ def auth_login(username: str, password: str) -> dict:
     if default_agent:
         agent_id = default_agent["id"]
     else:
-        agent_id = db.create_agent(
-            user_id=user["id"],
-            name="Default Agent",
-            display_name="Paper Agent",
-            agent_type="main",
-        )
+        agent_id = db.create_agent(user_id=user["id"])
 
     access_token = _create_jwt(user["id"], username, "access", agent_id=agent_id)
     refresh_token = _create_jwt(user["id"], username, "refresh", agent_id=agent_id)

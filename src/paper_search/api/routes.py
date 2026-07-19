@@ -79,6 +79,8 @@ async def api_register(body: RegisterRequest):
     except HTTPException:
         raise
     except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Registration failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
 
 
@@ -97,7 +99,22 @@ async def api_login(body: LoginRequest):
     except HTTPException:
         raise
     except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Login failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Login failed: {e}")
+
+@router.post("/auth/refresh", response_model=TokenResponse)
+async def api_refresh(body: RefreshRequest):
+    """使用 refresh_token 获取新的 access_token。"""
+    try:
+        result = auth_refresh(body.refresh_token)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error("Refresh failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
 
 
 @router.post("/auth/refresh", response_model=TokenResponse)
@@ -291,7 +308,7 @@ async def admin_system_health(user_id: str = Depends(verify_super_admin)):
     db_ms = int((time.monotonic() - t0) * 1000)
 
     user_count = db.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    agent_count = db.conn.execute("SELECT COUNT(*) FROM agents WHERE is_active = true").fetchone()[0]
+    agent_count = db.conn.execute("SELECT COUNT(*) FROM agents WHERE state != 'stopped'").fetchone()[0]
     session_count = db.conn.execute("SELECT COUNT(*) FROM sessions WHERE status = 'active'").fetchone()[0]
 
     import redis.asyncio as aioredis
