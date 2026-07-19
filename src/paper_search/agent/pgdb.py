@@ -257,21 +257,23 @@ class PostgresAgentDB:
         user_id: str,
         system_prompt: str = "",
         llm_provider: str = "deepseek",
+        state: str = "pending",
     ) -> str:
-        """创建智能体，返回 agent_id。v4.1: 去掉 name/display_name/agent_type 冗余列。"""
+        """创建智能体，返回 agent_id。v4.2: 支持 user_preferences/extra。"""
         agent_id = _uuid("agent")
         self._execute(
             """INSERT INTO agents (id, user_id, system_prompt, llm_provider, state)
-               VALUES (%s, %s, %s, %s, 'starting')""",
-            (agent_id, user_id, system_prompt, llm_provider),
+               VALUES (%s, %s, %s, %s, %s)""",
+            (agent_id, user_id, system_prompt, llm_provider, state),
         )
         return agent_id
 
     def update_agent(self, agent_id: str, user_id: str = None, **kwargs) -> bool:
-        """更新智能体配置。user_id 可选用于权限校验."""
+        """更新智能体配置。user_id 可选用于权限校验。v4.2: 支持 user_preferences/extra。"""
         if not kwargs:
             return False
-        allowed = {"system_prompt", "llm_provider", "state"}
+        allowed = {"system_prompt", "llm_provider", "state",
+                    "user_preferences", "extra"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False

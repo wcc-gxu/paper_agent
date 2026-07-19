@@ -1,5 +1,7 @@
 """Agent Worker — 子进程入口。
 
+v4.2: 启动上报 startup_ms / graph_nodes，Supervisor 据此判断就绪。
+
 v4.1: Agent 不直接连接 Redis。所有 IO 通过 stdin/stdout pipe 与 Supervisor 通信。
 
 通信协议 (JSON lines on stdout):
@@ -23,6 +25,7 @@ import logging
 import os
 import signal
 import sys
+import time as _time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +58,7 @@ class AgentWorker:
 
     async def bootstrap(self) -> bool:
         """初始化 DB / LLM / Tools / Memory / LangGraph。"""
+        t0 = _time.time()
         try:
             # DB
             from ..agent.pgdb import PostgresAgentDB
@@ -77,7 +81,7 @@ class AgentWorker:
             async def _graph_push(session_id, msg_type, subtype, role,
                                    payload=None, priority_kind="normal"):
                 supervisor_send(msg_type, session_id=session_id,
-                                **(payload or {}))
+                                 **(payload or {}))
 
             self._compiled_graph = build_main_graph(
                 llm=self._llm, registry=self._tools, db=self._db,
@@ -85,13 +89,18 @@ class AgentWorker:
             )
             logger.info("Worker %s: graph compiled", self.user_id)
 
+            elapsed_ms = int((_time.time() - t0) * 1000)
+            graph_nodes = list(self._compiled_graph.nodes.keys()) if hasattr(self._compiled_graph, 'nodes') else []
+
             supervisor_send("state", state="idle", node=None,
-                            active_turns=0, agent_id=self.agent_id)
+                             active_turns=0, agent_id=self.agent_id,
+                             startup_ms=elapsed_ms,
+                             graph_nodes=graph_nodes)
             return True
         except Exception as e:
             logger.error("Bootstrap failed: %s", e, exc_info=True)
             supervisor_send("error", subType="INTERNAL_ERROR",
-                            message=f"Bootstrap failed: {e}")
+                             message=f"Bootstrap failed: {e}")
             return False
 
     async def process_message(self, raw_msg: str) -> str:

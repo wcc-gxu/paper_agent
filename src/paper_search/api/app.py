@@ -325,41 +325,34 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
                                 redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     logger.info("📡 OutboxPoller running for user=%s", _user_id)
 
-    # ── Redis LPUSH helper (v4.1: Supervisor-managed agent:status Hash) ──
+    # ── Redis LPUSH helper (v4.2: Supervisor-managed agent:state:{agent_id} Hash) ──
     async def _push_to_redis(msg: dict):
-        """推送消息到 Redis 队列，失败重试 3 次。v4.1: 查 agent:status Hash。"""
+        """推送消息到 Redis 队列，失败重试 3 次。v4.2: 查 agent:state:{agent_id} Hash。"""
         msg["_session_id"] = session_id
         msg["_agent_id"] = _resolved_agent_id
         msg["target_agent_id"] = _resolved_agent_id
 
-        # v4.1: 查 Supervisor 维护的 agent:status Hash
+        # v4.2: 查 Supervisor 维护的 agent:state:{agent_id} Hash
         if msg.get("type") in ("message", "ask_reply", "plan_approve", "plan_revise"):
             try:
-                status_raw = await _redis.hget("agent:status", _user_id)
-                if not status_raw:
+                status_raw = await _redis.hget(f"agent:state:{_resolved_agent_id}", "state")
+                agent_state = status_raw or "unknown"
+                if agent_state in ("unknown", "stopped", "crashed", "stalled"):
                     await websocket.send_text(_json.dumps({
                         "type": "error", "subType": "AGENT_NOT_RUNNING",
                         "msg_id": str(uuid.uuid4()), "agentId": _resolved_agent_id,
                         "sessionId": session_id,
                         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "priority": "urgent",
-                        "payload": {"code": "AGENT_NOT_RUNNING", "message": "Agent 未运行，请先启动"},
+                        "payload": {"code": "AGENT_NOT_RUNNING",
+                                    "message": "Agent 未运行，请先启动" if agent_state == "unknown"
+                                    else f"Agent {agent_state}"},
                     }, ensure_ascii=False))
                     return False
 
-                status = _json.loads(status_raw)
-                if status.get("state") in ("stopped", "crashed", "stalled"):
-                    await websocket.send_text(_json.dumps({
-                        "type": "error", "subType": "AGENT_NOT_RUNNING",
-                        "msg_id": str(uuid.uuid4()), "agentId": _resolved_agent_id,
-                        "sessionId": session_id,
-                        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "priority": "urgent",
-                        "payload": {"code": "AGENT_NOT_RUNNING", "message": f"Agent {status['state']}"},
-                    }, ensure_ascii=False))
-                    return False
-
-                if int(status.get("active_turns", 0)) > 0:
+                active_turns_raw = await _redis.hget(f"agent:state:{_resolved_agent_id}", "active_turns")
+                active_turns = int(active_turns_raw) if active_turns_raw else 0
+                if active_turns > 0:
                     await websocket.send_text(_json.dumps({
                         "type": "status",
                         "msg_id": str(uuid.uuid4()), "agentId": _resolved_agent_id,

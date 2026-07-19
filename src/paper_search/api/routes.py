@@ -5,7 +5,9 @@ v3 Phase 1: 所有端点增加 user_id 注入（多用户支持）。
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1066,52 +1068,84 @@ async def list_devices(agent_id: str, user_id: str = Depends(verify_api_key)):
 
 @router.get("/agents/me")
 async def get_my_agent(user_id: str = Depends(verify_api_key)):
-    """获取当前用户 Agent 信息（DB + Redis agent:status Hash）。"""
+    """v4.2: 获取当前用户 Agent 信息（Redis agent:state Hash + DB fallback）。"""
+    agent_id = f"agent-{user_id}"
     from ..agent.pgdb import PostgresAgentDB
+
+    # 优先从 Redis 读取完整状态
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                              decode_responses=True)
+        data = await r.hgetall(f"agent:state:{agent_id}")
+        await r.aclose()
+        if data:
+            from ..agent.agent_state import AgentState
+            state = AgentState.from_redis_hash(data, agent_id=agent_id)
+            return {"agent": state.to_dict()}
+    except Exception:
+        pass
+
+    # DB fallback
     db = PostgresAgentDB()
     agent = db.get_default_agent(user_id)
     if not agent:
-        # 自动创建（兼容旧用户注册时 create_agent 失败）
-        agent_id = db.create_agent(user_id=user_id)
+        agent_id = db.create_agent(user_id=user_id, state="pending")
         agent = db.get_agent(agent_id)
     if not agent:
         raise HTTPException(status_code=404, detail="No agent found")
-    status_info = {"state": "unknown", "active_turns": 0}
-    try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-        raw = await r.hget("agent:status", user_id)
-        if raw:
-            status_info.update(_json.loads(raw))
-        await r.aclose()
-    except Exception:
-        pass
-    return {"agent": agent, **status_info}
+    return {"agent": agent}
 
 
 @router.put("/agents/me")
 async def update_my_agent(req: dict, user_id: str = Depends(verify_api_key)):
-    """更新当前用户 Agent 的 system_prompt。"""
+    """v4.2: 更新当前用户 Agent 的 system_prompt（同步 Redis + DB）。"""
+    agent_id = f"agent-{user_id}"
+
+    system_prompt = req.get("system_prompt", "")
+    llm_provider = req.get("llm_provider")
+
+    # 更新 DB
     from ..agent.pgdb import PostgresAgentDB
     db = PostgresAgentDB()
     agent = db.get_default_agent(user_id)
     if not agent:
         raise HTTPException(status_code=404, detail="No agent found")
-    db.update_agent(agent["id"], user_id=user_id, system_prompt=req.get("system_prompt", ""))
+    updates = {"system_prompt": system_prompt}
+    if llm_provider:
+        updates["llm_provider"] = llm_provider
+    db.update_agent(agent["id"], user_id=user_id, **updates)
+
+    # 同步 Redis
+    try:
+        import redis.asyncio as aioredis
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                              decode_responses=True)
+        if system_prompt:
+            await r.hset(f"agent:state:{agent_id}", "system_prompt", system_prompt)
+        if llm_provider:
+            await r.hset(f"agent:state:{agent_id}", "llm_provider", llm_provider)
+        await r.aclose()
+    except Exception:
+        pass
+
     return {"agent_id": agent["id"], "status": "updated"}
 
 
 @router.get("/agents/me/status")
 async def get_my_agent_status(user_id: str = Depends(verify_api_key)):
-    """v4.1: 查 Supervisor 维护的 agent:status Hash。"""
-    import os
+    """v4.2: 查 Supervisor 维护的 agent:state:{agent_id} Hash。"""
+    agent_id = f"agent-{user_id}"
     try:
         import redis.asyncio as aioredis
-        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
-        raw = await r.hget("agent:status", user_id)
+        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                              decode_responses=True)
+        data = await r.hgetall(f"agent:state:{agent_id}")
         await r.aclose()
-        if raw:
-            return _json.loads(raw)
+        if data:
+            from ..agent.agent_state import AgentState
+            state = AgentState.from_redis_hash(data, agent_id=agent_id)
+            return state.to_dict()
         return {"state": "stopped", "active_turns": 0}
     except Exception:
         return {"state": "unknown", "active_turns": 0}
@@ -1119,34 +1153,134 @@ async def get_my_agent_status(user_id: str = Depends(verify_api_key)):
 
 @router.post("/agents/me/start")
 async def start_my_agent(user_id: str = Depends(verify_api_key)):
-    """v4.1: PUBLISH agent:control {cmd:start} → Supervisor 创建子进程。"""
-    import os
+    """v4.2: 双向 Pub/Sub 启动 Agent。
+
+    API 先 SUBSCRIBE agent:control:resp:{corr_id}，
+    再 PUBLISH agent:control {cmd:start}，
+    Supervisor 处理后 PUBLISH 响应。
+    超时 180s (3 分钟 — 包含 worker bootstrap)。
+    """
+    agent_id = f"agent-{user_id}"
+    correlation_id = str(uuid.uuid4())
+
+    import redis.asyncio as aioredis
+    r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                          decode_responses=True)
+    pubsub = r.pubsub()
+
+    START_TIMEOUT = 180
+
     try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        # ① 先订阅响应通道
+        await pubsub.subscribe(f"agent:control:resp:{correlation_id}")
+        # 等待订阅确认（Pub/Sub 是异步的）
+        await asyncio.sleep(0.1)
+
+        # ② 发布启动请求
         await r.publish("agent:control", _json.dumps({
-            "cmd": "start", "user_id": user_id,
+            "cmd": "start",
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "correlation_id": correlation_id,
         }))
-        await r.aclose()
-        return {"status": "starting", "message": "Agent 启动指令已发送"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to send start command: {e}")
+
+        # ③ 等待响应
+        try:
+            async with asyncio.timeout(START_TIMEOUT):
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    data = _json.loads(msg["data"])
+                    if data.get("correlation_id") != correlation_id:
+                        continue
+
+                    status = data.get("status", "error")
+                    if status == "ok":
+                        return {
+                            "status": "started",
+                            "agent": data.get("agent_state", {}),
+                        }
+                    elif status == "already_running":
+                        return {
+                            "status": "running",
+                            "agent": data.get("agent_state", {}),
+                            "message": "Agent is already running",
+                        }
+                    else:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=data.get("error", "Start failed"),
+                        )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Agent start timed out after {START_TIMEOUT}s",
+            )
+    finally:
+        try:
+            await pubsub.unsubscribe(f"agent:control:resp:{correlation_id}")
+            await pubsub.aclose()
+            await r.aclose()
+        except Exception:
+            pass
 
 
 @router.post("/agents/me/stop")
 async def stop_my_agent(user_id: str = Depends(verify_api_key)):
-    """v4.1: PUBLISH agent:control {cmd:stop} → Supervisor 发 SIGTERM。"""
-    import os
+    """v4.2: 双向 Pub/Sub 停止 Agent。超时 30s。"""
+    agent_id = f"agent-{user_id}"
+    correlation_id = str(uuid.uuid4())
+
+    import redis.asyncio as aioredis
+    r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                          decode_responses=True)
+    pubsub = r.pubsub()
+
+    STOP_TIMEOUT = 30
+
     try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+        await pubsub.subscribe(f"agent:control:resp:{correlation_id}")
+        await asyncio.sleep(0.1)
+
         await r.publish("agent:control", _json.dumps({
-            "cmd": "stop", "user_id": user_id,
+            "cmd": "stop",
+            "agent_id": agent_id,
+            "user_id": user_id,
+            "correlation_id": correlation_id,
         }))
-        await r.aclose()
-        return {"status": "stopping", "message": "Agent 停止指令已发送"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to send stop command: {e}")
+
+        try:
+            async with asyncio.timeout(STOP_TIMEOUT):
+                async for msg in pubsub.listen():
+                    if msg.get("type") != "message":
+                        continue
+                    data = _json.loads(msg["data"])
+                    if data.get("correlation_id") != correlation_id:
+                        continue
+
+                    status = data.get("status", "error")
+                    if status in ("ok", "already_stopped"):
+                        return {
+                            "status": "stopped",
+                            "agent": data.get("agent_state", {}),
+                        }
+                    else:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=data.get("error", "Stop failed"),
+                        )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Agent stop timed out after {STOP_TIMEOUT}s",
+            )
+    finally:
+        try:
+            await pubsub.unsubscribe(f"agent:control:resp:{correlation_id}")
+            await pubsub.aclose()
+            await r.aclose()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════

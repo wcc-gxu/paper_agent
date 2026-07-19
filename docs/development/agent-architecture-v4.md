@@ -1,7 +1,7 @@
-# Paper Agent v4.1 — Agent 架构设计文档
+# Paper Agent v4.2 — Agent 架构设计文档
 
-> 最后更新: 2026-07-18
-> 状态: Supervisor + Agent 子进程架构（决策完成，进入开发）
+> 最后更新: 2026-07-19
+> 状态: v4.1 已进入开发；v4.2 统一状态管理 + 双向 Pub/Sub 控制已上线
 > 来源: Claude Code 架构对话 + OpenClaw 竞品分析 + 多轮需求确认
 
 ---
@@ -16,11 +16,12 @@
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │  Agent Supervisor                                           ││
-│  │  - 扫描 agents 表，管理所有用户 Agent 子进程                   ││
+│  │  - AgentStateManager: Redis agent:state:{agent_id} Hash      ││
+│  │  - LifecycleLogger: ~/.paper_search/logs/agent_lifecycle.jsonl││
 │  │  - BRPOP agent:ws:{uid} → stdin → Agent 子进程               ││
 │  │  - Agent 子进程 stdout → LPUSH agent:outbox:{uid}            ││
-│  │  - 3 层健康检测 (poll/积压/stdout) → HSET agent:status       ││
-│  │  - SUBSCRIBE agent:control ← API 控制指令                    ││
+│  │  - 3 层健康检测 (poll/积压/stdout)                            ││
+│  │  - 双向 Pub/Sub: agent:control + agent:control:resp:{corr_id} ││
 │  └─────────────────────────────────────────────────────────────┘│
 │         │ stdin/stdout pipe          │ stdin/stdout pipe         │
 │  ┌──────▼──────────┐         ┌──────▼──────────┐                │
@@ -43,27 +44,29 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 Supervior → Agent 通信模型
+### 1.2 Supervisor → Agent 通信模型
 
 Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout pipe 经由 Supervisor 中转：
 
 ```
 入站: API → LPUSH agent:ws:{uid} → Supervisor BRPOP → Agent stdin
 出站: Agent stdout → Supervisor → LPUSH agent:outbox:{uid} → API BRPOP → WS
-状态: Agent stdout {"type":"state","state":"busy","node":"plan"} → Supervisor HSET agent:status
-控制: API PUBLISH agent:control → Supervisor SUBSCRIBE → 启停 Agent 子进程
+状态: Agent stdout {"type":"state","state":"busy"} → Supervisor → HSET agent:state:{agent_id}
+控制 (v4.2): API SUBSCRIBE agent:control:resp:{corr_id} → PUBLISH agent:control → Supervisor 处理 → PUBLISH agent:control:resp:{corr_id}
 ```
 
-### 1.3 关键设计变更 (v4.1)
+### 1.3 关键设计变更
 
-| 概念 | v4.0 草案 | v4.1 最终 | 原因 |
-|------|--------|--------|------|
-| Agent 进程模型 | daemon 内 asyncio.Task | **每用户独立子进程** (create_subprocess_exec) | OS 级隔离，崩溃互不影响 |
-| Agent 连 Redis | ✅ Agent 直连 | ❌ **Agent 不连 Redis，仅 stdin/stdout** | 简化 Agent、Gateway 可拦截 |
-| 心跳机制 | Agent → Redis heartbeat key | **Supervisor 3 层检测 (poll/积压/stdout)** | Agent 无需主动上报，减少误报 |
-| API 查状态 | GET Redis heartbeat key | **HGET agent:status Hash** (Supervisor 维护) | 一次查询所有用户 |
-| Pub/Sub 用途 | 心跳 + 进度上报 + 控制 | **仅控制指令 (agent:control)** | 单一职责 |
-| 工具调度 | 全部 Celery | **轻工具 in-process / 重工具 Celery** | 减少序列化开销 |
+| 概念 | v4.0 草案 | v4.1 最终 | v4.2 | 原因 |
+|------|--------|--------|------|------|
+| Agent 进程模型 | daemon 内 asyncio.Task | **每用户独立子进程** | 同 v4.1 | OS 级隔离，崩溃互不影响 |
+| Agent 连 Redis | Agent 直连 | **Agent 不连 Redis** | 同 v4.1 | 简化 Agent、Gateway 可拦截 |
+| 心跳机制 | Agent → Redis heartbeat key | **Supervisor 3 层检测** | 同 v4.1 | Agent 无需主动上报 |
+| API 查状态 | GET Redis heartbeat key | **HGET agent:status Hash** | **agent:state:{agent_id} Hash** | 每条记录包含完整 agent 配置 |
+| Pub/Sub 控制 | 单向上报 + 控制 | **仅控制指令 (单向)** | **双向请求-响应** | API 等待启动确认 (180s 超时) |
+| 状态管理 | DB + Redis 双写 | Supervisor 写 Redis | **AgentStateManager 统一管理** | Redis + DB + lifecycle 日志三方一致 |
+| 创建 Agent | 注册时创建 | 注册时创建 | **Supervisor 自动创建** | API 发 start 时 Redis/DB 无记录自动建 |
+| 生命周期日志 | 无 | 无 | **JSONL 结构化日志** | agent.create/launch/crash/stop 全事件可追踪 |
 
 ### 1.4 7 种子意图（不变）
 
@@ -94,14 +97,19 @@ Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout
 
 ## 3. Agent 状态机
 
-### 3.1 7 种状态
+### 3.1 8 种状态
 
 ```
-                    ┌─────────┐
-         API: start │ STARTING│ crash/error
-         ──────────→│         │──────────────┐
+                    ┌──────────┐
+      首次创建/发现  │ PENDING  │
+          ─────────→│(未启动)   │
+                    └────┬─────┘
+                         │ API: start
+                    ┌────▼─────┐
+         API: start │ STARTING │ crash/error
+         ──────────→│          │──────────────┐
                     └────┬─────┘              │
-                         │ init OK            ▼
+                         │ worker idle        ▼
                     ┌────▼─────┐        ┌──────────┐
                     │   IDLE   │◄───────│ CRASHED  │
                     │(无活跃turn)│ 自动重启 │          │
@@ -123,6 +131,7 @@ Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout
 
 | 状态 | 含义 | 触发 | 前端 |
 |------|------|------|------|
+| `pending` | Agent 已注册，尚未首次启动 | Supervisor 自动创建 / API 注册 | 灰色 ● 未启动 |
 | `starting` | 子进程已 launch，初始化中 | API 调 start | 加载中 |
 | `idle` | 正常运行，无活跃 turn | turn 完成 | 绿色 ● 在线 |
 | `busy` | 正在处理消息 | WS 消息到达 | 黄色 ● 处理中 |
@@ -134,18 +143,23 @@ Agent 子进程**不直接连接 Redis**。所有进出消息通过 stdin/stdout
 ### 3.2 状态上报路径
 
 ```
-路径 1: Agent → stdout → Supervisor → HSET agent:status
+路径 1: Agent → stdout → Supervisor → AgentStateManager.transition()
+         → Redis agent:state:{agent_id} + lifecycle.jsonl + DB(异步)
 
   Agent 内部在 LangGraph 节点转换时:
-    print({"type":"state","state":"busy","node":"plan"})
+    print({"type":"state","state":"busy","node":"plan","startup_ms":0})
 
-路径 2: Supervisor OS 检测 → HSET agent:status
+路径 2: Supervisor OS 检测 → AgentStateManager.transition()
 
   proc.returncode is not None → state=crashed/stopped
 
-路径 3: Supervisor 队列检测 → HSET agent:status
+路径 3: Supervisor 队列检测 → AgentStateManager.update()
 
   state=idle + 队列最老消息 > 43200s → state=stalled
+  
+路径 4 (v4.2): API 控制 → AgentStateManager.transition()
+
+  API start → pending→starting / API stop → stopping→stopped
 ```
 
 ### 3.3 Busy 状态超时检测（按节点）
@@ -312,61 +326,105 @@ results = await asyncio.gather(
 
 ---
 
-## 8. Redis Key 设计（仅 5 个 Key 类型）
+## 8. Redis Key 设计
 
 | Key | 类型 | 写 | 读 | 用途 |
 |-----|------|:---:|:---:|------|
-| `agent:status` | **Hash** | Supervisor | API | `HGETALL` 全量状态 / `HGET {uid}` 单用户 |
+| `agent:state:{agent_id}` | **Hash** | Supervisor | API / WS | 每个 agent 完整状态（配置 + 运行时） |
+| `agent:active` | **SET** | Supervisor | Supervisor | 所有非 stopped 的 agent_id |
 | `agent:ws:{uid}` | **List** | API | Supervisor | 入站消息队列 |
 | `agent:outbox:{uid}` | **List** | Supervisor | API outbox_poller | 出站消息队列 |
-| `agent:control` | **Pub/Sub** | API | Supervisor | **唯一** Pub/Sub — 仅控制指令 |
-| `agent:ws:{uid}:parked` | **List** | Supervisor | Supervisor | 未匹配消息暂存（已有） |
+| `agent:control` | **Pub/Sub** | API | Supervisor | 控制指令 (cmd, agent_id, user_id, correlation_id) |
+| `agent:control:resp:{corr_id}` | **Pub/Sub** | Supervisor | API | 控制响应 (一次性，API subscribe → receive → unsubscribe) |
+| `agent:ws:{uid}:parked` | **List** | Supervisor | Supervisor | 未匹配消息暂存 |
 
-### agent:status Hash 结构
+### agent:state:{agent_id} Hash 结构 (v4.2)
+
+每个 agent 一个独立 Hash，包含完整配置和运行时状态：
 
 ```json
+// HSET agent:state:agent-user-abc
 {
-  "user-abc": {
-    "state": "busy", "node": "executing",
-    "active_turns": 2, "current_session": "sess-123",
-    "pid": 1001, "started_at": "2026-07-18T10:00:00Z",
-    "updated_at": "2026-07-18T10:05:23Z"
-  },
-  "user-xyz": {
-    "state": "idle", "node": null,
-    "active_turns": 0, "current_session": null,
-    "pid": 1002, "started_at": "2026-07-18T10:01:00Z",
-    "updated_at": "2026-07-18T10:05:20Z"
-  }
+  // ── 身份 ──
+  "agent_id": "agent-user-abc",
+  "user_id": "user-abc",
+  "agent_type": "main",
+  "display_name": "我的科研助理",
+
+  // ── LLM 配置 ──
+  "llm_provider": "deepseek",
+  "llm_model": "deepseek-v4-pro",
+  "system_prompt": "",
+
+  // ── 运行时配置 ──
+  "checkpoint_backend": "",
+  "session_default": "main",
+  "iteration_limit": "8",
+  "user_timeout_seconds": "1800",
+  "message_window_trim_max_tokens": "8000",
+  "data_dir": "~/.paper_search",
+
+  // ── 用户偏好 ──
+  "user_preferences": "{\"research_domain\":\"AI\",\"writing_style\":\"APA\",\"language_pref\":\"zh\"}",
+
+  // ── 运行时状态 ──
+  "state": "idle",
+  "pid": "12345",
+  "current_node": "",
+  "active_turns": "0",
+  "current_session_id": "main",
+  "started_at": "2026-07-19T10:00:00Z",
+  "last_active_at": "2026-07-19T10:05:23Z",
+  "last_error": "",
+  "exit_code": "0",
+  "restart_count": "0",
+  "created_at": "2026-07-19T09:00:00Z",
+  "updated_at": "2026-07-19T10:05:23Z"
 }
 ```
 
-**API 查询：** `HGET agent:status user-abc` — 1 次 Redis 往返，~0.1ms。
+**API 查询**：`HGETALL agent:state:agent-user-abc` — 返回完整配置 + 状态，1 次 Redis 往返。
 
-**状态不存 DB（实时变化快，持久化无意义）。**
+**API 查状态**：`HGET agent:state:agent-user-abc state` — 仅查状态字段。
+
+### agent:active SET
+
+```bash
+SMEMBERS agent:active
+# → ["agent-user-abc", "agent-user-xyz"]
+```
+
+Supervisor 自动维护：`transition()` 到 terminal 时 `SREM`，离开 terminal 时 `SADD`。
 
 ---
 
-## 9. 消息全链路（10 步）
+## 9. 消息全链路 (v4.2)
 
 ```
-┌─ 入站 ───────────────────────────────────────────────────────┐
-│  1. Client → WS → FastAPI                                    │
-│  2. API: HGET agent:status {uid} → state=running?idle?      │
-│     NO → error/AGENT_NOT_RUNNING                             │
-│  3. API: LPUSH agent:ws:{uid}                                │
-│  4. Supervisor: BRPOP agent:ws:{uid}                        │
-│  5. Supervisor: proc.stdin.write(msg)                       │
-│  6. Agent: stdin.readline → process → print(result)         │
-├──────────────────────────────────────────────────────────────┤
-│  7. Supervisor: stdout.readline → parse JSON                │
-│  8. Supervisor: LPUSH agent:outbox:{uid} (内容不变)          │
-│  9. API outbox_poller: BRPOP agent:outbox:{uid}             │
-│ 10. API: ws_manager.broadcast → Client                      │
-├─ 状态同步 ───────────────────────────────────────────────────┤
-│  Agent: print({"type":"state","state":"busy"})              │
-│  Supervisor: HSET agent:status {uid} {state:busy,...}       │
-└──────────────────────────────────────────────────────────────┘
+┌─ 入站 ─────────────────────────────────────────────────────────────────┐
+│  1. Client → WS → FastAPI                                              │
+│  2. API: HGET agent:state:{agent_id} state → running? idle?           │
+│     NO → error/AGENT_NOT_RUNNING                                       │
+│  3. API: LPUSH agent:ws:{uid}                                          │
+│  4. Supervisor: BRPOP agent:ws:{uid}                                  │
+│  5. Supervisor: proc.stdin.write(msg)                                 │
+│  6. Agent: stdin.readline → process → print(result)                   │
+├────────────────────────────────────────────────────────────────────────┤
+│  7. Supervisor: stdout.readline → parse JSON                          │
+│  8. Supervisor: LPUSH agent:outbox:{uid} (内容不变)                    │
+│  9. API outbox_poller: BRPOP agent:outbox:{uid}                       │
+│ 10. API: ws_manager.broadcast → Client                                │
+├─ 状态同步 ────────────────────────────────────────────────────────────┤
+│  Agent: print({"type":"state","state":"busy"})                        │
+│  Supervisor → AgentStateManager.transition("busy") →                  │
+│  HSET agent:state:{agent_id} + lifecycle.jsonl + DB(异步)             │
+├─ 控制 (v4.2 双向) ─────────────────────────────────────────────────────┤
+│  API: SUBSCRIBE agent:control:resp:{corr_id}                          │
+│  API: PUBLISH agent:control {cmd, agent_id, user_id, correlation_id}  │
+│  Supervisor: 处理 → AgentStateManager.transition() →                  │
+│  Supervisor: PUBLISH agent:control:resp:{corr_id} {status, agent_state}│
+│  API: 收到响应 → UNSUBSCRIBE → return to client                       │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -377,16 +435,20 @@ results = await asyncio.gather(
 
 ---
 
-## 11. v4.1 决策记录
+## 11. 决策记录
 
-| # | 决策 | 日期 |
-|---|------|------|
-| 1 | 每用户 1 个 Agent 子进程（OS 级隔离） | 2026-07-18 |
-| 2 | Agent 子进程不连 Redis，仅 stdin/stdout pipe 通信 | 2026-07-18 |
-| 3 | Supervisor 3 层健康检测替代心跳（poll/积压/stdout） | 2026-07-18 |
-| 4 | API 通过 Redis Hash `agent:status` 查询状态（不直接问 Supervisor） | 2026-07-18 |
-| 5 | Pub/Sub 仅用于控制指令 `agent:control` | 2026-07-18 |
-| 6 | 工具二分：轻工具 Agent 内执行，重工具 Celery Worker | 2026-07-18 |
+| # | 决策 | 日期 | 版本 |
+|---|------|------|------|
+| 1 | 每用户 1 个 Agent 子进程（OS 级隔离） | 2026-07-18 | v4.1 |
+| 2 | Agent 子进程不连 Redis，仅 stdin/stdout pipe 通信 | 2026-07-18 | v4.1 |
+| 3 | Supervisor 3 层健康检测替代心跳（poll/积压/stdout） | 2026-07-18 | v4.1 |
+| 4 | API 通过 Redis Hash `agent:state:{agent_id}` 查询完整状态 | 2026-07-19 | v4.2 |
+| 5 | 双向 Pub/Sub 控制协议 (agent:control + agent:control:resp) | 2026-07-19 | v4.2 |
+| 6 | 工具二分：轻工具 Agent 内执行，重工具 Celery Worker | 2026-07-18 | v4.1 |
+| 7 | AgentStateManager 统一状态管理 (Redis + DB + LifecycleLogger) | 2026-07-19 | v4.2 |
+| 8 | Supervisor 自动创建 Agent（Redis/DB 无记录时） | 2026-07-19 | v4.2 |
+| 9 | 结构化生命周期日志 (agent_lifecycle.jsonl) | 2026-07-19 | v4.2 |
+| 10 | API 启停同步等待确认 (start 180s / stop 30s 超时) | 2026-07-19 | v4.2 |
 | 7 | Celery 进度上报经 Agent stdout 中继，不直接写 outbox | 2026-07-18 |
 | 8 | Intent classify 7 意图独立打分，Flash 优先 | 2026-07-18 |
 | 9 | Plan ⇄ Clarify 外循环不限轮次，内循环 ≤5 轮 | 2026-07-18 |

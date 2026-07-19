@@ -52,6 +52,8 @@ CREATE TABLE agents (
     system_prompt   TEXT NOT NULL DEFAULT '',
     state           TEXT NOT NULL DEFAULT 'stopped',
     llm_provider    TEXT NOT NULL DEFAULT 'deepseek',
+    user_preferences JSONB DEFAULT '{}',
+    extra           JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );

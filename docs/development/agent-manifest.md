@@ -2,6 +2,10 @@
 
 > v2.0 | 2026-06-25 | 对齐 LangGraph 三件套
 >
+> **v4.2 (2026-07-19)**: Manifest 数据现已由 Supervisor 统一管理，存储于 Redis `agent:state:{agent_id}` Hash + PostgreSQL `agents` 表。
+> 文件系统 `agent_manifest.json` 为可选的离线备份，不再作为启动流程的必需组件。
+> 详见 [agent-architecture-v4.md](agent-architecture-v4.md)。
+>
 > 替代 v1.0（MemGPT 4 层记忆位置描述）。本文与 [memory-system.md](memory-system.md) v2.0 配套发布。
 
 ---
