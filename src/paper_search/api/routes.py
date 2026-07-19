@@ -21,13 +21,17 @@ from ..config import get_papers_dir, get_markdown_dir, get_outputs_dir
 from .auth import (
     verify_api_key,
     verify_super_admin,
+    verify_ws_token,
     auth_register,
     auth_login,
     auth_refresh,
 )
 
-router = APIRouter(prefix="/api", tags=["paper-agent"])
-_DEFAULT_USER = "anonymous"
+router = APIRouter(
+    prefix="/api",
+    dependencies=[Depends(verify_api_key)],  # v4.2: 所有端点自动 JWT 鉴权
+    tags=["paper-agent"],
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -65,7 +69,7 @@ class TokenResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 
-@router.post("/auth/register", response_model=TokenResponse)
+@router.post("/auth/register", response_model=TokenResponse, dependencies=[])
 async def api_register(body: RegisterRequest):
     """注册新用户 → 返回 JWT access_token + refresh_token。
 
@@ -86,7 +90,7 @@ async def api_register(body: RegisterRequest):
         raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
 
 
-@router.post("/auth/login", response_model=TokenResponse)
+@router.post("/auth/login", response_model=TokenResponse, dependencies=[])
 async def api_login(body: LoginRequest):
     """用户登录 → 返回 JWT access_token + refresh_token。
 
@@ -105,7 +109,7 @@ async def api_login(body: LoginRequest):
         logging.getLogger(__name__).error("Login failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Login failed: {e}")
 
-@router.post("/auth/refresh", response_model=TokenResponse)
+@router.post("/auth/refresh", response_model=TokenResponse, dependencies=[])
 async def api_refresh(body: RefreshRequest):
     """使用 refresh_token 获取新的 access_token。"""
     try:
@@ -116,18 +120,6 @@ async def api_refresh(body: RefreshRequest):
     except Exception as e:
         import logging
         logging.getLogger(__name__).error("Refresh failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
-
-
-@router.post("/auth/refresh", response_model=TokenResponse)
-async def api_refresh(body: RefreshRequest):
-    """使用 refresh_token 获取新的 access_token。"""
-    try:
-        result = auth_refresh(body.refresh_token)
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
 
 
@@ -457,12 +449,12 @@ def _get_kb():
 # Health
 # ═══════════════════════════════════════════════════════════════
 
-@router.get("/health")
+@router.get("/health", dependencies=[])
 async def health():
     return {"status": "ok", "version": "3.0.0"}
 
 
-@router.get("/sources")
+@router.get("/sources", dependencies=[])
 async def list_sources():
     """列出所有可用搜索来源及其状态."""
     engine = _get_engine()

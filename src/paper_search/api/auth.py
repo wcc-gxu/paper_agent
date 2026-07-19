@@ -1,13 +1,8 @@
-"""认证模块 — JWT (首选) + Bearer Token (兼容)。
+"""认证模块 — JWT 认证 (REST + WebSocket + SSE)。
 
-JWT 认证:
-  - POST /api/auth/register → 注册 + 返回 access_token
-  - POST /api/auth/login    → 登录 + 返回 access_token
-  - WebSocket /ws/chat/{agent_id}/{session_id}?token=<jwt>  → 验证 JWT
-
-Bearer Token (兼容):
-  - API_KEY=xxx  (.env) → 静态 API Key 模式
-  - 多用户: users 表 api_token 字段
+v4.2: 移除 API_KEY 兜底模式，统一使用 JWT。
+  - REST/SSE: Authorization: Bearer <jwt> header
+  - WebSocket: ?token=<jwt> query param (浏览器 WebSocket API 不支持自定义 header)
 
 配置 (环境变量):
   JWT_SECRET                 — JWT 签名密钥 (必需)
@@ -25,7 +20,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import HTTPException, Query, Security, WebSocket
+from fastapi import HTTPException, Query, Request, Security, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import jwt
 from jwt import PyJWTError
@@ -33,7 +28,6 @@ from jwt import PyJWTError
 logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
-API_KEY = os.getenv("API_KEY", "")
 
 # ── JWT 配置 ────────────────────────────────────────────
 JWT_SECRET = os.getenv("JWT_SECRET", "agent-user-default")
@@ -96,58 +90,46 @@ def _decode_jwt(token: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# REST API 依赖 — Bearer Token / JWT 验证
+# 共用 JWT 校验 — REST + WebSocket 复用
+# ═══════════════════════════════════════════════════════════════
+
+
+def _validate_jwt(token: str) -> str:
+    """校验 JWT access token → 返回 user_id。
+
+    REST (verify_api_key) 和 WebSocket (verify_ws_token) 共用。
+    """
+    payload = _decode_jwt(token)
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Not an access token")
+    return payload["sub"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# REST / SSE 鉴权 — router 级依赖
 # ═══════════════════════════════════════════════════════════════
 
 
 async def verify_api_key(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ) -> str:
-    """验证 Bearer Token，返回 user_id。
+    """JWT Bearer Token 验证 → 返回 user_id，注入 request.state.user_id。
 
-    同时支持 JWT 和静态 API Key。
-    行为:
-    - JWT_SECRET 已设置 + Bearer JWT → 解码 JWT 返回 user_id
-    - API_KEY 未设置 → 返回 "anonymous"（开放访问模式）
-    - API_KEY 已设置 + token==API_KEY → 返回 "user-default"
-    - API_KEY 已设置 + DB 多用户 → 查找 users 表
-    - 否则 → 403
+    router 级依赖：所有 /api/* 端点到达时已完成鉴权。
+    FastAPI 依赖缓存：同一请求多次 Depends 只执行一次。
     """
-    # 优先 JWT 验证
-    if credentials is not None:
-        token = credentials.credentials
-        if JWT_SECRET and token.count(".") == 2:
-            # 看起来像 JWT（header.payload.signature）
-            try:
-                payload = _decode_jwt(token)
-                if payload.get("type") == "access":
-                    return payload["sub"]
-            except HTTPException:
-                pass  # JWT 验证失败，回退到 API Key 模式
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Missing token")
 
-        # API Key 模式
-        if token == API_KEY:
-            return "user-default"
-        if API_KEY:
-            try:
-                from ..agent.pgdb import PostgresAgentDB
-                db = PostgresAgentDB()
-                user = db.get_user_by_token(token)
-                if user:
-                    return user["id"]
-            except Exception as e:
-                logger.warning(f"Auth lookup failed: {e}")
-
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-    if not API_KEY:
-        return "anonymous"
-
-    raise HTTPException(status_code=401, detail="Missing token")
+    token = credentials.credentials
+    user_id = _validate_jwt(token)
+    request.state.user_id = user_id
+    return user_id
 
 
 # ═══════════════════════════════════════════════════════════════
-# WebSocket JWT 验证
+# WebSocket 鉴权
 # ═══════════════════════════════════════════════════════════════
 
 
@@ -156,56 +138,36 @@ async def verify_ws_token(
     agent_id: str,
     token: Optional[str] = None,
 ) -> tuple[str, str]:
-    """WebSocket 连接时验证 JWT token，返回 (user_id, resolved_agent_id)。
+    """WebSocket JWT 验证，返回 (user_id, resolved_agent_id)。
 
-    v3.2 变更: agent_id 由 DB 验证而非从 user_id 派生，支持多智能体。
-    兼容旧格式: 无 JWT 时从 agent_id 提取 user_id。
-
-    返回: (user_id, agent_id) 元组
+    浏览器 WebSocket API 不支持自定义 header，token 通过 ?token=<jwt> 传递。
+    JWT 校验逻辑与 REST 完全一致（共用 _validate_jwt）。
     """
     from ..agent.pgdb import PostgresAgentDB
 
-    if not JWT_SECRET:
-        # 开放模式: 从 agent_id 提取 user_id
-        if agent_id.startswith("agent-"):
-            extracted = agent_id[6:]
-            if extracted and extracted != "001":
-                return extracted, agent_id
-        return "default", agent_id
-
     if not token:
-        await websocket.close(code=4001, reason="Missing JWT token (?token=<jwt>)")
+        await websocket.close(code=4001, reason="Missing JWT token")
         raise HTTPException(status_code=401, detail="Missing JWT token")
 
-    try:
-        payload = _decode_jwt(token)
-    except HTTPException:
-        await websocket.close(code=4001, reason="Invalid or expired JWT token")
-        raise
+    user_id = _validate_jwt(token)
 
-    if payload.get("type") != "access":
-        await websocket.close(code=4001, reason="Token must be access token")
-        raise HTTPException(status_code=401, detail="Not an access token")
-
-    user_id = payload["sub"]
+    # JWT 有 agent_id → 验证归属
+    payload = _decode_jwt(token)
     jwt_agent_id = payload.get("agent_id", "")
-
-    # v3.2: DB-backed agent 验证
-    db = PostgresAgentDB()
-
-    # 如果 JWT 有 agent_id，验证其属于该用户
     if jwt_agent_id:
+        db = PostgresAgentDB()
         if not db.agent_belongs_to_user(jwt_agent_id, user_id):
             await websocket.close(code=4003, reason="agent_id does not belong to this user")
             raise HTTPException(status_code=403, detail="agent_id not owned by user")
         return user_id, jwt_agent_id
 
-    # JWT 无 agent_id → 使用用户默认智能体
+    # JWT 无 agent_id → 取用户默认 agent
+    db = PostgresAgentDB()
     default_agent = db.get_default_agent(user_id)
     if default_agent:
         return user_id, default_agent["id"]
 
-    # 向后兼容: 旧 agent_id 格式 (agent-{user_id} / agent-001)
+    # 兼容旧格式: URL 中的 agent_id
     if agent_id.startswith("agent-"):
         if not db.agent_belongs_to_user(agent_id, user_id):
             await websocket.close(code=4003, reason="agent_id mismatch with JWT")
@@ -217,15 +179,16 @@ async def verify_ws_token(
 
 
 # ═══════════════════════════════════════════════════════════════
-# 超级管理员依赖 (v3.2)
+# 超级管理员依赖
 # ═══════════════════════════════════════════════════════════════
 
 
 async def verify_super_admin(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ) -> str:
-    """验证超级管理员权限 → 返回 user_id。普通用户返回 403。"""
-    user_id = await verify_api_key(credentials)
+    """验证超级管理员权限 → 返回 user_id。"""
+    user_id = await verify_api_key(request, credentials)
     from ..agent.pgdb import PostgresAgentDB
     db = PostgresAgentDB()
     user = db.get_user(user_id)
