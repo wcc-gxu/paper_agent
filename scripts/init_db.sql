@@ -335,7 +335,7 @@ CREATE TABLE _schema_meta (
 );
 INSERT INTO _schema_meta (key, value) VALUES
     ('embedding', '{"model": "doubao-embedding", "dim": 1024, "provider": "volcano"}'),
-    ('version', '{"schema": "4.1", "applied_at": "2026-07-18"}')
+    ('version', '{"schema": "4.1.0", "applied_at": "2026-07-18"}')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- ============================================================
