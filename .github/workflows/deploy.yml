@@ -30,10 +30,11 @@ jobs:
             git pull origin develop
             echo ""
             echo "=== Pulling images ==="
-            docker compose pull api worker beat daemon
+            docker compose pull
             echo ""
             echo "=== Starting services ==="
             docker compose up -d --remove-orphans
+            docker compose restart nginx
             echo ""
             echo "=== Health check ==="
             sleep 5
@@ -80,10 +81,11 @@ jobs:
             git pull origin develop
             echo ""
             echo "=== Pulling images ==="
-            docker compose pull api worker beat daemon
+            docker compose pull
             echo ""
             echo "=== Starting services ==="
             docker compose up -d --remove-orphans
+            docker compose restart nginx
             echo ""
             echo "=== Health check ==="
             sleep 5
