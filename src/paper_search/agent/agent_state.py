@@ -213,7 +213,7 @@ class AgentState:
 
     def to_redis_hash(self) -> dict[str, str]:
         """转为 Redis Hash 字段（全部 string）。"""
-        return {
+        data = {
             "agent_id": self.agent_id,
             "user_id": self.user_id,
             "agent_type": self.agent_type,
@@ -230,18 +230,19 @@ class AgentState:
             "user_preferences": json.dumps(self.user_preferences, ensure_ascii=False),
             "state": self.state,
             "pid": str(self.pid),
-            "current_node": self.current_node,
+            "current_node": str(self.current_node) if self.current_node else "",
             "active_turns": str(self.active_turns),
-            "current_session_id": self.current_session_id,
-            "started_at": self.started_at,
-            "last_active_at": self.last_active_at,
-            "last_error": self.last_error,
+            "current_session_id": self.current_session_id or "",
+            "started_at": str(self.started_at) if self.started_at else "",
+            "last_active_at": str(self.last_active_at) if self.last_active_at else "",
+            "last_error": self.last_error or "",
             "exit_code": str(self.exit_code),
             "restart_count": str(self.restart_count),
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
+            "created_at": str(self.created_at) if self.created_at else "",
+            "updated_at": str(self.updated_at) if self.updated_at else "",
             "extra": json.dumps(self.extra, ensure_ascii=False),
         }
+        return data
 
     @classmethod
     def from_redis_hash(cls, data: dict[str, str],
@@ -479,14 +480,25 @@ class AgentStateManager:
                                 row: dict) -> AgentState:
         """从 DB 行重建 Redis 状态。"""
         now = _now_iso()
+
+        def _to_str(v):
+            """DB 时间列可能返回 datetime，统一转 ISO 字符串。"""
+            if v is None:
+                return now
+            if isinstance(v, str):
+                return v
+            if hasattr(v, 'isoformat'):
+                return v.isoformat()
+            return str(v)
+
         state = AgentState(
             agent_id=row.get("id", agent_id),
             user_id=row.get("user_id", user_id),
             system_prompt=row.get("system_prompt", ""),
             llm_provider=row.get("llm_provider", "deepseek"),
             state=row.get("state", "pending"),
-            created_at=row.get("created_at", now),
-            updated_at=row.get("updated_at", now),
+            created_at=_to_str(row.get("created_at")),
+            updated_at=_to_str(row.get("updated_at")),
         )
 
         # 从 DB 加载用户偏好
