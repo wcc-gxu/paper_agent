@@ -28,6 +28,8 @@ import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+import redis.asyncio as aioredis
+import psycopg2
 
 logger = logging.getLogger(__name__)
 
@@ -285,13 +287,9 @@ class AgentSupervisor:
     # ── Message Ingress (BRPOP → stdin) ────────────────────
 
     async def _ingress_loop(self):
-        """BRPOP 所有用户队列 → route to agent subprocess stdin."""
-        import redis.asyncio as aioredis
-        self.redis = aioredis.from_url(self.redis_url, decode_responses=True)
-        # State manager 现在可以使用 redis
-        self._state_mgr._redis = self.redis
-
+        """BRPOP 所有用户队列 → route to agent subprocess stdin。"""
         logger.info("Ingress loop started")
+
         while not self._stopping:
             if not self._agents:
                 await asyncio.sleep(1)
@@ -307,8 +305,8 @@ class AgentSupervisor:
             try:
                 result = await self.redis.brpop(queues, timeout=1)
             except Exception as e:
-                logger.warning("Ingress BRPOP error: %s", e)
-                await asyncio.sleep(0.5)
+                logger.error("Ingress BRPOP error: %s", e)
+                await asyncio.sleep(1)
                 continue
 
             if result is None:
@@ -642,107 +640,86 @@ class AgentSupervisor:
         v4.2: 双向通信。API 先 SUBSCRIBE agent:control:resp:{corr_id}，
         再 PUBLISH agent:control {cmd, agent_id, user_id, correlation_id}，
         Supervisor 处理后 PUBLISH 响应到 agent:control:resp:{corr_id}。
-
-        Redis 断开自动重连。
         """
-        import redis.asyncio as aioredis
+        pubsub = self.redis.pubsub()
+        await pubsub.subscribe("agent:control")
+        logger.info("Control listener started: agent:control (v4.2 bidirectional)")
 
-        while not self._stopping:
-            r = None
-            pubsub = None
-            try:
-                r = aioredis.from_url(self.redis_url, decode_responses=True)
-                pubsub = r.pubsub()
-                await pubsub.subscribe("agent:control")
-                logger.info("Control listener started: agent:control (v4.2 bidirectional)")
+        try:
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    cmd = json.loads(message.get("data", "{}"))
+                except json.JSONDecodeError:
+                    logger.warning("Control: non-JSON message received: %s", str(message.get("data", ""))[:200])
+                    continue
 
-                async for message in pubsub.listen():
-                    if message.get("type") != "message":
-                        continue
-                    try:
-                        cmd = json.loads(message.get("data", "{}"))
-                    except json.JSONDecodeError:
-                        logger.warning("Control: non-JSON message received: %s", str(message.get("data", ""))[:200])
-                        continue
+                action = cmd.get("cmd", "")
+                agent_id = cmd.get("agent_id", "")
+                user_id = cmd.get("user_id", "")
+                correlation_id = cmd.get("correlation_id", "")
 
-                    action = cmd.get("cmd", "")
-                    agent_id = cmd.get("agent_id", "")
-                    user_id = cmd.get("user_id", "")
-                    correlation_id = cmd.get("correlation_id", "")
+                if not correlation_id:
+                    logger.warning("Control: missing correlation_id, cmd=%s agent=%s user=%s", action, agent_id, user_id)
+                    continue
 
-                    if not correlation_id:
-                        logger.warning("Control: missing correlation_id, cmd=%s agent=%s user=%s", action, agent_id, user_id)
-                        continue
-
-                    try:
-                        if action == "start":
-                            logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
-                            result = await self._handle_start(agent_id, user_id, correlation_id)
-                        elif action == "stop":
-                            logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
-                            result = await self._handle_stop(agent_id, user_id, correlation_id)
-                        elif action == "restart":
-                            logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
-                            result = await self._handle_restart(agent_id, user_id, correlation_id)
-                        elif action == "shutdown":
-                            logger.info("Control: supervisor shutdown requested")
-                            self._stopping = True
-                            result = {"status": "ok", "message": "shutting down"}
-                        else:
-                            logger.warning("Control: unknown command '%s' cmd=%s", action, str(cmd)[:200])
-                            await self._sse_publish(correlation_id, "error",
-                                {"error": f"Unknown command: {action}"})
-                            result = {"status": "error", "error": f"Unknown command: {action}"}
-                    except Exception as e:
-                        logger.error("Control handler crashed for %s: %s", action, e, exc_info=True)
+                try:
+                    if action == "start":
+                        logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
+                        result = await self._handle_start(agent_id, user_id, correlation_id)
+                    elif action == "stop":
+                        logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
+                        result = await self._handle_stop(agent_id, user_id, correlation_id)
+                    elif action == "restart":
+                        logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
+                        result = await self._handle_restart(agent_id, user_id, correlation_id)
+                    elif action == "shutdown":
+                        logger.info("Control: supervisor shutdown requested")
+                        self._stopping = True
+                        result = {"status": "ok", "message": "shutting down"}
+                    else:
+                        logger.warning("Control: unknown command '%s' cmd=%s", action, str(cmd)[:200])
                         await self._sse_publish(correlation_id, "error",
-                            {"error": f"Internal error: {e}"})
-                        result = {"status": "error", "error": str(e)}
+                            {"error": f"Unknown command: {action}"})
+                        result = {"status": "error", "error": f"Unknown command: {action}"}
+                except Exception as e:
+                    logger.error("Control handler crashed for %s: %s", action, e, exc_info=True)
+                    await self._sse_publish(correlation_id, "error",
+                        {"error": f"Internal error: {e}"})
+                    result = {"status": "error", "error": str(e)}
 
-                    # 发送响应
-                    resp_channel = f"agent:control:resp:{correlation_id}"
-                    try:
-                        await r.publish(resp_channel, json.dumps({
-                            **result,
-                            "correlation_id": correlation_id,
-                            "timestamp": _now_iso(),
-                        }, ensure_ascii=False))
-                    except Exception as e:
-                        logger.error("Failed to publish control response (corr_id=%s): %s", correlation_id, e)
+                # 发送响应
+                resp_channel = f"agent:control:resp:{correlation_id}"
+                try:
+                    await self.redis.publish(resp_channel, json.dumps({
+                        **result,
+                        "correlation_id": correlation_id,
+                        "timestamp": _now_iso(),
+                    }, ensure_ascii=False))
+                except Exception as e:
+                    logger.error("Failed to publish control response (corr_id=%s): %s", correlation_id, e)
 
-            except (ConnectionError, OSError) as e:
-                logger.error("Control listener disconnected: %s, reconnecting in 3s...", e)
-                await asyncio.sleep(3)
-            except asyncio.CancelledError:
-                break
-            finally:
-                if pubsub:
-                    try:
-                        await pubsub.unsubscribe("agent:control")
-                    except Exception as e:
-                        logger.warning("Control listener unsubscribe error: %s", e)
-                if r:
-                    try:
-                        await r.aclose()
-                    except Exception as e:
-                        logger.warning("Control listener redis aclose error: %s", e)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            try:
+                await pubsub.unsubscribe("agent:control")
+            except Exception as e:
+                logger.warning("Control listener unsubscribe error: %s", e)
+            try:
+                await pubsub.aclose()
+            except Exception as e:
+                logger.warning("Control listener pubsub aclose error: %s", e)
 
     # ── SSE helper ────────────────────────────────────────
 
     async def _sse_publish(self, corr_id: str, event: str, data: dict):
-        """向 SSE channel 发布事件。fallback: 如果 self.redis 不可用则自建连接。"""
+        """向 SSE channel 发布事件。"""
         if not corr_id:
             return
-        redis_conn = self.redis
-        if redis_conn is None:
-            import redis.asyncio as aioredis
-            try:
-                redis_conn = aioredis.from_url(self.redis_url, decode_responses=True)
-            except Exception as e:
-                logger.error("SSE publish: cannot create redis connection: %s", e)
-                return
         try:
-            await redis_conn.publish(
+            await self.redis.publish(
                 f"agent:sse:{corr_id}",
                 json.dumps({"event": event, "data": data}, ensure_ascii=False),
             )
@@ -1024,30 +1001,56 @@ class AgentSupervisor:
     # ── Run ────────────────────────────────────────────────
 
     async def run(self):
-        """主入口 — 启动 Supervisor 所有循环。"""
-        # 状态管理器需要 Redis，在 _ingress_loop 之前创建
-        try:
-            import redis.asyncio as aioredis
-            self._state_mgr._redis = aioredis.from_url(self.redis_url, decode_responses=True)
-            # 快速检测连接是否可用
-            await self._state_mgr._redis.ping()
-            logger.info("State manager Redis connected: %s", self.redis_url)
-        except Exception as e:
-            logger.error("Failed to connect state manager Redis: %s", e)
-            raise
+        """主入口 — 等待依赖就绪 → 启动所有循环。"""
+        import redis.asyncio as aioredis
 
-        # 扫描所有活跃用户，为每个用户确保 agent 存在并恢复到 Redis
+        # 创建唯一的 Redis 连接（内部连接池，所有任务复用）
+        self.redis = aioredis.from_url(self.redis_url, decode_responses=True)
+        self._state_mgr._redis = self.redis
+
+        # 等待 Redis + DB 就绪
+        await self._wait_for_deps()
+
+        # 扫描用户，确保 agent 存在
         await self._bootstrap_users()
 
         # 为所有 agent 创建子进程
         await self._launch_all_agents()
 
-        # 启动 3 个后台循环
+        # 启动 3 个后台循环（复用 self.redis）
         await asyncio.gather(
             self._ingress_loop(),
             self._monitor_loop(),
             self._control_listener(),
         )
+
+    async def _wait_for_deps(self, max_retries: int = 30, interval: float = 2):
+        """等待 Redis + Postgres 就绪。"""
+        # Redis
+        for i in range(1, max_retries + 1):
+            try:
+                await self.redis.ping()
+                logger.info("Redis ready: %s", self.redis_url)
+                break
+            except Exception:
+                if i == max_retries:
+                    logger.error("Redis not ready after %d attempts", max_retries)
+                    raise
+                logger.info("Waiting for Redis... (%d/%d)", i, max_retries)
+                await asyncio.sleep(interval)
+
+        # Postgres
+        for i in range(1, max_retries + 1):
+            try:
+                self._db._raw_conn.cursor().execute("SELECT 1")
+                logger.info("Postgres ready")
+                break
+            except Exception:
+                if i == max_retries:
+                    logger.error("Postgres not ready after %d attempts", max_retries)
+                    raise
+                logger.info("Waiting for Postgres... (%d/%d)", i, max_retries)
+                await asyncio.sleep(interval)
 
     async def _bootstrap_users(self):
         """扫描 DB 用户表，为每个活跃用户确保 agent 存在并同步到 Redis。"""
