@@ -108,6 +108,10 @@ async def lifespan(app: FastAPI):
     """应用生命周期 — 启动时初始化，关闭时清理."""
     import asyncio
 
+    # 持久化日志到文件（容器重建不丢失）
+    from ..logging_setup import setup_file_logging
+    setup_file_logging("api")
+
     logger.info("Paper Agent API starting...")
 
     # v4.1: 自动增量数据库迁移

@@ -54,9 +54,11 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       PAPER_USER_ID: ${PAPER_USER_ID:-default}
+      LOGS_DIR: /var/log/paper_agent
     volumes:
       - papers:/root/papers
       - /oss:/oss
+      - ./logs:/var/log/paper_agent
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,9 +84,11 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       PAPER_USER_ID: ${PAPER_USER_ID:-default}
+      LOGS_DIR: /var/log/paper_agent
     volumes:
       - papers:/root/papers
       - /oss:/oss
+      - ./logs:/var/log/paper_agent
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,9 +110,11 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       PAPER_USER_ID: ${PAPER_USER_ID:-default}
+      LOGS_DIR: /var/log/paper_agent
     volumes:
       - papers:/root/papers
       - /oss:/oss
+      - ./logs:/var/log/paper_agent
     depends_on:
       postgres:
         condition: service_healthy
@@ -130,9 +136,11 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       PAPER_USER_ID: ${PAPER_USER_ID:-default}
+      LOGS_DIR: /var/log/paper_agent
     volumes:
       - papers:/root/papers
       - /oss:/oss
+      - ./logs:/var/log/paper_agent
     depends_on:
       postgres:
         condition: service_healthy

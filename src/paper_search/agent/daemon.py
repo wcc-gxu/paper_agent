@@ -105,6 +105,10 @@ class AgentSupervisor:
         )
         os.environ.setdefault("DEBUG_PROTOCOL", "1")
 
+        # 持久化日志到文件（容器重建不丢失）
+        from ..logging_setup import setup_file_logging
+        setup_file_logging("supervisor")
+
         from .agent_state import AgentStateManager, LifecycleLogger
         from .pgdb import PostgresAgentDB
 
