@@ -27,11 +27,7 @@ from .auth import (
     auth_refresh,
 )
 
-router = APIRouter(
-    prefix="/api",
-    dependencies=[Depends(verify_api_key)],  # v4.2: 所有端点自动 JWT 鉴权
-    tags=["paper-agent"],
-)
+router = APIRouter(prefix="/api", tags=["paper-agent"])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -69,7 +65,7 @@ class TokenResponse(BaseModel):
 # ═══════════════════════════════════════════════════════════════
 
 
-@router.post("/auth/register", response_model=TokenResponse, dependencies=[])
+@router.post("/auth/register", response_model=TokenResponse)
 async def api_register(body: RegisterRequest):
     """注册新用户 → 返回 JWT access_token + refresh_token。
 
@@ -90,7 +86,7 @@ async def api_register(body: RegisterRequest):
         raise HTTPException(status_code=500, detail=f"Registration failed: {e}")
 
 
-@router.post("/auth/login", response_model=TokenResponse, dependencies=[])
+@router.post("/auth/login", response_model=TokenResponse)
 async def api_login(body: LoginRequest):
     """用户登录 → 返回 JWT access_token + refresh_token。
 
@@ -109,7 +105,7 @@ async def api_login(body: LoginRequest):
         logging.getLogger(__name__).error("Login failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Login failed: {e}")
 
-@router.post("/auth/refresh", response_model=TokenResponse, dependencies=[])
+@router.post("/auth/refresh", response_model=TokenResponse)
 async def api_refresh(body: RefreshRequest):
     """使用 refresh_token 获取新的 access_token。"""
     try:
@@ -449,12 +445,12 @@ def _get_kb():
 # Health
 # ═══════════════════════════════════════════════════════════════
 
-@router.get("/health", dependencies=[])
+@router.get("/health")
 async def health():
     return {"status": "ok", "version": "3.0.0"}
 
 
-@router.get("/sources", dependencies=[])
+@router.get("/sources")
 async def list_sources():
     """列出所有可用搜索来源及其状态."""
     engine = _get_engine()

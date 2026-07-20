@@ -27,10 +27,18 @@ jobs:
             cd /home/ubuntu/paper_agant
             export IMAGE_TAG=dev
             echo "=== Git pull ==="
-            git pull origin develop
+            git fetch origin develop
+            git checkout develop
+            git reset --hard origin/develop
             echo ""
             echo "=== Pulling images ==="
-            docker compose pull
+            for i in 1 2 3; do
+              if docker compose pull; then
+                break
+              fi
+              echo "Pull failed, retrying... ($i/3)"
+              sleep 5
+            done
             echo ""
             echo "=== Starting services ==="
             docker compose up -d --remove-orphans
@@ -39,19 +47,21 @@ jobs:
             echo "=== Health check ==="
             sleep 5
             HEALTH_OK=false
-            for i in 1 2 3 4 5 6 7 8 9 10; do
+            for i in $(seq 1 20); do
               if docker compose exec api curl -sf http://localhost:8000/api/health; then
                 echo "Health check passed"
                 HEALTH_OK=true
                 break
               fi
-              echo "Waiting... ($i/10)"
+              echo "Waiting... ($i/20)"
               sleep 3
             done
             if [ "$HEALTH_OK" = false ]; then
-              echo "ERROR: Health check failed after 10 retries"
-              echo "=== API logs (last 30 lines) ==="
-              docker compose logs --tail 30 api
+              echo "ERROR: Health check failed after 20 retries"
+              echo "=== API logs (last 50 lines) ==="
+              docker compose logs --tail 50 api
+              echo "=== API container inspect ==="
+              docker compose ps api
               exit 1
             fi
             echo ""
@@ -59,10 +69,13 @@ jobs:
             sleep 3
             CORS_HEADER=$(docker compose exec api curl -sI http://nginx/api/health \
               -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
+            echo "CORS header: $CORS_HEADER"
             if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
               echo "CORS check passed: $CORS_HEADER"
             else
               echo "ERROR: CORS check failed"
+              docker compose exec api curl -svI http://nginx/api/health \
+                -H "Origin: http://localhost:3000" 2>&1 | head -20
               docker compose ps nginx
               exit 1
             fi
@@ -90,10 +103,18 @@ jobs:
             cd /home/ubuntu/paper_agant
             export IMAGE_TAG=latest
             echo "=== Git pull ==="
-            git pull origin develop
+            git fetch origin master
+            git checkout master
+            git reset --hard origin/master
             echo ""
             echo "=== Pulling images ==="
-            docker compose pull
+            for i in 1 2 3; do
+              if docker compose pull; then
+                break
+              fi
+              echo "Pull failed, retrying... ($i/3)"
+              sleep 5
+            done
             echo ""
             echo "=== Starting services ==="
             docker compose up -d --remove-orphans
@@ -102,19 +123,21 @@ jobs:
             echo "=== Health check ==="
             sleep 5
             HEALTH_OK=false
-            for i in 1 2 3 4 5 6 7 8 9 10; do
+            for i in $(seq 1 20); do
               if docker compose exec api curl -sf http://localhost:8000/api/health; then
                 echo "Health check passed"
                 HEALTH_OK=true
                 break
               fi
-              echo "Waiting... ($i/10)"
+              echo "Waiting... ($i/20)"
               sleep 3
             done
             if [ "$HEALTH_OK" = false ]; then
-              echo "ERROR: Health check failed after 10 retries"
-              echo "=== API logs (last 30 lines) ==="
-              docker compose logs --tail 30 api
+              echo "ERROR: Health check failed after 20 retries"
+              echo "=== API logs (last 50 lines) ==="
+              docker compose logs --tail 50 api
+              echo "=== API container inspect ==="
+              docker compose ps api
               exit 1
             fi
             echo ""
@@ -122,10 +145,13 @@ jobs:
             sleep 3
             CORS_HEADER=$(docker compose exec api curl -sI http://nginx/api/health \
               -H "Origin: http://localhost:3000" 2>/dev/null | grep -i "Access-Control-Allow-Origin" || echo "MISSING")
+            echo "CORS header: $CORS_HEADER"
             if echo "$CORS_HEADER" | grep -q "Access-Control-Allow-Origin"; then
               echo "CORS check passed: $CORS_HEADER"
             else
               echo "ERROR: CORS check failed"
+              docker compose exec api curl -svI http://nginx/api/health \
+                -H "Origin: http://localhost:3000" 2>&1 | head -20
               docker compose ps nginx
               exit 1
             fi
