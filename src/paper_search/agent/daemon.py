@@ -438,6 +438,13 @@ class AgentSupervisor:
                     except Exception as e:
                         logger.error("Failed to push outbox for %s (agent=%s): %s", uid, agent_id, e)
 
+                elif msg_type in ("sync_ack", "sync_complete", "sync_request"):
+                    logger.warning(
+                        "Agent %s stdout: control message type=%s — "
+                        "control messages must use SSE Pub/Sub, not stdout/outbox. Dropping.",
+                        agent_id, msg_type,
+                    )
+
         except Exception as e:
             logger.error("Agent %s stdout reader error: %s", uid, e)
         finally:

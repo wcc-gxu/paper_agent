@@ -26,6 +26,10 @@ from .apns_pusher import get_apns_pusher
 
 logger = logging.getLogger(__name__)
 
+# 控制/协议消息类型 — 禁止走 WebSocket，应通过 SSE Pub/Sub 通道发送
+_CONTROL_TYPES: frozenset[str] = frozenset({
+    "sync_ack", "sync_complete", "sync_request",
+})
 
 # 每个 agent_id 对应一个 poller task
 _pollers: dict[str, asyncio.Task] = {}
@@ -82,6 +86,15 @@ async def _dispatch_envelope(envelope: dict, ws_manager: Any,
     msg_id = envelope.get("msg_id", "")
     msg_type = envelope.get("type", "?")
     sub_type = envelope.get("subType", "")
+
+    if msg_type in _CONTROL_TYPES:
+        logger.warning(
+            "OutboxPoller: BLOCKED control message type=%s msg=%s — "
+            "control messages must use SSE, not WebSocket",
+            msg_type, msg_id[:8],
+        )
+        return
+
     # v10: 字段名 priority；fallback priorityKind 兼容旧路径
     priority_kind = (envelope.get("priority")
                      or envelope.get("priorityKind") or "normal")

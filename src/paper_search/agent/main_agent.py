@@ -361,7 +361,11 @@ def _v9_to_v10_envelope(
     if msg_type in ("plan_review", "plan_todo_update", "tool_execution"):
         return (msg_type, sub_type, payload or {})
 
-    # ── 其他类型透传（status / error / pong / sync_complete / 已 v10 命名的）──
+    # ── 控制/协议消息（不应走 outbox → WebSocket）──
+    if msg_type in ("sync_ack", "sync_complete", "sync_request"):
+        return (None, "", {})
+
+    # ── 其他类型透传（status / error / pong / 已 v10 命名的）──
     return (msg_type, sub_type, payload or {})
 
 

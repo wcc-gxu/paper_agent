@@ -454,6 +454,13 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
                 pass
             continue
 
+        # ── 非 chat 协议消息过滤 ──
+        # sync_request / sync_complete / pong 等控制/协议消息不应进入 agent 处理管线，
+        # 禁止 LPUSH 到 agent:ws:{user_id}，避免被 LLM 误解析为对话内容。
+        if msg_type not in ("message", "ask_reply", "plan_approve", "plan_revise", "tool_result"):
+            logger.info("📩 WS RECV non-chat protocol message type=%s, not forwarding to agent", msg_type)
+            continue
+
         # v10 入站类型 → 转写为 main_agent 期望的 v9 形态再 LPUSH
         # (main_agent._wait_ws_reply 已对 v10 type 做了 alias，但保险起见
         # 在这里把"无 subType 的 message"补成 v9 message/chat，便于 main_agent.run
@@ -467,7 +474,6 @@ async def ws_chat(websocket: WebSocket, agent_id: str, session_id: str,
         # main_agent._wait_ws_reply 内部 v10 别名匹配会处理；
         # 入口 BRPOP 只看 type+subType 不强制限制。
 
-        # 所有其他消息 → LPUSH Redis
         await _push_to_redis(msg)
 
     # ── 清理 ────────────────────────────────────────────

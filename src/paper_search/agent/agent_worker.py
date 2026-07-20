@@ -122,11 +122,16 @@ class AgentWorker:
                           self.user_id, len(raw_msg), raw_msg[:200])
             return ""
 
+        msg_type = msg.get("type", "")
+        if msg_type not in ("message", "ask_reply", "plan_approve", "plan_revise", "tool_result"):
+            logger.debug("Worker %s: skipping non-chat protocol message type=%s", self.user_id, msg_type)
+            return ""
+
         session_id = msg.get("_session_id", "main")
         user_content = msg.get("payload", {}).get("content", "")
         if not user_content:
-            logger.debug("Worker %s: empty user_content, falling back to raw message", self.user_id)
-            user_content = raw_msg
+            logger.warning("Worker %s: empty user_content in chat message type=%s, skipping", self.user_id, msg_type)
+            return ""
 
         self._current_session_id = session_id
         self._active_turns += 1
