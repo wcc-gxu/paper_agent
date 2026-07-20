@@ -52,6 +52,7 @@ jobs:
   deploy-dev:
     needs: build-dev
     runs-on: ubuntu-latest
+    continue-on-error: true
     if: github.event_name == 'push' && (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/dev')
     steps:
       - uses: actions/checkout@v4

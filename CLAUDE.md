@@ -288,7 +288,7 @@ Python >= 3.11
 
 ## 文档索引
 
-- [intent-routing-design.md](docs/development/intent-routing-design.md) — **v5 意图-场景-节点路由设计**（权威）
+- [intent-routing-design.md](docs/development/intent-routing-design.md) — v5 意图-场景-节点路由设计
 - [architecture-upgrade-v5.md](docs/development/architecture-upgrade-v5.md) — v5 架构升级方案
 - [v5-development-plan.md](docs/development/v5-development-plan.md) — v5 分阶段开发计划
 - [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 v11.1
