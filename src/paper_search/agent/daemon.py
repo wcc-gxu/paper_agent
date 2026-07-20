@@ -48,6 +48,8 @@ DEFAULT_BUSY_TIMEOUT = 300
 QUEUE_STALE_SECONDS = 43200
 STDOUT_SILENT_SECONDS = 15
 WORKER_READY_TIMEOUT = 120  # 等待 worker 上报 idle 的最大秒数（bootstrap 可能需要 >15s）
+MAX_RESTART_COUNT = 3       # 最多自动重启次数
+RESTART_BACKOFF_BASE = 1.0  # 重启退避基础秒数，指数增长: 1s → 2s → 4s
 
 
 def _now_ts() -> float:
@@ -83,6 +85,9 @@ class AgentSupervisor:
 
         # v4.2: 就绪事件 (agent_id → Event)
         self._ready_events: dict[str, asyncio.Event] = {}
+
+        # v4.2: 防重入 — 正在自动重启中的 agent
+        self._relaunching: set[str] = set()
 
         # v4.2: State manager + lifecycle logger (延迟初始化)
         self._state_mgr: Any = None
@@ -125,7 +130,10 @@ class AgentSupervisor:
             if proc.returncode is None:
                 logger.info("Agent %s already running (pid=%d)", user_id, proc.pid)
                 return False
-            del self._agents[user_id]
+            logger.info("Agent %s replacing dead process (pid=%d, rc=%s)", user_id, proc.pid, proc.returncode)
+            if proc.pid:
+                self._pid_to_uid.pop(proc.pid, None)
+            self._agents.pop(user_id, None)
 
         cmd = [
             sys.executable, "-m", "paper_search.agent.agent_worker",
@@ -164,6 +172,7 @@ class AgentSupervisor:
         """等待 agent worker 上报 idle 状态。"""
         event = self._ready_events.get(agent_id)
         if not event:
+            logger.warning("Agent %s ready event not found (launch not completed?)", agent_id)
             return False
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
@@ -175,33 +184,92 @@ class AgentSupervisor:
     async def stop_agent(self, user_id: str, graceful: bool = True) -> bool:
         """停止一个用户 Agent。"""
         proc = self._agents.get(user_id)
-        if proc is None or proc.returncode is not None:
+        if proc is None:
+            logger.info("Agent %s stop skipped: not in _agents", user_id)
+            return False
+        if proc.returncode is not None:
+            logger.info("Agent %s stop skipped: already exited (rc=%s)", user_id, proc.returncode)
+            self._agent_started.pop(user_id, None)
             return False
 
+        logger.info("Stopping agent %s (graceful=%s)", user_id, graceful)
         if graceful:
             proc.send_signal(signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
+                logger.info("Agent %s exited gracefully (rc=%s)", user_id, proc.returncode)
             except asyncio.TimeoutError:
                 logger.warning("Agent %s did not exit gracefully, force killing", user_id)
                 proc.kill()
         else:
             proc.kill()
+            logger.info("Agent %s killed", user_id)
+        self._agent_started.pop(user_id, None)
 
         return True
 
     async def _relaunch_agent(self, user_id: str):
-        """Agent 崩溃后自动重启。"""
+        """Agent 崩溃后自动重启。指数退避 + 最大次数限制。"""
         agent_id = f"agent-{user_id}"
-        state = await self._state_mgr.get(agent_id)
-        rc = state.restart_count + 1 if state else 1
 
-        self._lifecycle.auto_restart(agent_id, user_id, rc)
-        logger.info("Auto-restarting agent %s (attempt #%d)", agent_id, rc)
+        # 防重入：已经在重启中则跳过
+        if user_id in self._relaunching:
+            logger.warning("Agent %s already restarting, skipping duplicate call", user_id)
+            return
+        self._relaunching.add(user_id)
 
-        await self._state_mgr.update(agent_id, restart_count=rc)
-        await self.launch_agent(user_id)
-        await self._state_mgr.transition(agent_id, "starting")
+        try:
+            state = await self._state_mgr.get(agent_id)
+            rc = state.restart_count + 1 if state else 1
+
+            if rc > MAX_RESTART_COUNT:
+                logger.error("Agent %s exceeded max restart count (%d), stopping", agent_id, MAX_RESTART_COUNT)
+                await self._state_mgr.transition(agent_id, "crashed",
+                    last_error=f"exceeded max restart count {MAX_RESTART_COUNT}")
+                self._lifecycle.crash(agent_id, user_id, -1)
+                return
+
+            delay = RESTART_BACKOFF_BASE * (2 ** (rc - 1))
+            self._lifecycle.auto_restart(agent_id, user_id, rc)
+            logger.info("Auto-restarting agent %s (attempt #%d/%d, delay=%.1fs)",
+                        agent_id, rc, MAX_RESTART_COUNT, delay)
+
+            await self._state_mgr.update(agent_id, restart_count=rc)
+            await asyncio.sleep(delay)
+
+            # 先 transition 再 launch（与 _handle_start 一致，避免 race）
+            await self._state_mgr.transition(agent_id, "starting")
+            launched = await self.launch_agent(user_id)
+
+            if not launched:
+                await self._state_mgr.transition(
+                    agent_id, "crashed",
+                    last_error="Failed to spawn subprocess during restart")
+                self._lifecycle.launch_failed(agent_id, user_id, "Failed to spawn during restart")
+                logger.error("Agent %s relaunch failed: spawn error", agent_id)
+                return
+
+            # 等待 worker 就绪
+            ready = await self.wait_agent_ready(agent_id, timeout=WORKER_READY_TIMEOUT // 2)
+            if ready:
+                state = await self._state_mgr.get(agent_id)
+                if state and state.state == "idle":
+                    logger.info("Agent %s auto-restarted successfully (attempt #%d)", agent_id, rc)
+                else:
+                    error = state.last_error if state else "Agent exited during bootstrap"
+                    await self._state_mgr.transition(agent_id, "crashed",
+                        last_error=f"Auto-restart failed: {error}")
+                    self._lifecycle.launch_failed(agent_id, user_id, error)
+                    logger.error("Agent %s relaunch failed after bootstrap: %s", agent_id, error)
+            else:
+                await self._state_mgr.transition(agent_id, "crashed",
+                    last_error=f"Auto-restart timeout after {WORKER_READY_TIMEOUT // 2}s")
+                self._lifecycle.launch_timeout(agent_id, user_id, WORKER_READY_TIMEOUT // 2)
+                logger.error("Agent %s relaunch timed out", agent_id)
+        except Exception as e:
+            logger.error("Agent %s relaunch error: %s", agent_id, e, exc_info=True)
+        finally:
+            self._relaunching.discard(user_id)
 
     # ── Message Ingress (BRPOP → stdin) ────────────────────
 
@@ -227,7 +295,8 @@ class AgentSupervisor:
 
             try:
                 result = await self.redis.brpop(queues, timeout=1)
-            except Exception:
+            except Exception as e:
+                logger.warning("Ingress BRPOP error: %s", e)
                 await asyncio.sleep(0.5)
                 continue
 
@@ -242,8 +311,8 @@ class AgentSupervisor:
             if proc is None or proc.returncode is not None:
                 try:
                     await self.redis.rpush(f"agent:ws:{uid}:parked", raw_msg)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Parked message RPUSH failed for %s: %s", uid, e)
                 continue
 
             try:
@@ -273,7 +342,7 @@ class AgentSupervisor:
                 try:
                     msg = json.loads(line.decode("utf-8").strip())
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    logger.debug("Agent %s stdout non-JSON: %s", uid, line[:100])
+                    logger.warning("Agent %s stdout non-JSON: %s", uid, line[:200])
                     continue
 
                 msg_type = msg.get("type", "")
@@ -292,6 +361,7 @@ class AgentSupervisor:
 
                     # v4.2: 状态转移 + 就绪事件
                     if state == "idle":
+                        logger.info("Agent %s state → idle (pid=%d node=%s turns=%d)", agent_id, pid, node, active)
                         current = await self._state_mgr.get(agent_id)
                         if current and current.state in ("starting", "pending", "busy"):
                             startup_ms = msg.get("startup_ms", 0)
@@ -315,6 +385,7 @@ class AgentSupervisor:
                         )
 
                     elif state == "busy":
+                        logger.info("Agent %s state → busy (pid=%d node=%s turns=%d)", agent_id, pid, node, active)
                         await self._state_mgr.transition(
                             agent_id, "busy",
                             pid=pid, current_node=node,
@@ -323,6 +394,7 @@ class AgentSupervisor:
                         )
 
                     elif state == "stopped":
+                        logger.info("Agent %s state → stopped (pid=%d)", agent_id, pid)
                         await self._state_mgr.transition(
                             agent_id, "stopped",
                             pid=pid, current_node="",
@@ -341,19 +413,19 @@ class AgentSupervisor:
                         "timestamp": _now_iso(),
                     }
                     try:
-                        await self.redis.lpush(f"agent:outbox:{uid}",
+                        await self.redis.lpush(f"outbox:{uid}",
                                                json.dumps(envelope, ensure_ascii=False))
                     except Exception as e:
-                        logger.error("Failed to push outbox for %s: %s", uid, e)
+                        logger.error("Failed to push outbox for %s (agent=%s): %s", uid, agent_id, e)
 
                 elif msg_type in ("tool", "status", "tool_execution",
                                    "plan_todo_update", "error"):
                     try:
                         msg["agentId"] = msg.get("agentId", agent_id)
-                        await self.redis.lpush(f"agent:outbox:{uid}",
+                        await self.redis.lpush(f"outbox:{uid}",
                                                json.dumps(msg, ensure_ascii=False))
                     except Exception as e:
-                        logger.error("Failed to push outbox for %s: %s", uid, e)
+                        logger.error("Failed to push outbox for %s (agent=%s): %s", uid, agent_id, e)
 
         except Exception as e:
             logger.error("Agent %s stdout reader error: %s", uid, e)
@@ -373,22 +445,33 @@ class AgentSupervisor:
                     break
                 logger.error("Agent %s stderr: %s", uid,
                              line.decode("utf-8", errors="replace").rstrip())
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("Agent %s stderr reader crashed: %s", uid, e, exc_info=True)
 
     async def _handle_exit(self, uid: str, proc: asyncio.subprocess.Process):
-        """处理 Agent 退出。"""
+        """处理 Agent 退出。幂等——重复调用不会重复转移状态或重启。"""
         agent_id = f"agent-{uid}"
 
+        # 已在清理中 → 跳过
+        if uid not in self._agents or self._agents.get(uid) is not proc:
+            logger.debug("Agent %s exit already handled or proc mismatch, skipping", uid)
+            return
+
+        logger.info("Agent %s handling exit (pid=%d)", uid, proc.pid)
+
+        # 确保 returncode 已设置
         if proc.returncode is None:
             try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
+                await asyncio.wait_for(proc.wait(), timeout=2)
             except asyncio.TimeoutError:
-                pass
+                logger.warning("Agent %s wait timeout, force killing", uid)
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except asyncio.TimeoutError:
+                    logger.error("Agent %s kill timeout — process may be stuck", uid)
 
         rc = proc.returncode
-        state = "stopped" if rc == 0 else "crashed"
-
         to_state = "stopped" if rc == 0 else "crashed"
         await self._state_mgr.transition(
             agent_id, to_state,
@@ -402,9 +485,11 @@ class AgentSupervisor:
         logger.info("Agent %s %s (pid=%d rc=%d)", uid, to_state,
                     self._agent_started.get(uid, 0), rc)
 
-        # Auto restart on crash
-        if to_state == "crashed" and not self._stopping:
-            asyncio.create_task(self._relaunch_agent(uid))
+        # 清理所有追踪
+        self._agents.pop(uid, None)
+        self._agent_started.pop(uid, None)
+        if proc.pid:
+            self._pid_to_uid.pop(proc.pid, None)
 
         # Clean up ready event — trigger it so any waiter unblocks
         evt = self._ready_events.pop(agent_id, None)
@@ -412,14 +497,18 @@ class AgentSupervisor:
             evt.set()
 
         # Re-push parked messages
-        if uid in self._agents:
-            try:
+        try:
+            if self.redis:
                 parked = await self.redis.lrange(f"agent:ws:{uid}:parked", 0, -1)
                 for msg in parked:
                     await self.redis.lpush(f"agent:ws:{uid}", msg)
                 await self.redis.delete(f"agent:ws:{uid}:parked")
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+        # Auto restart on crash
+        if to_state == "crashed" and not self._stopping:
+            asyncio.create_task(self._relaunch_agent(uid))
 
     # ── Health Monitor (3 layers) ──────────────────────────
 
@@ -431,6 +520,7 @@ class AgentSupervisor:
             for uid, proc in list(self._agents.items()):
                 rc = proc.returncode
                 if rc is not None:
+                    logger.info("Monitor: agent %s already exited (rc=%s), handling exit", uid, rc)
                     await self._handle_exit(uid, proc)
                     continue
 
@@ -459,23 +549,35 @@ class AgentSupervisor:
                             await self._state_mgr.transition(
                                 f"agent-{uid}", "crashed",
                                 last_error=f"stuck_in_{node}")
+                            await self._handle_exit(uid, proc)
 
                 # Layer 2: Idle queue staleness
                 if state == "idle":
                     try:
                         if self.redis:
-                            oldest_raw = await self.redis.xrange(
-                                f"agent:ws:{uid}", count=1)
-                            if oldest_raw:
-                                oldest_id = oldest_raw[0][0]
-                                oldest_ms = int(oldest_id.split("-")[0])
-                                age = (now * 1000 - oldest_ms) / 1000
-                                if age > QUEUE_STALE_SECONDS:
-                                    logger.warning(
-                                        "Agent %s stalled: state=idle queue_oldest=%.0fs",
-                                        uid, age)
-                    except Exception:
-                        pass
+                            qlen = await self.redis.llen(f"agent:ws:{uid}")
+                            if qlen > 0:
+                                oldest_raw = await self.redis.lindex(f"agent:ws:{uid}", 0)
+                                # 检查队列最旧消息是否有时间戳
+                                if oldest_raw:
+                                    try:
+                                        oldest_msg = json.loads(oldest_raw)
+                                        ts_str = oldest_msg.get("timestamp", "")
+                                    except json.JSONDecodeError:
+                                        ts_str = ""
+                                    if ts_str:
+                                        from datetime import datetime as _dt
+                                        try:
+                                            ts = _dt.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")
+                                            age = (_dt.now(timezone.utc) - ts.replace(tzinfo=timezone.utc)).total_seconds()
+                                            if age > QUEUE_STALE_SECONDS:
+                                                logger.warning(
+                                                    "Agent %s stalled: state=idle queue_size=%d oldest_age=%.0fs",
+                                                    agent_id, qlen, age)
+                                        except ValueError:
+                                            pass
+                    except Exception as e:
+                        logger.warning("Monitor queue staleness check failed for %s: %s", agent_id, e)
 
                 # Layer 3: Stdout silence
                 if last_update > 0 and now - last_update > STDOUT_SILENT_SECONDS:
@@ -495,47 +597,60 @@ class AgentSupervisor:
         v4.2: 双向通信。API 先 SUBSCRIBE agent:control:resp:{corr_id}，
         再 PUBLISH agent:control {cmd, agent_id, user_id, correlation_id}，
         Supervisor 处理后 PUBLISH 响应到 agent:control:resp:{corr_id}。
+
+        Redis 断开自动重连。
         """
         import redis.asyncio as aioredis
-        r = aioredis.from_url(self.redis_url, decode_responses=True)
-        pubsub = r.pubsub()
-        await pubsub.subscribe("agent:control")
-        logger.info("Control listener started: agent:control (v4.2 bidirectional)")
 
-        try:
-            async for message in pubsub.listen():
-                if message.get("type") != "message":
-                    continue
+        while not self._stopping:
+            r = None
+            pubsub = None
+            try:
+                r = aioredis.from_url(self.redis_url, decode_responses=True)
+                pubsub = r.pubsub()
+                await pubsub.subscribe("agent:control")
+                logger.info("Control listener started: agent:control (v4.2 bidirectional)")
+
+                async for message in pubsub.listen():
+                    if message.get("type") != "message":
+                        continue
                 try:
                     cmd = json.loads(message.get("data", "{}"))
                 except json.JSONDecodeError:
+                    logger.warning("Control: non-JSON message received: %s", str(message.get("data", ""))[:200])
                     continue
 
-                action = cmd.get("cmd", "")
-                agent_id = cmd.get("agent_id", "")
-                user_id = cmd.get("user_id", "")
-                correlation_id = cmd.get("correlation_id", "")
+                    action = cmd.get("cmd", "")
+                    agent_id = cmd.get("agent_id", "")
+                    user_id = cmd.get("user_id", "")
+                    correlation_id = cmd.get("correlation_id", "")
 
                 if not correlation_id:
-                    logger.warning("Control: missing correlation_id, ignoring")
+                    logger.warning("Control: missing correlation_id, cmd=%s agent=%s user=%s", action, agent_id, user_id)
                     continue
 
-                if action == "start":
-                    logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
-                    result = await self._handle_start(agent_id, user_id, correlation_id)
-                elif action == "stop":
-                    logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
-                    result = await self._handle_stop(agent_id, user_id, correlation_id)
-                elif action == "restart":
-                    logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
-                    result = await self._handle_restart(agent_id, user_id, correlation_id)
-                elif action == "shutdown":
-                    logger.info("Control: supervisor shutdown requested")
-                    self._stopping = True
-                    result = {"status": "ok", "message": "shutting down"}
-                else:
-                    logger.warning("Control: unknown command %s", action)
-                    result = {"status": "error", "error": f"Unknown command: {action}"}
+                try:
+                    if action == "start":
+                        logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
+                        result = await self._handle_start(agent_id, user_id, correlation_id)
+                    elif action == "stop":
+                        logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
+                        result = await self._handle_stop(agent_id, user_id, correlation_id)
+                    elif action == "restart":
+                        logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
+                        result = await self._handle_restart(agent_id, user_id, correlation_id)
+                    elif action == "shutdown":
+                        logger.info("Control: supervisor shutdown requested")
+                        self._stopping = True
+                        result = {"status": "ok", "message": "shutting down"}
+                    else:
+                        logger.warning("Control: unknown command '%s' cmd=%s", action, str(cmd)[:200])
+                        result = {"status": "error", "error": f"Unknown command: {action}"}
+                except Exception as e:
+                    logger.error("Control handler crashed for %s: %s", action, e, exc_info=True)
+                    await self._sse_publish(correlation_id, "error",
+                        {"error": f"Internal error: {e}"})
+                    result = {"status": "error", "error": str(e)}
 
                 # 发送响应
                 resp_channel = f"agent:control:resp:{correlation_id}"
@@ -546,21 +661,41 @@ class AgentSupervisor:
                         "timestamp": _now_iso(),
                     }, ensure_ascii=False))
                 except Exception as e:
-                    logger.error("Failed to publish control response: %s", e)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await pubsub.unsubscribe("agent:control")
-            await r.aclose()
+                    logger.error("Failed to publish control response (corr_id=%s): %s", correlation_id, e)
+
+            except (ConnectionError, OSError) as e:
+                logger.error("Control listener disconnected: %s, reconnecting in 3s...", e)
+                await asyncio.sleep(3)
+            except asyncio.CancelledError:
+                break
+            finally:
+                if pubsub:
+                    try:
+                        await pubsub.unsubscribe("agent:control")
+                    except Exception as e:
+                        logger.warning("Control listener unsubscribe error: %s", e)
+                if r:
+                    try:
+                        await r.aclose()
+                    except Exception as e:
+                        logger.warning("Control listener redis aclose error: %s", e)
 
     # ── SSE helper ────────────────────────────────────────
 
     async def _sse_publish(self, corr_id: str, event: str, data: dict):
-        """向 SSE channel 发布事件。"""
-        if not corr_id or not self.redis:
+        """向 SSE channel 发布事件。fallback: 如果 self.redis 不可用则自建连接。"""
+        if not corr_id:
             return
+        redis_conn = self.redis
+        if redis_conn is None:
+            import redis.asyncio as aioredis
+            try:
+                redis_conn = aioredis.from_url(self.redis_url, decode_responses=True)
+            except Exception as e:
+                logger.error("SSE publish: cannot create redis connection: %s", e)
+                return
         try:
-            await self.redis.publish(
+            await redis_conn.publish(
                 f"agent:sse:{corr_id}",
                 json.dumps({"event": event, "data": data}, ensure_ascii=False),
             )
@@ -578,10 +713,12 @@ class AgentSupervisor:
         
         如果传入 corr_id，每个步骤都会通过 SSE 推送进度事件。
         """
+        logger.info("_handle_start: agent=%s user=%s corr_id=%s", agent_id, user_id, corr_id)
         # 1. 获取或创建 agent 状态
         state = await self._state_mgr.get_or_create(agent_id, user_id)
 
         if not state:
+            logger.error("_handle_start: get_or_create failed for agent=%s", agent_id)
             await self._sse_publish(corr_id, "error", {"error": "Failed to get or create agent state"})
             return {"status": "error", "error": "Failed to get or create agent state"}
 
@@ -589,6 +726,7 @@ class AgentSupervisor:
 
         # 2. 已在运行中
         if current_state in ("idle", "busy"):
+            logger.info("_handle_start: agent=%s already %s", agent_id, current_state)
             await self._sse_publish(corr_id, "done",
                                      {"status": "already_running", "agent_id": agent_id})
             return {
@@ -598,12 +736,20 @@ class AgentSupervisor:
 
         # 3. 正在启动中 — 等待就绪
         if current_state == "starting":
+            logger.info("_handle_start: agent=%s starting, waiting for ready", agent_id)
             await self._sse_publish(corr_id, "progress",
                                      {"stage": "ready_wait", "message": "Agent 正在启动中，等待就绪..."})
             agent_uid = user_id or agent_id.replace("agent-", "")
             ready = await self.wait_agent_ready(agent_id, timeout=WORKER_READY_TIMEOUT)
             if ready:
                 state = await self._state_mgr.get(agent_id)
+                if state and state.state == "crashed":
+                    error = state.last_error or "Agent crashed during startup"
+                    logger.error("_handle_start: agent=%s crashed during wait: %s", agent_id, error)
+                    await self._sse_publish(corr_id, "error",
+                        {"error": f"Agent crashed during startup: {error}"})
+                    return {"status": "error", "error": error}
+                logger.info("_handle_start: agent=%s now %s (waited)", agent_id, state.state if state else "?")
                 await self._sse_publish(corr_id, "done",
                                          {"status": "already_running", "agent_id": agent_id})
                 return {
@@ -611,6 +757,7 @@ class AgentSupervisor:
                     "agent_state": state.to_dict() if state else {},
                 }
             else:
+                logger.error("_handle_start: agent=%s ready wait timed out after %ds", agent_id, WORKER_READY_TIMEOUT)
                 self._lifecycle.launch_timeout(agent_id, user_id, WORKER_READY_TIMEOUT)
                 await self._sse_publish(corr_id, "error",
                                          {"error": f"Agent startup timed out after {WORKER_READY_TIMEOUT}s"})
@@ -620,6 +767,7 @@ class AgentSupervisor:
                 }
 
         # 4. 启动新 agent
+        logger.info("_handle_start: launching agent=%s from state=%s", agent_id, current_state)
         self._lifecycle.launch_start(agent_id, user_id)
         await self._state_mgr.transition(agent_id, "starting")
         await self._sse_publish(corr_id, "state",
@@ -629,9 +777,14 @@ class AgentSupervisor:
                                  {"stage": "launch", "message": "正在启动 Agent 子进程..."})
 
         agent_uid = user_id or agent_id.replace("agent-", "")
-        launched = await self.launch_agent(agent_uid)
+        try:
+            launched = await self.launch_agent(agent_uid)
+        except Exception as e:
+            logger.error("launch_agent exception for %s: %s", agent_id, e, exc_info=True)
+            launched = False
 
         if not launched:
+            logger.error("_handle_start: agent=%s launch failed", agent_id)
             await self._state_mgr.transition(
                 agent_id, "crashed",
                 last_error="Failed to spawn subprocess")
@@ -657,6 +810,7 @@ class AgentSupervisor:
             if state and state.state == "idle":
                 pid = self._agents.get(agent_uid)
                 pid = pid.pid if hasattr(pid, 'pid') and pid else 0
+                logger.info("_handle_start: agent=%s started OK pid=%d bootstrap=%dms", agent_id, pid, elapsed_ms)
                 self._lifecycle.launch_success(agent_id, user_id, pid, elapsed_ms)
                 await self._sse_publish(corr_id, "state",
                                          {"from": "starting", "to": "idle", "agent_id": agent_id, "pid": pid})
@@ -667,8 +821,8 @@ class AgentSupervisor:
                     "agent_state": state.to_dict(),
                 }
             else:
-                # 进程在 bootstrap 期间退出/crash
                 error = state.last_error if state else "Agent exited during bootstrap"
+                logger.error("_handle_start: agent=%s bootstrap failed: %s", agent_id, error)
                 self._lifecycle.launch_failed(agent_id, user_id, error)
                 await self._sse_publish(corr_id, "error", {"error": f"Agent failed to start: {error}"})
                 return {
@@ -676,6 +830,7 @@ class AgentSupervisor:
                     "error": f"Agent failed to start: {error}",
                 }
         else:
+            logger.error("_handle_start: agent=%s bootstrap timeout after %ds", agent_id, WORKER_READY_TIMEOUT)
             await self._state_mgr.transition(
                 agent_id, "crashed",
                 last_error=f"Startup timeout after {WORKER_READY_TIMEOUT}s")
@@ -690,17 +845,21 @@ class AgentSupervisor:
     async def _handle_stop(self, agent_id: str, user_id: str,
                             corr_id: str = "") -> dict:
         """处理 stop 指令。"""
+        logger.info("_handle_stop: agent=%s user=%s corr_id=%s", agent_id, user_id, corr_id)
         state = await self._state_mgr.get(agent_id)
         if not state:
+            logger.warning("_handle_stop: agent=%s not found", agent_id)
             await self._sse_publish(corr_id, "error", {"error": "Agent not found"})
             return {"status": "error", "error": "Agent not found"}
 
         if state.state in ("stopped", "crashed"):
+            logger.info("_handle_stop: agent=%s already %s", agent_id, state.state)
             await self._sse_publish(corr_id, "done",
                                      {"status": "already_stopped", "agent_id": agent_id})
             return {"status": "already_stopped", "agent_state": state.to_dict()}
 
         from_state = state.state
+        logger.info("_handle_stop: stopping agent=%s from state=%s", agent_id, from_state)
         self._lifecycle.stop_requested(agent_id, user_id)
         await self._state_mgr.transition(agent_id, "stopping")
         await self._sse_publish(corr_id, "state",
@@ -713,12 +872,14 @@ class AgentSupervisor:
         stopped = await self.stop_agent(agent_uid, graceful=True)
 
         if stopped:
+            logger.info("_handle_stop: agent=%s stopped OK", agent_id)
             await self._sse_publish(corr_id, "progress",
                                      {"stage": "stopped", "message": "Agent 已停止"})
             await self._state_mgr.transition(agent_id, "stopped")
             uptime = _now_ts() - (self._agent_started.get(agent_uid, _now_ts()))
             self._lifecycle.stop_success(agent_id, user_id, uptime)
         else:
+            logger.warning("_handle_stop: agent=%s stop_agent returned False (already exited?)", agent_id)
             await self._state_mgr.transition(agent_id, "stopped")
 
         await self._sse_publish(corr_id, "state",
@@ -732,6 +893,7 @@ class AgentSupervisor:
     async def _handle_restart(self, agent_id: str, user_id: str,
                                corr_id: str = "") -> dict:
         """处理 restart 指令。"""
+        logger.info("_handle_restart: agent=%s user=%s corr_id=%s", agent_id, user_id, corr_id)
         await self._sse_publish(corr_id, "progress",
                                  {"stage": "stopping", "message": "正在停止 Agent..."})
 
@@ -741,12 +903,14 @@ class AgentSupervisor:
 
         await asyncio.sleep(1)
 
+        logger.info("_handle_restart: re-launching agent=%s", agent_id)
         await self._sse_publish(corr_id, "progress",
                                  {"stage": "launch", "message": "正在重新启动 Agent..."})
 
         start_result = await self._handle_start(agent_id, user_id, corr_id)
         if start_result.get("status") in ("ok", "already_running"):
             state = start_result.get("agent_state", {})
+            logger.info("_handle_restart: agent=%s restarted OK", agent_id)
             await self._sse_publish(corr_id, "done",
                                      {"status": "restarted", "agent_id": agent_id})
             return {"status": "ok", "agent_state": state}
@@ -782,6 +946,8 @@ class AgentSupervisor:
                                        json.dumps(base, ensure_ascii=False))
             except Exception as e:
                 logger.error("HSET agent:status failed for %s: %s", uid, e)
+        else:
+            logger.debug("_hsync_status: redis not available, skipping HSET for %s", uid)
 
         # 同步到新 agent:state:{agent_id}
         if self._state_mgr:
@@ -793,16 +959,14 @@ class AgentSupervisor:
             if sync_fields:
                 try:
                     await self._state_mgr.update(agent_id, **sync_fields)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("_hsync_status state_mgr.update failed for %s: %s", agent_id, e)
 
     # ── Run ────────────────────────────────────────────────
 
     async def run(self):
         """主入口 — 启动 Supervisor 所有循环。"""
-        import redis.asyncio as aioredis
-        self.redis = aioredis.from_url(self.redis_url, decode_responses=True)
-        self._state_mgr._redis = self.redis
+        # Redis 连接由 _ingress_loop 创建并赋给 self.redis + self._state_mgr._redis
 
         # 扫描 DB，重建所有活跃 agent 的 Redis 状态
         try:

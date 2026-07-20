@@ -21,7 +21,6 @@ from ..config import get_papers_dir, get_markdown_dir, get_outputs_dir
 from .auth import (
     verify_api_key,
     verify_super_admin,
-    verify_ws_token,
     auth_register,
     auth_login,
     auth_refresh,
@@ -1285,21 +1284,31 @@ async def _sse_control_stream(user_id: str, cmd: str) -> StreamingResponse:
         user_id: 用户 ID
         cmd: "start" | "stop" | "restart"
     """
+    import logging as _sse_log
     import redis.asyncio as aioredis
+    _log = _sse_log.getLogger("paper_search.api.sse")
 
     agent_id = f"agent-{user_id}"
     correlation_id = str(uuid.uuid4())
     channel = f"agent:sse:{correlation_id}"
 
     async def event_generator():
-        r = aioredis.from_url(
-            os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-            decode_responses=True,
-        )
-        pubsub = r.pubsub()
+        r = None
+        pubsub = None
         try:
+            r = aioredis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                decode_responses=True,
+            )
+            pubsub = r.pubsub()
             await pubsub.subscribe(channel)
-            await asyncio.sleep(0.1)
+            _log.info("SSE subscribed: agent=%s cmd=%s corr_id=%s", agent_id, cmd, correlation_id)
+
+            # 等待订阅确认后再 publish（避免竞态）
+            for _ in range(50):
+                msg = await pubsub.get_message(timeout=0.1)
+                if msg and msg.get("type") == "subscribe":
+                    break
 
             # 发送控制指令
             await r.publish("agent:control", _json.dumps({
@@ -1308,34 +1317,67 @@ async def _sse_control_stream(user_id: str, cmd: str) -> StreamingResponse:
                 "user_id": user_id,
                 "correlation_id": correlation_id,
             }))
+            _log.info("SSE command sent: agent=%s cmd=%s corr_id=%s", agent_id, cmd, correlation_id)
 
-            # 流式转发 Supervisor 事件
-            async for msg in pubsub.listen():
-                if msg.get("type") != "message":
+            # 流式转发 Supervisor 事件，30s 无事件则超时关闭
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        pubsub.get_message(ignore_subscribe_messages=True), timeout=30
+                    )
+                except asyncio.TimeoutError:
+                    _log.warning("SSE timeout: agent=%s cmd=%s corr_id=%s", agent_id, cmd, correlation_id)
+                    yield f"event: error\ndata: {_json.dumps({'error': 'SSE timeout: no response from supervisor'}, ensure_ascii=False)}\n\n"
+                    return
+
+                if msg is None:
+                    await asyncio.sleep(0.1)
                     continue
+
                 try:
                     payload = _json.loads(msg["data"])
                 except _json.JSONDecodeError:
+                    _log.warning("SSE non-JSON message: agent=%s corr_id=%s raw=%s",
+                                agent_id, correlation_id, str(msg.get("data", ""))[:200])
                     continue
 
                 event_type = payload.get("event", "message")
                 data = payload.get("data", {})
 
                 if event_type == "done":
+                    _log.info("SSE done: agent=%s cmd=%s corr_id=%s status=%s",
+                             agent_id, cmd, correlation_id, data.get("status", "?"))
                     yield f"event: done\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
                     return
                 elif event_type == "error":
+                    _log.error("SSE error: agent=%s cmd=%s corr_id=%s error=%s",
+                              agent_id, cmd, correlation_id, data.get("error", "?"))
                     yield f"event: error\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
                     return
                 else:
+                    _log.info("SSE event: agent=%s cmd=%s corr_id=%s event=%s",
+                             agent_id, cmd, correlation_id, event_type)
                     yield f"event: {event_type}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            _log.error("SSE connection error: agent=%s cmd=%s corr_id=%s error=%s",
+                      agent_id, cmd, correlation_id, e, exc_info=True)
+            yield f"event: error\ndata: {_json.dumps({'error': f'SSE connection failed: {e}'}, ensure_ascii=False)}\n\n"
         finally:
-            try:
-                await pubsub.unsubscribe(channel)
-                await pubsub.aclose()
-                await r.aclose()
-            except Exception:
-                pass
+            if pubsub:
+                try:
+                    await pubsub.unsubscribe(channel)
+                except Exception as e:
+                    _log.warning("SSE unsubscribe error: corr_id=%s error=%s", correlation_id, e)
+            if pubsub:
+                try:
+                    await pubsub.aclose()
+                except Exception as e:
+                    _log.warning("SSE pubsub aclose error: corr_id=%s error=%s", correlation_id, e)
+            if r:
+                try:
+                    await r.aclose()
+                except Exception as e:
+                    _log.warning("SSE redis aclose error: corr_id=%s error=%s", correlation_id, e)
 
     return StreamingResponse(
         event_generator(),
