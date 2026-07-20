@@ -89,6 +89,9 @@ class AgentSupervisor:
         # v4.2: 防重入 — 正在自动重启中的 agent
         self._relaunching: set[str] = set()
 
+        # v4.3: user_id → agent_id 映射（解决 stdout reader 拼错 agent_id 的问题）
+        self._uid_to_agent_id: dict[str, str] = {}
+
         # v4.2: State manager + lifecycle logger (延迟初始化)
         self._state_mgr: Any = None
         self._lifecycle: Any = None
@@ -160,6 +163,10 @@ class AgentSupervisor:
         self._agent_started[user_id] = _now_ts()
         if proc.pid:
             self._pid_to_uid[proc.pid] = user_id
+
+        # 存储 user_id → agent_id 映射（用于 stdout reader 等需要正确 agent_id 的地方）
+        agent = self._db.get_default_agent(user_id) if self._db else None
+        self._uid_to_agent_id[user_id] = agent["id"] if agent else agent_id
 
         # 创建就绪事件
         self._ready_events[agent_id] = asyncio.Event()
@@ -331,7 +338,8 @@ class AgentSupervisor:
     async def _read_agent_stdout(self, uid: str, proc: asyncio.subprocess.Process):
         """持续读取 Agent 子进程 stdout，解析 JSON → 路由到 Redis outbox + 状态更新。"""
         logger.info("Egress reader started for %s (pid=%d)", uid, proc.pid)
-        agent_id = f"agent-{uid}"
+        # 使用正确的 DB agent_id，不是 f"agent-{uid}"
+        agent_id = self._uid_to_agent_id.get(uid, f"agent-{uid}")
 
         try:
             while proc.returncode is None:
@@ -455,7 +463,7 @@ class AgentSupervisor:
 
     async def _handle_exit(self, uid: str, proc: asyncio.subprocess.Process):
         """处理 Agent 退出。幂等——重复调用不会重复转移状态或重启。"""
-        agent_id = f"agent-{uid}"
+        agent_id = self._uid_to_agent_id.get(uid, f"agent-{uid}")
 
         # 已在清理中 → 跳过
         if uid not in self._agents or self._agents.get(uid) is not proc:
@@ -554,7 +562,7 @@ class AgentSupervisor:
                     logger.warning("Periodic user scan failed: %s", e)
 
             for uid, proc in list(self._agents.items()):
-                agent_id = f"agent-{uid}"
+                agent_id = self._uid_to_agent_id.get(uid, f"agent-{uid}")
                 rc = proc.returncode
                 if rc is not None:
                     logger.info("Monitor: agent %s already exited (rc=%s), handling exit", uid, rc)
@@ -573,18 +581,18 @@ class AgentSupervisor:
                     if now - last_update > timeout:
                         if node in ("gate", "ask_user"):
                             self._lifecycle.health_warning(
-                                f"agent-{uid}",
+                                agent_id,
                                 f"stuck_waiting_user node={node} age={int(now - last_update)}s")
                             logger.warning("Agent %s stuck waiting for user: node=%s age=%.0fs",
-                                          uid, node, now - last_update)
+                                          agent_id, node, now - last_update)
                         else:
                             self._lifecycle.health_timeout(
-                                f"agent-{uid}", node, now - last_update)
+                                agent_id, node, now - last_update)
                             logger.error("Agent %s busy timeout: node=%s age=%.0fs → SIGTERM",
-                                        uid, node, now - last_update)
+                                        agent_id, node, now - last_update)
                             proc.send_signal(signal.SIGTERM)
                             await self._state_mgr.transition(
-                                f"agent-{uid}", "crashed",
+                                agent_id, "crashed",
                                 last_error=f"stuck_in_{node}")
                             await self._handle_exit(uid, proc)
 
@@ -619,10 +627,10 @@ class AgentSupervisor:
                 # Layer 3: Stdout silence
                 if last_update > 0 and now - last_update > STDOUT_SILENT_SECONDS:
                     self._lifecycle.health_warning(
-                        f"agent-{uid}",
+                        agent_id,
                         f"stdout_silent {int(now - last_update)}s state={state} node={node}")
                     logger.warning("Agent %s stdout silent for %.0fs (state=%s node=%s)",
-                                  uid, now - last_update, state, node)
+                                  agent_id, now - last_update, state, node)
 
             await asyncio.sleep(10)
 
@@ -1002,7 +1010,7 @@ class AgentSupervisor:
 
         # 同步到新 agent:state:{agent_id}
         if self._state_mgr:
-            agent_id = f"agent-{uid}"
+            agent_id = self._uid_to_agent_id.get(uid, f"agent-{uid}")
             sync_fields = {}
             for k in ("state", "pid", "node", "active_turns", "last_error"):
                 if k in fields:
@@ -1017,12 +1025,15 @@ class AgentSupervisor:
 
     async def run(self):
         """主入口 — 启动 Supervisor 所有循环。"""
-        # Redis 连接由 _ingress_loop 创建并赋给 self.redis + self._state_mgr._redis
+        import redis.asyncio as aioredis
+
+        # 状态管理器需要 Redis，在 _ingress_loop 之前创建
+        self._state_mgr._redis = aioredis.from_url(self.redis_url, decode_responses=True)
 
         # 扫描所有活跃用户，为每个用户确保 agent 存在并恢复到 Redis
         await self._bootstrap_users()
 
-        # 为所有 agent 创建子进程（仅 state 非 stopped/crashed 的）
+        # 为所有 agent 创建子进程
         await self._launch_all_agents()
 
         # 启动 3 个后台循环
