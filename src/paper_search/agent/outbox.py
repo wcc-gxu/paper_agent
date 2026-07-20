@@ -103,7 +103,7 @@ async def outbox_publish(
     Args:
         redis_client: redis.asyncio 客户端
         db: AgentDB 实例
-        envelope: 完整 v9.0 协议信封（type/subType/role/agentId/sessionId/...）
+        envelope: 完整 v10 协议信封（type/subType/agentId/sessionId/...）
         correlation_id: 关联一轮对话的 ID（事件源 Checkpoint 用）
 
     Returns:

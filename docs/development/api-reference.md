@@ -1,10 +1,9 @@
-# Paper Agent v4.2 — API 参考文档
+# Paper Agent v5 — API 参考文档
 
-> 更新: 2026-07-19 | 版本: 4.2.0 | LLM: DeepSeek v4 Pro + Flash
+> 更新: 2026-07-20 | 版本: 5.0.0 | LLM: DeepSeek v4 Pro + Flash
 >
+> v5 变更: 去规划节点, intent→handler 直连路由, 新增 ingest/cleanup handler
 > v4.2 新增: SSE 实时事件流 + 双向控制协议 + 结构化生命周期日志
-> v4.1 变动: Agent 需手动启动 / status 响应新增 state/node 字段
-> v4.0 新增: Agent 生命周期 / Document CRUD / Preference / Share API
 >
 > 详见 [vue 客户端 API 参考](../../paper-agent-vue/docs/api-reference.md)
 
@@ -14,21 +13,20 @@
 
 - [1. 认证 (JWT)](#1-认证-jwt)
 - [2. 认证端点](#2-认证端点)
-- [3. Agent 管理 (v4.2)](#3-agent-管理-v42)
-  - [3.1 REST 端点](#31-rest-端点)
-  - [3.2 SSE 事件流端点](#32-sse-事件流端点)
-  - [3.3 SSE 事件协议](#33-sse-事件协议)
+- [3. Agent 管理](#3-agent-管理)
 - [4. 搜索与论文](#4-搜索与论文)
 - [5. 知识库](#5-知识库)
-- [6. 项目管理](#6-项目管理)
-- [7. 文档管理 (v4.0)](#7-文档管理-v40)
-- [8. 用户偏好 (v4.0)](#8-用户偏好-v40)
-- [9. 会话与消息](#9-会话与消息)
-- [10. 订阅](#10-订阅)
-- [11. 知识共享 (v4.0)](#11-知识共享-v40)
-- [12. 设备注册 (APNs)](#12-设备注册-apns)
-- [13. RAG 健康检查](#13-rag-健康检查)
-- [14. 调试模式](#14-调试模式)
+- [6. 入库](#6-入库)
+- [7. 项目管理](#7-项目管理)
+- [8. 文档管理](#8-文档管理)
+- [9. 用户偏好](#9-用户偏好)
+- [10. 会话与消息](#10-会话与消息)
+- [11. 订阅](#11-订阅)
+- [12. 任务管理](#12-任务管理)
+- [13. 知识共享](#13-知识共享)
+- [14. 设备注册 (APNs)](#14-设备注册-apns)
+- [15. Admin / 运维](#15-admin--运维)
+- [16. 调试模式](#16-调试模式)
 
 ---
 
@@ -155,7 +153,7 @@ Base URL: `http://{host}/api`
 
 ---
 
-## 3. Agent 管理 (v4.2)
+## 3. Agent 管理
 
 v4.2 新增 SSE 事件流端点，替代旧的轮询方式。客户端通过 SSE 实时接收 Agent 状态变更和启动进度，无需设置超时。
 
@@ -293,7 +291,36 @@ data: {"status":"restarted","agent_state":{...}}
 
 ---
 
-### 3.3 SSE 事件协议
+### 3.3 Agent CRUD 端点
+
+### `GET /api/agents`
+
+列出所有 Agent 实例。
+
+### `POST /api/agents`
+
+创建新 Agent。
+
+### `GET /api/agents/{agent_id}`
+
+获取指定 Agent 详情。
+
+### `PUT /api/agents/{agent_id}`
+
+更新 Agent 配置。
+
+### `DELETE /api/agents/{agent_id}`
+
+删除 Agent。
+
+### `POST /api/agents/{agent_id}/activate`
+
+激活指定 Agent。
+
+
+---
+
+### 3.4 SSE 事件协议
 
 所有 SSE 事件遵循统一格式：
 
@@ -486,7 +513,7 @@ async function startAgent(token) {
 
 ---
 
-## 4. 知识库
+## 5. 知识库
 
 ### `POST /api/knowledge/ask`
 
@@ -512,7 +539,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 5. 项目管理
+## 7. 项目管理
 
 ### `GET /api/projects`
 
@@ -532,7 +559,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 7. 文档管理 (v4.0)
+## 8. 文档管理
 
 `GET/POST /api/documents` — 列出/创建（mode=create/upload/from_paper）
 `GET/PUT/DELETE /api/documents/{id}` — CRUD + 乐观锁
@@ -543,13 +570,13 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 8. 用户偏好 (v4.0)
+## 9. 用户偏好
 
 `GET/PUT /api/preferences/me` — 研究领域/写作风格/语言/导师语录
 
 ---
 
-## 9. 会话与消息
+## 10. 会话与消息
 
 ### `GET /api/sessions/{session_id}/messages`
 
@@ -595,7 +622,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 10. 订阅
+## 11. 订阅
 
 ### `GET /api/subscriptions`
 
@@ -629,7 +656,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 11. 知识共享 (v4.0)
+## 13. 知识共享
 
 `POST /api/share` — 发起共享请求
 `GET /api/share/requests` — 请求列表
@@ -637,7 +664,7 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 ---
 
-## 12. 设备注册 (APNs)
+## 14. 设备注册 (APNs)
 
 ### `POST /api/devices/register`
 
@@ -657,34 +684,62 @@ RAG 问答 (pgvector 向量检索 + LLM)。
 
 查看活跃设备 (token 脱敏)。
 
-## 9. RAG 健康检查
+---
 
-### `GET /api/knowledge/health`
+## 15. Admin / 运维
 
-查询 RAG 检索系统的运行状态（需要 Bearer Token）。
+> 需要 superadmin 权限。
 
-**Query Parameters**:
+### `GET /api/admin/system/health`
 
-| 参数 | 类型 | 默认 | 说明 |
-|------|------|------|------|
-| `hours` | int | 24 | 统计最近 N 小时的查询 |
+系统级健康检查，返回 DB 延迟、Redis 状态、用户数/Agent 数/Session 数。
 
-**Response** (200):
 ```json
-{
-  "total_queries": 142,
-  "error_rate": 0.014,
-  "latency_p50_ms": 320,
-  "latency_p95_ms": 890,
-  "status": "healthy"
-}
+{"status": "ok", "db_latency_ms": 2.3, "redis": "connected", "users": 5, "agents": 3, "sessions": 12}
 ```
 
-数据来源: `rag_traces` 表，每次 RAG 检索 fire-and-forget 写入。
+### `GET /api/admin/users`
+
+列出所有用户。
+
+### `PUT /api/admin/users/{target_user_id}/role`
+
+修改用户角色。
+
+### `POST /api/admin/users/{target_user_id}/deactivate`
+
+停用用户。
+
+### `GET /api/sessions`
+
+列出所有会话。
 
 ---
 
-## 10. 调试模式
+## 12. 任务管理
+
+### `POST /api/tasks`
+
+创建异步任务。
+
+### `POST /api/tasks/{task_id}/confirm`
+
+确认任务执行。
+
+### `POST /api/tasks/{task_id}/pause`
+
+暂停任务。
+
+### `POST /api/tasks/{task_id}/resume`
+
+恢复暂停的任务。
+
+### `DELETE /api/tasks/{task_id}`
+
+取消/删除任务。
+
+
+## 16. 调试模式
 
 设置 `DEBUG_PROTOCOL=1` 后，服务端通过 WebSocket 推送 `status{level:debug}` 消息：
 
