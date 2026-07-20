@@ -138,7 +138,7 @@ def convert_task(self, paper_id: str, pdf_path: str,
                  title: str = "", project_id: str = "") -> dict:
     """PDF → Markdown。
 
-    使用 pymupdf4llm 转换，输出到 ~/papers/markdown/{project_id}/。
+    使用 docling 转换，输出到 ~/papers/markdown/{project_id}/。
 
     Returns:
         {"paper_id": str, "success": bool, "markdown_path": str, "error": str}

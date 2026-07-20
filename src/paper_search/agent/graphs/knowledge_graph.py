@@ -917,7 +917,7 @@ class KnowledgeAgent:
             stripped = line.strip()
             if not stripped:
                 continue
-            # 优先取 # 开头的 heading（pymupdf4llm 通常第一行就是标题）
+            # 优先取 # 开头的 heading（docling 通常第一行就是标题）
             if stripped.startswith("#"):
                 result["title"] = re.sub(r'^#+\s*', '', stripped)[:500]
                 break

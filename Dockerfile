@@ -13,7 +13,7 @@ COPY src/ src/
 COPY docs/ docs/
 COPY scripts/migrations/ scripts/migrations/
 
-RUN pip install --no-cache-dir -e ".[all]" pymupdf4llm pgvector psycopg2-binary python-multipart && \
+RUN pip install --no-cache-dir -e ".[all]" pgvector psycopg2-binary python-multipart && \
     apt-get remove -y build-essential && \
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*

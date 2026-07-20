@@ -30,7 +30,7 @@ from .common import (
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="PDF→Markdown 转换 — 使用 pymupdf4llm 将论文 PDF 转为结构化 Markdown",
+        description="PDF→Markdown 转换 — 使用 docling 将论文 PDF 转为结构化 Markdown",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # 定位方式

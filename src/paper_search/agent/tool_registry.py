@@ -1573,7 +1573,7 @@ class ToolRegistry:
 
     def _make_convert_paper(self):
         async def convert_paper(paper_id: str = "", pdf_path: str = "") -> str:
-            """PDF → Markdown（pymupdf4llm）→ 写 papers.markdown_path。"""
+            """PDF → Markdown（docling）→ 写 papers.markdown_path。"""
             from .pdf_converter import PDFConverter
             db = _get_db()
             row = db.conn.execute(
