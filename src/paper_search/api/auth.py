@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 security = HTTPBearer(auto_error=False)
 
 # ── JWT 配置 ────────────────────────────────────────────
-JWT_SECRET = os.getenv("JWT_SECRET", "agent-user-default")
+JWT_SECRET = os.getenv("JWT_SECRET", "paper-agent-default-secret-key-32bytes!")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
@@ -114,18 +114,22 @@ async def verify_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Security(security),
 ) -> str:
-    """JWT Bearer Token 验证 → 返回 user_id，注入 request.state.user_id。
+    """JWT Bearer Token 验证 → 返回 user_id，注入 request.state。
 
-    router 级依赖：所有 /api/* 端点到达时已完成鉴权。
     FastAPI 依赖缓存：同一请求多次 Depends 只执行一次。
+    request.state.user_id / request.state.agent_id 可供下游直接使用。
     """
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing token")
 
     token = credentials.credentials
-    user_id = _validate_jwt(token)
-    request.state.user_id = user_id
-    return user_id
+    payload = _decode_jwt(token)
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Not an access token")
+
+    request.state.user_id = payload["sub"]
+    request.state.agent_id = payload.get("agent_id", "")
+    return payload["sub"]
 
 
 # ═══════════════════════════════════════════════════════════════

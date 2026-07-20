@@ -513,11 +513,37 @@ class AgentSupervisor:
     # ── Health Monitor (3 layers) ──────────────────────────
 
     async def _monitor_loop(self):
-        """每 10s 检测所有 Agent 健康状态。"""
+        """每 10s 检测所有 Agent 健康状态 + 每 60s 扫描新用户。"""
         await asyncio.sleep(5)
         logger.info("Health monitor started")
+        _last_user_scan = 0.0
         while not self._stopping:
+            # 每 60s 扫描新注册用户，自动创建 agent 并启动
+            now = _now_ts()
+            if now - _last_user_scan > 60:
+                _last_user_scan = now
+                try:
+                    users = self._db.list_active_users()
+                    for user in users:
+                        user_id = user.get("id", "")
+                        if not user_id:
+                            continue
+                        agent = self._db.get_default_agent(user_id)
+                        if agent:
+                            agent_id = agent["id"]
+                            await self._state_mgr.get_or_create(agent_id, user_id)
+                        else:
+                            agent_id = self._db.create_agent(user_id=user_id)
+                            await self._state_mgr.get_or_create(agent_id, user_id)
+                            logger.info("Monitor: auto-created agent=%s for new user=%s", agent_id, user_id)
+                        # 如果 agent 还没启动子进程，启动它
+                        if user_id not in self._agents:
+                            asyncio.create_task(self.launch_agent(user_id))
+                except Exception as e:
+                    logger.warning("Periodic user scan failed: %s", e)
+
             for uid, proc in list(self._agents.items()):
+                agent_id = f"agent-{uid}"
                 rc = proc.returncode
                 if rc is not None:
                     logger.info("Monitor: agent %s already exited (rc=%s), handling exit", uid, rc)
@@ -968,27 +994,11 @@ class AgentSupervisor:
         """主入口 — 启动 Supervisor 所有循环。"""
         # Redis 连接由 _ingress_loop 创建并赋给 self.redis + self._state_mgr._redis
 
-        # 扫描 DB，重建所有活跃 agent 的 Redis 状态
-        try:
-            rows = self._db._fetchall(
-                "SELECT * FROM agents WHERE state NOT IN ('stopped', 'crashed')")
-            logger.info("Found %d active agents in DB", len(rows))
-            for row in rows:
-                agent_id = row.get("id", "")
-                user_id = row.get("user_id", "")
-                if agent_id and user_id and user_id != "user-default":
-                    await self._state_mgr.get_or_create(agent_id, user_id)
-                    logger.info("Recovered agent from DB: %s (user=%s state=%s)",
-                                agent_id, user_id, row.get("state", "?"))
-        except Exception as e:
-            logger.error("Failed to scan agents table: %s", e)
+        # 扫描所有活跃用户，为每个用户确保 agent 存在并恢复到 Redis
+        await self._bootstrap_users()
 
-        # 为所有活跃 agent 创建子进程
-        active_ids = await self._state_mgr.list_active()
-        for agent_id in active_ids:
-            state = await self._state_mgr.get(agent_id)
-            if state and state.user_id and state.user_id != "user-default":
-                asyncio.create_task(self.launch_agent(state.user_id))
+        # 为所有 agent 创建子进程（仅 state 非 stopped/crashed 的）
+        await self._launch_all_agents()
 
         # 启动 3 个后台循环
         await asyncio.gather(
@@ -996,6 +1006,37 @@ class AgentSupervisor:
             self._monitor_loop(),
             self._control_listener(),
         )
+
+    async def _bootstrap_users(self):
+        """扫描 DB 用户表，为每个活跃用户确保 agent 存在并同步到 Redis。"""
+        try:
+            users = self._db.list_active_users()
+            logger.info("Found %d active users in DB, ensuring agents exist", len(users))
+            for user in users:
+                user_id = user.get("id", "")
+                if not user_id:
+                    continue
+                agent = self._db.get_default_agent(user_id)
+                if agent:
+                    agent_id = agent["id"]
+                    await self._state_mgr.get_or_create(agent_id, user_id)
+                    logger.info("Bootstrapped agent=%s user=%s state=%s",
+                                agent_id, user_id, agent.get("state", "?"))
+                else:
+                    agent_id = self._db.create_agent(user_id=user_id)
+                    await self._state_mgr.get_or_create(agent_id, user_id)
+                    logger.info("Auto-created agent=%s for user=%s", agent_id, user_id)
+        except Exception as e:
+            logger.error("Failed to bootstrap agents from users: %s", e, exc_info=True)
+
+    async def _launch_all_agents(self):
+        """为所有活跃 agent 启动子进程。"""
+        active_ids = await self._state_mgr.list_active()
+        logger.info("Launching %d active agents", len(active_ids))
+        for agent_id in active_ids:
+            state = await self._state_mgr.get(agent_id)
+            if state and state.user_id and state.user_id != "user-default":
+                asyncio.create_task(self.launch_agent(state.user_id))
 
 
 # ═══════════════════════════════════════════════════════════════

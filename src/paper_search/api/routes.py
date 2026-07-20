@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,20 @@ from .auth import (
 )
 
 router = APIRouter(prefix="/api", tags=["paper-agent"])
+
+
+def _get_user_agent_id(user_id: str, request: Optional[Request] = None) -> str:
+    """解析用户的实际 agent_id。优先从 request.state.agent_id（JWT）取，fallback 查 DB。"""
+    if request:
+        agent_id = getattr(request.state, "agent_id", "")
+        if agent_id:
+            return agent_id
+    from ..agent.pgdb import PostgresAgentDB
+    db = PostgresAgentDB()
+    agent = db.get_default_agent(user_id)
+    if agent:
+        return agent["id"]
+    return f"agent-{user_id}"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -444,7 +458,7 @@ def _get_kb():
 # Health
 # ═══════════════════════════════════════════════════════════════
 
-@router.get("/health")
+@router.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return {"status": "ok", "version": "3.0.0"}
 
@@ -1056,7 +1070,7 @@ async def list_devices(agent_id: str, user_id: str = Depends(verify_api_key)):
 @router.get("/agents/me")
 async def get_my_agent(user_id: str = Depends(verify_api_key)):
     """v4.2: 获取当前用户 Agent 信息（Redis agent:state Hash + DB fallback）。"""
-    agent_id = f"agent-{user_id}"
+    agent_id = _get_user_agent_id(user_id)
     from ..agent.pgdb import PostgresAgentDB
 
     # 优先从 Redis 读取完整状态
@@ -1087,7 +1101,7 @@ async def get_my_agent(user_id: str = Depends(verify_api_key)):
 @router.put("/agents/me")
 async def update_my_agent(req: dict, user_id: str = Depends(verify_api_key)):
     """v4.2: 更新当前用户 Agent 的 system_prompt（同步 Redis + DB）。"""
-    agent_id = f"agent-{user_id}"
+    agent_id = _get_user_agent_id(user_id)
 
     system_prompt = req.get("system_prompt", "")
     llm_provider = req.get("llm_provider")
@@ -1122,7 +1136,7 @@ async def update_my_agent(req: dict, user_id: str = Depends(verify_api_key)):
 @router.get("/agents/me/status")
 async def get_my_agent_status(user_id: str = Depends(verify_api_key)):
     """v4.2: 查 Supervisor 维护的 agent:state:{agent_id} Hash。"""
-    agent_id = f"agent-{user_id}"
+    agent_id = _get_user_agent_id(user_id)
     try:
         import redis.asyncio as aioredis
         r = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
@@ -1147,7 +1161,7 @@ async def start_my_agent(user_id: str = Depends(verify_api_key)):
     Supervisor 处理后 PUBLISH 响应。
     超时 180s (3 分钟 — 包含 worker bootstrap)。
     """
-    agent_id = f"agent-{user_id}"
+    agent_id = _get_user_agent_id(user_id)
     correlation_id = str(uuid.uuid4())
 
     import redis.asyncio as aioredis
@@ -1215,7 +1229,7 @@ async def start_my_agent(user_id: str = Depends(verify_api_key)):
 @router.post("/agents/me/stop")
 async def stop_my_agent(user_id: str = Depends(verify_api_key)):
     """v4.2: 双向 Pub/Sub 停止 Agent。超时 30s。"""
-    agent_id = f"agent-{user_id}"
+    agent_id = _get_user_agent_id(user_id)
     correlation_id = str(uuid.uuid4())
 
     import redis.asyncio as aioredis
@@ -1288,7 +1302,7 @@ async def _sse_control_stream(user_id: str, cmd: str) -> StreamingResponse:
     import redis.asyncio as aioredis
     _log = _sse_log.getLogger("paper_search.api.sse")
 
-    agent_id = f"agent-{user_id}"
+    agent_id = _get_user_agent_id(user_id)
     correlation_id = str(uuid.uuid4())
     channel = f"agent:sse:{correlation_id}"
 

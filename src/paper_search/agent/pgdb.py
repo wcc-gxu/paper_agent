@@ -252,6 +252,12 @@ class PostgresAgentDB:
             (user_id,),
         )
 
+    def list_active_users(self) -> list[dict]:
+        """获取所有活跃用户的 id 和 username（排除 user-default）。"""
+        return self._fetchall(
+            "SELECT id, username FROM users WHERE is_active = TRUE AND id != 'user-default'"
+        )
+
     def create_agent(
         self,
         user_id: str,
