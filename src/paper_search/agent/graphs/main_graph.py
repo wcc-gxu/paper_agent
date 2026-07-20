@@ -34,10 +34,6 @@ from ..main_agent_prompts import (
     build_execute_v31_prompt,
     build_evaluate_v31_prompt,
     build_todo_checkpoint_prompt,
-    build_plan_review_prompt,
-    PlanReviewPayload,
-    PlanTodoUpdatePayload,
-    ToolExecutionPayload,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,51 +116,52 @@ class MainState(TypedDict, total=False):
     triage_research: float
     triage_reasoning: str
 
-    # Intent + Plan
-    plan: Optional[dict]  # PlanOutput as dict
+    # v5 Intent
+    primary_intent: str
+    intent_params: dict
+    route: str
+
+    # Intent + Plan (legacy, kept for backward compat)
+    plan: Optional[dict]
     needs_clarify: bool
     clarify_questions: list[dict]
     clarify_mode: str
     clarify_results: list[dict]
     clarify_rounds: int
 
-    # Execute
-    todos: list[dict]  # TodoSpec list
+    # Execute (legacy)
+    todos: list[dict]
     current_todo_index: int
-    messages: Annotated[list, add_messages]  # ReAct conversation
+    messages: Annotated[list, add_messages]
     tool_call_count: int
     tool_results: list[dict]
-    needs_more_tools: list[dict]  # retry_tools 注入的补充工具
+    needs_more_tools: list[dict]
 
-    # Evaluate
+    # Evaluate (legacy)
     all_satisfied: bool
-    next_action: str  # "done" | "retry_tools" | "ask_user" | "replan" | "fail"
+    next_action: str
     final_reply: str
     replan_hint: str
-    ask_user_question: Optional[dict]  # ClarificationQuestion as dict
-    user_reply: Optional[Any]  # 用户对 ask 卡片的回复
-    plan_iterations: int  # 全局 evaluate→replan→execute 循环计数
+    ask_user_question: Optional[dict]
+    user_reply: Optional[Any]
+    plan_iterations: int
     error: Optional[str]
 
     # Ops confirm
     ops_confirmed: bool
     danger_level: str
 
-    # Todo Checkpoint
+    # Todo Checkpoint (legacy)
     todo_checkpoint_satisfied: bool
     todo_retry_count: int
 
-    # Internal: track whether the final reply was already pushed inside the graph
-    # (e.g., _inline_reply and Free ReAct _execute path push it inline).
-    # _run_turn uses this to decide whether to push final_reply from state.
     _reply_pushed: bool
 
-    # Plan Review (v3.1 plan approval flow)
+    # Plan Review (legacy)
     plan_id: str
     plan_approved: bool
     plan_feedback: str
     gate_type: str
-    plan_iterations: int  # plan review loop counter (distinct from evaluate replan)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -307,6 +304,222 @@ class MainGraph:
         except Exception:
             pass
 
+    # ── v5 Handler Nodes ─────────────────────────────────────
+
+    async def _rag_handler(self, state: MainState) -> dict:
+        """RAG 问答 handler: 搜索知识库 → LLM 回答 → 反馈收集。"""
+        session_id = state.get("session_id", "main")
+        params = state.get("intent_params", {})
+        question = params.get("question") or state.get("user_content", "")
+
+        await self._push_status(session_id, "searching", "正在搜索知识库...")
+
+        try:
+            tool = self.registry.get("agent_knowledge_ask")
+            if not tool:
+                raise RuntimeError("agent_knowledge_ask tool not found")
+
+            result_json = await tool.ainvoke({"question": question})
+            result = json.loads(result_json) if isinstance(result_json, str) else result_json
+            answer = result.get("answer") or result.get("result") or str(result)
+
+            await self._push_status(session_id, "done", "完成")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": answer})
+
+            return {"final_reply": answer, "_reply_pushed": True}
+
+        except Exception as e:
+            logger.warning(f"rag_handler failed: {e}")
+            await self._push_error(session_id, f"RAG 问答失败: {e}",
+                                   subtype="TASK_FAILED")
+            return {"error": str(e), "_reply_pushed": True}
+
+    async def _ingest_handler(self, state: MainState) -> dict:
+        """入库 handler: 扫描本地目录 → PDF→MD → 切片入库。"""
+        session_id = state.get("session_id", "main")
+        params = state.get("intent_params", {})
+        dir_path = params.get("dir_path") or params.get("path") or ""
+        user_content = state.get("user_content", "")
+
+        # Extract path from user message if not in params
+        if not dir_path:
+            import re
+            m = re.search(r'(/[^\s,.!?;:，。！？；：]+)', user_content)
+            if m:
+                dir_path = m.group(1).rstrip("'\"")
+
+        if not dir_path:
+            reply = "请指定要扫描的目录路径，例如: /mnt/oss/papers"
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": reply})
+            return {"final_reply": reply, "_reply_pushed": True}
+
+        await self._push_status(session_id, "executing", f"正在扫描 {dir_path} ...")
+
+        try:
+            from pathlib import Path
+            root = Path(dir_path)
+            if not root.exists():
+                raise FileNotFoundError(f"目录不存在: {dir_path}")
+
+            pdf_files = list(root.rglob("*.pdf"))
+            if not pdf_files:
+                reply = f"在 {dir_path} 中未找到 PDF 文件"
+                await self._push(session_id, "message", "reply", "assistant",
+                                 payload={"content": reply})
+                return {"final_reply": reply, "_reply_pushed": True}
+
+            total = len(pdf_files)
+            await self._push_status(session_id, "executing",
+                                    f"找到 {total} 个 PDF，开始入库...")
+
+            success = 0
+            failed = 0
+            for i, pf in enumerate(pdf_files):
+                try:
+                    await self._push_status(session_id, "executing",
+                                            f"入库 [{i+1}/{total}] {pf.name}")
+                    # Try agent_knowledge_ingest_local if available
+                    tool = self.registry.get("agent_knowledge_ingest_local")
+                    if tool:
+                        await tool.ainvoke({
+                            "pdf_dir": str(pf.parent),
+                            "project_id": f"ingest-oss-{pf.stem[:20]}",
+                        })
+                    success += 1
+                except Exception as e2:
+                    logger.warning(f"Ingest failed for {pf}: {e2}")
+                    failed += 1
+
+            reply = f"入库完成: {success} 篇成功{f', {failed} 篇失败' if failed else ''}"
+            await self._push_status(session_id, "done", "完成")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": reply})
+            return {"final_reply": reply, "_reply_pushed": True}
+
+        except Exception as e:
+            logger.warning(f"ingest_handler failed: {e}")
+            err_msg = f"入库失败: {e}"
+            await self._push_error(session_id, err_msg, subtype="TASK_FAILED")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": err_msg})
+            return {"final_reply": err_msg, "error": str(e), "_reply_pushed": True}
+
+    async def _cleanup_handler(self, state: MainState) -> dict:
+        """清理 handler: 删除原始 PDF/MD 文件，保留 DB 记录。"""
+        session_id = state.get("session_id", "main")
+        params = state.get("intent_params", {})
+        dir_path = params.get("dir_path") or ""
+        user_content = state.get("user_content", "")
+
+        if not dir_path:
+            import re
+            m = re.search(r'(/[^\s,.!?;:，。！？；：]+)', user_content)
+            if m:
+                dir_path = m.group(1).rstrip("'\"")
+
+        if not dir_path:
+            reply = "请指定要清理的目录路径"
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": reply})
+            return {"final_reply": reply, "_reply_pushed": True}
+
+        await self._push_status(session_id, "executing", f"正在清理 {dir_path} ...")
+
+        try:
+            from pathlib import Path
+            import shutil
+            root = Path(dir_path)
+            if not root.exists():
+                reply = f"目录不存在: {dir_path}"
+                await self._push(session_id, "message", "reply", "assistant",
+                                 payload={"content": reply})
+                return {"final_reply": reply, "_reply_pushed": True}
+
+            pdf_count = len(list(root.rglob("*.pdf")))
+            md_count = len(list(root.rglob("*.md")))
+
+            if pdf_count == 0 and md_count == 0:
+                reply = f"{dir_path} 中没有 PDF/MD 文件需要清理"
+                await self._push(session_id, "message", "reply", "assistant",
+                                 payload={"content": reply})
+                return {"final_reply": reply, "_reply_pushed": True}
+
+            deleted = 0
+            errors = []
+            for ext in ("*.pdf", "*.md"):
+                for f in root.rglob(ext):
+                    try:
+                        f.unlink()
+                        deleted += 1
+                    except Exception as e2:
+                        errors.append(f"{f.name}: {e2}")
+
+            reply = f"清理完成: 已删除 {deleted} 个文件{'(PDF+MD)' if deleted > 0 else ''}"
+            if errors:
+                reply += f"\n{len(errors)} 个文件删除失败"
+            await self._push_status(session_id, "done", "完成")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": reply})
+            return {"final_reply": reply, "_reply_pushed": True}
+
+        except Exception as e:
+            logger.warning(f"cleanup_handler failed: {e}")
+            err_msg = f"清理失败: {e}"
+            await self._push_error(session_id, err_msg, subtype="TASK_FAILED")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": err_msg})
+            return {"final_reply": err_msg, "error": str(e), "_reply_pushed": True}
+
+    async def _literature_search_handler(self, state: MainState) -> dict:
+        """文献调研 handler: 搜索 → 评估 → 返回结果 + 保存调研报告。"""
+        session_id = state.get("session_id", "main")
+        params = state.get("intent_params", {})
+        user_content = state.get("user_content", "")
+        query = params.get("search_query") or user_content
+
+        await self._push_status(session_id, "searching", f"正在搜索: {query[:60]}...")
+
+        try:
+            tool = self.registry.get("agent_literature_search")
+            if not tool:
+                reply = "文献搜索工具暂不可用"
+                await self._push(session_id, "message", "reply", "assistant",
+                                 payload={"content": reply})
+                return {"final_reply": reply, "_reply_pushed": True}
+
+            result_json = await tool.ainvoke({"user_query": query})
+            result = json.loads(result_json) if isinstance(result_json, str) else result_json
+
+            try:
+                if self.db:
+                    self.db.record_agent_event(
+                        "agent-001", session_id,
+                        state.get("correlation_id", ""),
+                        "survey_report",
+                        {
+                            "user_intent": query[:500],
+                            "search_result": str(result)[:2000],
+                        },
+                    )
+            except Exception:
+                pass
+
+            reply_text = str(result.get("result", result))[:3000]
+            await self._push_status(session_id, "done", "搜索完成")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": reply_text})
+            return {"final_reply": reply_text, "_reply_pushed": True}
+
+        except Exception as e:
+            logger.warning(f"literature_search_handler failed: {e}")
+            err_msg = f"搜索失败: {e}"
+            await self._push_error(session_id, err_msg, subtype="TASK_FAILED")
+            await self._push(session_id, "message", "reply", "assistant",
+                             payload={"content": err_msg})
+            return {"final_reply": err_msg, "error": str(e), "_reply_pushed": True}
+
     # ── Compile ─────────────────────────────────────────────
 
     def compile(self, checkpointer: Any = None) -> Any:
@@ -315,6 +528,12 @@ class MainGraph:
         # Nodes
         builder.add_node("fast_triage", self._fast_triage)
         builder.add_node("intent_classify", self._intent_classify)
+        # v5 handler nodes
+        builder.add_node("rag_handler", self._rag_handler)
+        builder.add_node("ingest_handler", self._ingest_handler)
+        builder.add_node("cleanup_handler", self._cleanup_handler)
+        builder.add_node("literature_search_handler", self._literature_search_handler)
+        # legacy nodes (kept for backward compat, not routed in v5)
         builder.add_node("plan", self._plan)
         builder.add_node("clarify", self._clarify)
         builder.add_node("gate", self._gate)
@@ -322,7 +541,7 @@ class MainGraph:
         builder.add_node("execute", self._execute)
         builder.add_node("todo_checkpoint", self._todo_checkpoint)
         builder.add_node("evaluate", self._evaluate)
-        builder.add_node("ask_user", self._gate)  # merged into Gate
+        builder.add_node("ask_user", self._gate)
         builder.add_node("inline_reply", self._inline_reply)
 
         # Edges
@@ -337,12 +556,26 @@ class MainGraph:
                 "chat": "inline_reply",
             },
         )
-        # v4.0: intent_classify routes to chat/ops/plan
+        # v5: intent_classify 路由到 handler / chat / ops
         builder.add_conditional_edges(
             "intent_classify",
             self._route_intent,
-            {"inline_reply": "inline_reply", "ops_plan": "ops_confirm", "plan": "plan"},
+            {
+                "inline_reply": "inline_reply",
+                "ops_plan": "ops_confirm",
+                "rag_handler": "rag_handler",
+                "ingest_handler": "ingest_handler",
+                "cleanup_handler": "cleanup_handler",
+                "literature_search_handler": "literature_search_handler",
+                "plan": "plan",
+            },
         )
+
+        # Handler nodes → END
+        builder.add_edge("rag_handler", END)
+        builder.add_edge("ingest_handler", END)
+        builder.add_edge("cleanup_handler", END)
+        builder.add_edge("literature_search_handler", END)
 
         # plan → clarify (ask_user) or plan_review (send for approval)
         builder.add_conditional_edges(
@@ -463,11 +696,11 @@ class MainGraph:
     # ═══════════════════════════════════════════════════════════
 
     async def _intent_classify(self, state: MainState) -> dict:
-        """v4.0: Flash model, 7 意图独立打分 + planning_prompt 生成。"""
+        """v5: 分类 primary intent + 路由。"""
         user = state.get("user_content", "")
         session_id = state.get("session_id", "main")
 
-        await self._push_status(session_id, "planning", "正在分析研究意图...")
+        await self._push_status(session_id, "analyzing", "正在分析意图...")
 
         from ...agent.main_agent_prompts import INTENT_CLASSIFY_PROMPT
 
@@ -476,36 +709,40 @@ class MainGraph:
                 messages=[{"role": "user", "content": user}],
                 system=INTENT_CLASSIFY_PROMPT,
                 temperature=0.0,
-                node="intent_classify_v4",
+                node="intent_classify_v5",
             )
         except Exception as e:
-            logger.warning(f"intent_classify LLM failed: {e}, fallback to survey")
-            return {
-                "v4_intents": [{"intent": "survey", "score": 0.8}],
-                "planning_prompt": user,
-                "should_plan": True,
-                "route": "plan",
-            }
+            logger.warning(f"intent_classify LLM failed: {e}, fallback to chat")
+            return {"route": "chat", "primary_intent": "chat", "intent_params": {}}
 
-        intents = [i for i in data.get("intents", []) if i.get("score", 0) > 0.7]
-        should_plan = data.get("should_plan", True)
-        planning_prompt = data.get("planning_prompt", user)
+        primary = data.get("primary", data.get("route", "chat"))
+        params = data.get("params", {})
+        route = data.get("route", primary)
 
-        if not should_plan:
-            return {"v4_intents": intents, "route": "chat"}
-
-        if all(i.get("intent") == "ops" for i in intents):
-            return {"v4_intents": intents, "planning_prompt": planning_prompt, "route": "ops"}
-
-        return {"v4_intents": intents, "planning_prompt": planning_prompt, "route": "plan"}
+        # Map primary to route
+        if route == "chat":
+            return {"route": "chat", "primary_intent": primary, "intent_params": params}
+        if route == "ops":
+            return {"route": "ops", "primary_intent": primary, "intent_params": params}
+        # All research intents → route by name
+        return {"route": route, "primary_intent": primary, "intent_params": params}
 
     async def _route_intent(self, state: MainState) -> str:
-        """v4.0: 路由 intent_classify 结果。"""
-        route = state.get("route", "plan")
+        """v5: 路由 intent_classify 结果到 handler。"""
+        route = state.get("route", "chat")
         if route == "chat":
             return "inline_reply"
         if route == "ops":
-            return "ops_plan"  # maps to ops_confirm in conditional edges
+            return "ops_plan"
+        if route == "rag":
+            return "rag_handler"
+        if route == "survey":
+            return "literature_search_handler"
+        if route == "ingest":
+            return "ingest_handler"
+        if route == "cleanup":
+            return "cleanup_handler"
+        # Fallback: use plan for unknown research routes (backward compat)
         return "plan"
 
     # ═══════════════════════════════════════════════════════════

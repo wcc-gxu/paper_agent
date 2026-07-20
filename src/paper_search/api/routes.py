@@ -787,6 +787,7 @@ async def _run_ingest(task_id: str, project_id: str, user_query: str,
     try:
         from ..agent.sub_agent import PipelineRunner
         from ..agent.graphs.knowledge_graph import KnowledgeAgent
+        from ..agent.graphs.literature_graph import LiteratureAgent
         from ..agent.pdf_converter import PDFConverter
         from ..agent.journal_ranker import JournalRanker
         from ..agent.pgvector_store import PgVectorStore
@@ -804,8 +805,8 @@ async def _run_ingest(task_id: str, project_id: str, user_query: str,
             converter=PDFConverter(max_concurrent=2),
             ranker=JournalRanker(),
         )
-        ingest = IngestAgent(runner)
-        graph = ingest.compile()
+        agent = LiteratureAgent(runner)
+        graph = agent.compile()
 
         config = {"configurable": {"thread_id": f"ingest-{task_id}"}}
         result = await graph.ainvoke(

@@ -1,6 +1,6 @@
 """子 Agent 编排器 — PipelineRunner。
 
-编排 IngestAgent 的 7 阶段论文入库流水线 (默认进程内执行):
+编排 7 阶段论文入库流水线 (进程内执行):
   1. search_stage    → Engine.search()              [进程内 async]
   2. evaluate_stage  → LLM.evaluate_batch()         [进程内 async]
   3. download_stage  → PipelineRunner._download     [进程内 async]
@@ -9,15 +9,9 @@
   6. rank_stage      → JournalRanker.rank_batch()   [进程内 async]
   7. survey_stage    → PipelineRunner._survey       [进程内 async]
 
-Celery 异步调度 (通过 sub_agent_task 编排器):
-  run_pipeline_via_celery() → Celery sub_agent_task.delay()
-    → search_task → evaluate_task → group(download) → group(convert)
-    → group(index) → rank_task → survey_task
-
 执行模式:
   - ExecuteGraph (默认): 完整流水线，进程内执行
   - Single Tool: 单独执行一个阶段
-  - Celery 分发: run_pipeline_via_celery() 异步执行
 
 进度上报:
   - TaskLogger 写 JSON 日志
@@ -536,45 +530,3 @@ class PipelineRunner:
         except Exception as e:
             logger.error(f"Survey generation failed: {e}")
             return {"survey_path": "", "error": str(e)}
-
-    # ══════════════════════════════════════════════════════════
-    # Celery 异步分发 — 完整流水线通过 Celery 编排器执行
-    # ══════════════════════════════════════════════════════════
-
-    @staticmethod
-    def run_pipeline_via_celery(
-        user_query: str,
-        sources: list[str] = None,
-        year_from: int = 2022,
-        max_results: int = 20,
-        project_id: str = "",
-        agent_task_id: str = "",
-    ) -> dict:
-        """通过 Celery sub_agent_task 异步执行完整流水线。
-
-        Args:
-            user_query: 搜索查询
-            sources: 搜索来源列表
-            year_from: 起始年份
-            max_results: 每个来源最大结果数
-            project_id: 项目 ID
-            agent_task_id: 主 Agent 任务 ID (用于日志/报告关联)
-
-        Returns:
-            {"celery_task_id": str, "status": "dispatched"}
-        """
-        from .celery_tasks import sub_agent_task
-
-        result = sub_agent_task.delay(
-            user_query=user_query,
-            sources=sources or ["arxiv", "semantic_scholar"],
-            year_from=year_from,
-            max_results=max_results,
-            project_id=project_id,
-            agent_task_id=agent_task_id,
-        )
-        logger.info(
-            f"Celery pipeline dispatched: task_id={result.id} "
-            f"query={user_query[:60]}"
-        )
-        return {"celery_task_id": result.id, "status": "dispatched"}

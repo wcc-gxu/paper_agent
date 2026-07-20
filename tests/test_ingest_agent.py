@@ -215,13 +215,8 @@ def test_ingest_agent_compile():
 
 def test_celery_tasks_import():
     """测试 Celery task 可导入。"""
-    from paper_search.agent.celery_tasks import (
-        download_task, convert_task, index_task, survey_task,
-    )
-    assert download_task is not None
-    assert convert_task is not None
-    assert index_task is not None
-    assert survey_task is not None
+    from paper_search.agent.celery_tasks import subscription_check_task
+    assert subscription_check_task is not None
 
 
 # ═══════════════════════════════════════════════════════════════

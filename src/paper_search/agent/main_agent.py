@@ -793,16 +793,12 @@ class MainAgent:
 
         envelope = {
             "type": new_type,
-            # v10: subType 仅 tool/error 用；其余去除
             "subType": new_sub,
-            "role": role,                         # v10 删除 role，但过渡期保留为可选向后兼容
             "agentId": self._agent_id,
             "sessionId": session_id,
             "timestamp": _now(),
             "payload": new_payload,
-            # v10: 字段名 priority；同时保留 priorityKind 兼容旧客户端 / 旧库逻辑
             "priority": priority_kind,
-            "priorityKind": priority_kind,
         }
         try:
             result = await outbox_publish(

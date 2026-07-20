@@ -235,14 +235,14 @@ class TestV4Prompts:
 
     def test_intent_classify_prompt_exists(self):
         from paper_search.agent.main_agent_prompts import INTENT_CLASSIFY_PROMPT
-        assert "7 种意图" in INTENT_CLASSIFY_PROMPT or "intent" in INTENT_CLASSIFY_PROMPT
+        assert "intent" in INTENT_CLASSIFY_PROMPT.lower()
+        assert "rag" in INTENT_CLASSIFY_PROMPT
         assert "survey" in INTENT_CLASSIFY_PROMPT
         assert "writing" in INTENT_CLASSIFY_PROMPT
         assert "chat" in INTENT_CLASSIFY_PROMPT
         assert "ops" in INTENT_CLASSIFY_PROMPT
-        assert "score" in INTENT_CLASSIFY_PROMPT
-        assert "should_plan" in INTENT_CLASSIFY_PROMPT
-        assert "planning_prompt" in INTENT_CLASSIFY_PROMPT
+        assert "primary" in INTENT_CLASSIFY_PROMPT
+        assert "params" in INTENT_CLASSIFY_PROMPT
 
     def test_react_system_prompt_exists(self):
         from paper_search.agent.main_agent_prompts import REACT_SYSTEM_PROMPT
@@ -256,54 +256,7 @@ class TestV4Prompts:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Test 5: React Executor
-# ═══════════════════════════════════════════════════════════════
-
-
-class TestReactExecutor:
-    """v4.0 react_executor Celery task。"""
-
-    def test_task_is_registered(self):
-        from paper_search.agent.react_executor import react_execute
-        assert react_execute is not None
-        assert callable(react_execute)
-
-    def test_task_name(self):
-        from paper_search.agent.react_executor import react_execute
-        assert react_execute.name
-
-    def test_react_max_rounds_env(self):
-        from paper_search.agent.react_executor import REACT_MAX_ROUNDS
-        assert REACT_MAX_ROUNDS > 0
-        assert REACT_MAX_ROUNDS <= 20
-
-    def test_react_execute_accepts_plan_args(self):
-        from paper_search.agent.react_executor import _run_react
-
-        plan_args = {
-            "plan_id": "plan-1", "agent_id": "agent-001",
-            "user_id": "user-1", "session_id": "main",
-            "todos": [], "context": {}, "llm_provider": "deepseek",
-        }
-        with patch("paper_search.agent.react_executor._get_llm") as mock_llm, \
-             patch("paper_search.agent.react_executor._get_db") as mock_db, \
-             patch("paper_search.agent.react_executor._get_redis") as mock_redis, \
-             patch("paper_search.agent.react_executor._outbox_push"), \
-             patch("paper_search.agent.tool_registry.ToolRegistry.get_instance") as mock_registry:
-            mock_llm.return_value.chat.return_value = MagicMock(
-                content="Done", tool_calls=[])
-            mock_db.return_value = MagicMock()
-            mock_redis.return_value = MagicMock()
-            reg = MagicMock()
-            reg.get_all_tool_defs = MagicMock(return_value=[])
-            mock_registry.return_value = reg
-
-            result = _run_react(plan_args)
-            assert result["status"] in ("done", "max_rounds")
-
-
-# ═══════════════════════════════════════════════════════════════
-# Test 6: Agent Heartbeat
+# Test 5: Agent Heartbeat
 # ═══════════════════════════════════════════════════════════════
 
 

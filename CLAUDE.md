@@ -1,63 +1,92 @@
-# CLAUDE.md — Paper Agent v4
+# CLAUDE.md — Paper Agent v5
 
 > AGENTS.md 含开发命令和环境配置，本文件为详细架构参考。
 
 ## 项目概述
 
-Paper Agent v4.1 — 个人 AI 科研助理。Python 后端 (FastAPI + WebSocket) + Vue 3 Web 客户端 + iOS 客户端。
+Paper Agent v5 — 个人 AI 科研助理。Python 后端 (FastAPI + WebSocket) + Vue 3 Web 客户端 + iOS 客户端。
 
 - **编排层**: Agent Supervisor (daemon 容器，管理 N 个 Agent 子进程。stdin/stdout pipe 通信)
-- **执行层**: Celery Worker (react_execute, max 8 rounds) + Agent 内部 asyncio 工具
+- **执行层**: Celery Worker (异步下载/转换/入库) + Agent 内部 asyncio 工具
 - **Agent 子进程**: 每用户独立 PID，不直接连 Redis。通过 Supervisor 中转消息
 - **消息**: Outbox 模式 (Redis List + PostgreSQL + APNs)
 - **状态**: Redis Hash `agent:status`（Supervisor 维护，API 查询）
 - **控制**: Pub/Sub `agent:control`（仅启停命令）
-- **v4.1 新增**: Agent 子进程模型/3 层健康检测/工具二分(in-process vs Celery)/幂等重试
 - **记忆**: LangGraph 三件套 + pgvector
 - **存储**: PostgreSQL+pgvector + Redis + 文件系统
 - **定时**: Celery Beat (订阅检查 + health_check + cleanup + 长期抽取 + session_close)
 
-## 主 Agent 架构
+## 主 Agent 架构 (v5)
 
 ```
 WS 消息 → BRPOP → Safety Filter → MainGraph.ainvoke()
                   ↓                        ↓
-          regex + LLM 二次确认      10-node StateGraph
+          regex + LLM 二次确认      路由式 StateGraph
                                           ↓
-                          fast_triage → intent_classify → plan → gate
-                             → execute(ReAct) → todo_checkpoint → evaluate
+                    fast_triage → intent_classify → side_handler
+                       → [primary handler 路由]
+                          ├─ rag → rag_handler → END
+                          ├─ survey → literature_search_handler → END
+                          ├─ translation → translate_handler → END
+                          ├─ writing → writing_handler → END
+                          └─ ... → xxx_handler → END
 ```
+
+**v5 核心理念**：
+- 意图驱动的**确定性路由**，去 LLM 规划（删除 plan/clarify/gate/todo_checkpoint/evaluate 节点）
+- 每个 handler 节点自治（内部调工具 + push 消息 + 错误处理）
+- 主/辅意图分离（primary 业务意图 + side 辅助意图如反馈/偏好/语录）
+- 用户交互统一走 `ask` 消息
+- 耗时操作（下载/转换/入库）进 Celery 前 `ask` 确认
 
 **模型策略**: 结构化判断 (flash + tool_choice) / 生成类 (pro + thinking)
 
 **安全**: 入口 regex → LLM 二次确认 → tool 调用前 regex。fail-closed 纪律。
 
-**evaluate 5 出口**: `done` / `retry_tools` / `ask_user` / `replan` / `fail`
+**错误处理层级**: retry_once → fallback/degradation → LLM advise → ask_user
 
-## 17 个业务场景
+## Intent 分类 → Handler 路由
 
-`intent_classify` 映射到 1~N 个 scenario_id（支持复合意图）：
+`intent_classify` 输出 `{primary, side[], params, route}`：
 
-| ID | 场景 | ID | 场景 |
-|---|---|---|---|
-| S1 | 文献调研/筛选 | S10 | RAG 问答 |
-| S2 | 文献综述生成 | S11 | 批量搜索 |
-| S3 | 每日前沿追踪 (订阅) | S12 | 学术翻译/术语库 |
-| S4 | 论文精读/提炼 | S13 | 视频解析 |
-| S5 | 方法对比 | S14 | 导出/清理 |
-| S6 | 研究空白分析 | S15 | iOS 自动化 |
-| S7 | 进度查看 | S16 | 运维操作 |
-| S8 | 聚类+全景图 | S17 | 记忆操作 |
-| S9 | 引用追溯 | | |
+| primary intent | handler 节点 | 说明 |
+|---------------|-------------|------|
+| `rag` | `rag_handler` | BM25+向量检索 → LLM 回答 | ✅ |
+| `survey` | `literature_search_handler` | 搜索 → 评估 → 返回结果 + 保存调研报告 | ✅ |
+| `ingest` | `ingest_handler` | 扫描本地目录 → PDF 入库 | ✅ |
+| `cleanup` | `cleanup_handler` | 删除原始 PDF/MD，保留 DB 记录 | ✅ |
+| `translation` | `translate_handler` | glossary_search → LLM 翻译 | 🔧 |
+| `writing` | `writing_handler` | 综述/AI检测/gap分析 | 🔧 |
+| `glossary` | `glossary_handler` | 词表收集 → 校验 | 🔧 |
+| `clustering` | `cluster_handler` | K-means → LLM label | 🔧 |
+| `citation_chase` | `citation_handler` | 引用追溯 | 🔧 |
+| `paper_analysis` | `paper_handler` | 单篇精读 | 🔧 |
+| `knowledge_mgmt` | 按需路由 | 订阅/全文获取 | 🔧 |
+| `chat` | `inline_reply` | 纯 LLM 回复 | ✅ |
+| `ops` | `ops_confirm` → `execute(ReAct)` | 运维操作 | ✅ |
 
-## LLM JSON Schema 强约束
+> ✅ = 已实现 | 🔧 = 待实现
+
+## Handler 节点列表
+
+| 节点 | 状态 | 工具调用 | Turn 结束? |
+|------|:---:|---------|:---:|
+| `fast_triage` | ✅ | 1 次 LLM | — |
+| `intent_classify` | ✅ | 1 次 LLM | — |
+| `rag_handler` | ✅ | `agent_knowledge_ask` | ✓ |
+| `literature_search_handler` | ✅ | `agent_literature_search` + 保存调研报告 | ✓ |
+| `ingest_handler` | ✅ | 扫描目录 → `agent_knowledge_ingest_local` | ✓ |
+| `cleanup_handler` | ✅ | `os.walk` + `Path.unlink` | ✓ |
+| `inline_reply` | ✅ | 纯 LLM | ✓ |
+| `ops_confirm` | ✅ | 危险确认 | — |
+| `execute` | ✅ | 自由 ReAct（仅 ops 路径） | ✓ |
+
+## LLM JSON Schema
 
 | Schema | 用途 | 节点 |
-|---|---|---|
+|--------|------|------|
 | `SafetyResult` | safe + risk_kind + user_message | C1 安全前置 |
-| `IntentClassifyResult` | intent_kind + scenarios[] + confidence | C2 意图分类 |
-| `ScenarioPlanResult` | summary + needs_clarify + permissions + tools[] | plan |
-| `EvaluateCompletionResult` | satisfied + next_action + final_message | evaluate |
+| `IntentClassifyV5Result` | primary + side[] + params + route | intent_classify |
 
 ## 出站消息链路 — Outbox 模式
 
@@ -69,7 +98,7 @@ MainAgent → outbox_publish() ─┬─ PostgreSQL ws_messages (持久化)
                               BRPOP → WS (在线) / APNs (离线)
 ```
 
-| priority_kind | 在线 | 离线 |
+| priority | 在线 | 离线 |
 |---|---|---|
 | silent | WS | 丢弃 |
 | normal | WS + 持久化 | 持久化 |
@@ -90,27 +119,37 @@ MainAgent → outbox_publish() ─┬─ PostgreSQL ws_messages (持久化)
 
 跨进程 resume: `thread_id = session_id` → `graph.aget_state()` 自动续上
 
-## 8 个子 Agent
+## Tool 体系
 
-| Agent | Graph | 流程 |
-|---|---|---|
-| Literature | `literature_graph.py` | search → evaluate → download → convert → metadata |
-| Knowledge | `knowledge_graph.py` | Ingest(embed→dedup→rank) + Query(parse→route→search→evaluate) |
-| Clustering | `clustering_graph.py` | cluster → label → detect |
-| CitationChase | `citation_chase_graph.py` | resolve → fetch → filter → ingest → decide → summarize |
-| Translation | `translation_graph.py` | route → translate/build_glossary/enrich |
-| Glossary | `glossary_graph.py` | collect → search → verify → evolve |
-| Video | `video_graph.py` | download → transcribe → summarize |
-| Writing | `writing_graph.py` | survey → citation_check → ai_flavor_check |
+所有工具在 `ToolRegistry` 中注册，被 handler 节点调用。无 `agent_` 前缀子 Agent。
 
-Sub-agent 工具使用 `agent_` 前缀 (e.g., `agent_literature_search`)。
+| Tool | 来源 | 说明 |
+|------|------|------|
+| `search_papers` | LiteratureAgent | BM25+向量混合搜索 |
+| `evaluate_papers` | LiteratureAgent | LLM 评估相关性 |
+| `download_paper` | LiteratureAgent | 单篇下载 |
+| `convert_to_md` | LiteratureAgent | PDF→MD |
+| `search_kb` | KnowledgeAgent | BM25+向量检索知识库 |
+| `chunk_embed_ingest` | KnowledgeAgent | 切片+embedding+入库 |
+| `generate_survey` | WritingAgent | LLM 综述 |
+| `check_ai_flavor` | WritingAgent | AI 检测 |
+| `gap_analysis` | WritingAgent | 空白分析 |
+| `glossary_search` | TranslationAgent | 词表检索 |
+| `collect_terms` | GlossaryAgent | TF-IDF 提取 |
+| `verify_terms` | GlossaryAgent | LLM 校验 |
+| `cluster_papers` | ClusteringAgent | K-means |
+| `fetch_citations` | CitationChaseAgent | S2 API |
+| `filter_relevance` | CitationChaseAgent | LLM 过滤 |
+| `process_video` | VideoAgent | 视频处理 |
+| `record_feedback` | 新增 | 反馈记录 |
+| `update_preference` | 已有 | 偏好更新 |
 
 ## 服务进程
 
 | # | 服务 | 端口 | 说明 |
 |---|---|---|---|
 | 1 | Redis | 6379 | 消息队列 + 状态缓存 |
-| 2 | Celery Worker | — | 重型任务（搜索/下载/转换/综述） |
+| 2 | Celery Worker | — | 异步任务（下载/转换/入库） |
 | 3 | Celery Beat | — | 定时任务（订阅/健康检查） |
 | 4 | API Server | 8000 | FastAPI + WebSocket |
 | 5 | Agent Supervisor | — | 管理 N 个 Agent 子进程 + 消息路由 + 状态监控 |
@@ -124,7 +163,6 @@ proc = await asyncio.create_subprocess_exec(
     "--user-id", uid,
     stdin=PIPE, stdout=PIPE, stderr=PIPE,
 )
-
 # 用户间 OS 级隔离：独立 PID、独立内存空间、崩溃互不影响
 # Agent 不直接连 Redis，所有 IO 通过 Supervisor stdin/stdout pipe 中转
 ```
@@ -163,6 +201,7 @@ proc = await asyncio.create_subprocess_exec(
 | `outbox:{uid}` | List | Agent outbox | outbox_poller | 出站消息（兼容旧版） |
 | `agent:reports:{uid}` | Pub/Sub | 子 Agent | Agent | 子 Agent 上报（保留，中继使用） |
 | `agent:notifications` | Pub/Sub | Celery Beat | API | 订阅通知 |
+| `session:{sid}` | Hash | handler 节点 | handler 节点 | 跨 turn 状态（v5 新增） |
 
 ## Environment (.env)
 
@@ -197,11 +236,10 @@ Python >= 3.11
 
 ## 文档索引
 
-- [agent-architecture-v4.md](docs/development/agent-architecture-v4.md) — v4.1 Supervisor + Agent 子进程架构
-- [main-agent.md](docs/development/main-agent.md) — MainAgent LangGraph StateGraph 详解
-- [anti-hallucination.md](docs/development/anti-hallucination.md) — 反幻觉三层策略
-- [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 v10.2
+- [architecture-upgrade-v5.md](docs/development/architecture-upgrade-v5.md) — **v5 架构升级方案**
+- [v5-development-plan.md](docs/development/v5-development-plan.md) — **v5 分阶段开发计划**
+- [websocket-protocol.md](docs/development/websocket-protocol.md) — WS 协议 v11.1
 - [memory-system.md](docs/development/memory-system.md) — 记忆系统架构
 - [api-reference.md](docs/development/api-reference.md) — API 参考文档
 - [database-architecture.md](docs/development/database-architecture.md) — PostgreSQL schema
-- [gap-analysis.md](docs/development/gap-analysis.md) — 当前差距分析
+- [anti-hallucination.md](docs/development/anti-hallucination.md) — 反幻觉三层策略
