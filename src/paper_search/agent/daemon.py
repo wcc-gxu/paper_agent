@@ -640,54 +640,56 @@ class AgentSupervisor:
                 async for message in pubsub.listen():
                     if message.get("type") != "message":
                         continue
-                try:
-                    cmd = json.loads(message.get("data", "{}"))
-                except json.JSONDecodeError:
-                    logger.warning("Control: non-JSON message received: %s", str(message.get("data", ""))[:200])
-                    continue
+                    try:
+                        cmd = json.loads(message.get("data", "{}"))
+                    except json.JSONDecodeError:
+                        logger.warning("Control: non-JSON message received: %s", str(message.get("data", ""))[:200])
+                        continue
 
                     action = cmd.get("cmd", "")
                     agent_id = cmd.get("agent_id", "")
                     user_id = cmd.get("user_id", "")
                     correlation_id = cmd.get("correlation_id", "")
 
-                if not correlation_id:
-                    logger.warning("Control: missing correlation_id, cmd=%s agent=%s user=%s", action, agent_id, user_id)
-                    continue
+                    if not correlation_id:
+                        logger.warning("Control: missing correlation_id, cmd=%s agent=%s user=%s", action, agent_id, user_id)
+                        continue
 
-                try:
-                    if action == "start":
-                        logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
-                        result = await self._handle_start(agent_id, user_id, correlation_id)
-                    elif action == "stop":
-                        logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
-                        result = await self._handle_stop(agent_id, user_id, correlation_id)
-                    elif action == "restart":
-                        logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
-                        result = await self._handle_restart(agent_id, user_id, correlation_id)
-                    elif action == "shutdown":
-                        logger.info("Control: supervisor shutdown requested")
-                        self._stopping = True
-                        result = {"status": "ok", "message": "shutting down"}
-                    else:
-                        logger.warning("Control: unknown command '%s' cmd=%s", action, str(cmd)[:200])
-                        result = {"status": "error", "error": f"Unknown command: {action}"}
-                except Exception as e:
-                    logger.error("Control handler crashed for %s: %s", action, e, exc_info=True)
-                    await self._sse_publish(correlation_id, "error",
-                        {"error": f"Internal error: {e}"})
-                    result = {"status": "error", "error": str(e)}
+                    try:
+                        if action == "start":
+                            logger.info("Control: start agent_id=%s user_id=%s", agent_id, user_id)
+                            result = await self._handle_start(agent_id, user_id, correlation_id)
+                        elif action == "stop":
+                            logger.info("Control: stop agent_id=%s user_id=%s", agent_id, user_id)
+                            result = await self._handle_stop(agent_id, user_id, correlation_id)
+                        elif action == "restart":
+                            logger.info("Control: restart agent_id=%s user_id=%s", agent_id, user_id)
+                            result = await self._handle_restart(agent_id, user_id, correlation_id)
+                        elif action == "shutdown":
+                            logger.info("Control: supervisor shutdown requested")
+                            self._stopping = True
+                            result = {"status": "ok", "message": "shutting down"}
+                        else:
+                            logger.warning("Control: unknown command '%s' cmd=%s", action, str(cmd)[:200])
+                            await self._sse_publish(correlation_id, "error",
+                                {"error": f"Unknown command: {action}"})
+                            result = {"status": "error", "error": f"Unknown command: {action}"}
+                    except Exception as e:
+                        logger.error("Control handler crashed for %s: %s", action, e, exc_info=True)
+                        await self._sse_publish(correlation_id, "error",
+                            {"error": f"Internal error: {e}"})
+                        result = {"status": "error", "error": str(e)}
 
-                # 发送响应
-                resp_channel = f"agent:control:resp:{correlation_id}"
-                try:
-                    await r.publish(resp_channel, json.dumps({
-                        **result,
-                        "correlation_id": correlation_id,
-                        "timestamp": _now_iso(),
-                    }, ensure_ascii=False))
-                except Exception as e:
-                    logger.error("Failed to publish control response (corr_id=%s): %s", correlation_id, e)
+                    # 发送响应
+                    resp_channel = f"agent:control:resp:{correlation_id}"
+                    try:
+                        await r.publish(resp_channel, json.dumps({
+                            **result,
+                            "correlation_id": correlation_id,
+                            "timestamp": _now_iso(),
+                        }, ensure_ascii=False))
+                    except Exception as e:
+                        logger.error("Failed to publish control response (corr_id=%s): %s", correlation_id, e)
 
             except (ConnectionError, OSError) as e:
                 logger.error("Control listener disconnected: %s, reconnecting in 3s...", e)
