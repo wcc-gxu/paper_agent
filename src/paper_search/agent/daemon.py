@@ -367,7 +367,8 @@ class AgentSupervisor:
                     if state == "idle":
                         logger.info("Agent %s state → idle (pid=%d node=%s turns=%d)", agent_id, pid, node, active)
                         current = await self._state_mgr.get(agent_id)
-                        if current and current.state in ("starting", "pending", "busy"):
+                        # 接受 starting/pending/busy（正常启动），以及 stopped/crashed（并发启动 + 防御）
+                        if current and current.state in ("starting", "pending", "busy", "stopped", "crashed"):
                             startup_ms = msg.get("startup_ms", 0)
                             await self._state_mgr.transition(
                                 agent_id, "idle",
@@ -542,7 +543,13 @@ class AgentSupervisor:
                             logger.info("Monitor: auto-created agent=%s for new user=%s", agent_id, user_id)
                         # 如果 agent 还没启动子进程，启动它
                         if user_id not in self._agents:
-                            asyncio.create_task(self.launch_agent(user_id))
+                            agent_id = agent.get("id", f"agent-{user_id}") if agent else f"agent-{user_id}"
+                            await self._state_mgr.transition(agent_id, "starting")
+                            launched = await self.launch_agent(user_id)
+                            if launched:
+                                logger.info("Monitor: auto-launched agent=%s for user=%s", agent_id, user_id)
+                            else:
+                                logger.warning("Monitor: failed to launch agent=%s", agent_id)
                 except Exception as e:
                     logger.warning("Periodic user scan failed: %s", e)
 
@@ -816,6 +823,18 @@ class AgentSupervisor:
             launched = False
 
         if not launched:
+            # 可能 agent 已经被其他入口启动了，检查是否实际在运行
+            if agent_uid in self._agents:
+                proc = self._agents[agent_uid]
+                if proc.returncode is None:
+                    logger.info("_handle_start: agent=%s already running (launched by another path), skipping", agent_id)
+                    await self._sse_publish(corr_id, "done",
+                        {"status": "already_running", "agent_id": agent_id})
+                    state = await self._state_mgr.get(agent_id)
+                    return {
+                        "status": "already_running",
+                        "agent_state": state.to_dict() if state else {},
+                    }
             logger.error("_handle_start: agent=%s launch failed", agent_id)
             await self._state_mgr.transition(
                 agent_id, "crashed",
@@ -1036,13 +1055,20 @@ class AgentSupervisor:
             logger.error("Failed to bootstrap agents from users: %s", e, exc_info=True)
 
     async def _launch_all_agents(self):
-        """为所有活跃 agent 启动子进程。"""
+        """为所有活跃 agent 启动子进程。先 transition("starting") 再 launch。"""
         active_ids = await self._state_mgr.list_active()
         logger.info("Launching %d active agents", len(active_ids))
         for agent_id in active_ids:
             state = await self._state_mgr.get(agent_id)
-            if state and state.user_id and state.user_id != "user-default":
-                asyncio.create_task(self.launch_agent(state.user_id))
+            if not state or not state.user_id or state.user_id == "user-default":
+                continue
+            # 确保状态为 starting（与 _handle_start 一致）
+            await self._state_mgr.transition(agent_id, "starting")
+            launched = await self.launch_agent(state.user_id)
+            if launched:
+                logger.info("Bootstrap launched agent=%s user=%s", agent_id, state.user_id)
+            else:
+                logger.warning("Bootstrap failed to launch agent=%s (already running?)", agent_id)
 
 
 # ═══════════════════════════════════════════════════════════════
