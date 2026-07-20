@@ -1025,10 +1025,16 @@ class AgentSupervisor:
 
     async def run(self):
         """主入口 — 启动 Supervisor 所有循环。"""
-        import redis.asyncio as aioredis
-
         # 状态管理器需要 Redis，在 _ingress_loop 之前创建
-        self._state_mgr._redis = aioredis.from_url(self.redis_url, decode_responses=True)
+        try:
+            import redis.asyncio as aioredis
+            self._state_mgr._redis = aioredis.from_url(self.redis_url, decode_responses=True)
+            # 快速检测连接是否可用
+            await self._state_mgr._redis.ping()
+            logger.info("State manager Redis connected: %s", self.redis_url)
+        except Exception as e:
+            logger.error("Failed to connect state manager Redis: %s", e)
+            raise
 
         # 扫描所有活跃用户，为每个用户确保 agent 存在并恢复到 Redis
         await self._bootstrap_users()
