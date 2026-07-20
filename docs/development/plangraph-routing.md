@@ -1,8 +1,9 @@
 # PlanGraph 硬编码 17 场景路由表 + C 档缺口实现计划
 
-> 状态：设计稿（2026-06-23）
-> 关联：[main-agent.md](main-agent.md) · [anti-hallucination.md](anti-hallucination.md)
-> 范围：仅设计，不改代码。落地实施需另开 PR。
+> **[DEPRECATED]** 本文档已被 [intent-routing-design.md](intent-routing-design.md) 取代。
+>
+> v5 不再维护独立的 S1~S17 场景 ID 表，意图 ID 即路由键。14 个业务意图 1:1 映射到 handler 节点序列。
+> 本文档保留作为 v4 历史参考，不用于 v5 开发。
 
 ---
 

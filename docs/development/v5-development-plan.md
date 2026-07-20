@@ -330,23 +330,25 @@ bash scripts/start-all.sh
 
 ---
 
-## Phase 2b: 其余 Handler（面试后实现）
+## Phase 2b: 其余 Handler
 
 ### Handler 清单
 
 | Handler | 工具序列 | 特殊逻辑 |
 |---------|---------|---------|
 | `_translate_handler` | glossary_search → LLM translate | glossary_search 是 tool，翻译 LLM 在 handler 内调 |
-| `_literature_search_handler` | search_papers → evaluate_papers | query 模糊→ask 先澄清；返回结果列表→turn 结束 |
 | `_download_handler` | download_paper(s) | N<10→inline；N≥10→ask(confirm)→Celery |
 | `_convert_handler` | convert_to_md | Celery task，progress 推送 |
-| `_ingest_handler` | chunk_embed_ingest | Celery task，progress 推送 |
-| `_survey_handler` | LLM generate survey | 从已下载论文生成综述 |
-| `_writing_handler` | generate_survey / check_ai_flavor / gap_analysis | 三个独立 LLM 调用串行 |
+| `_survey_handler` | LLM generate survey | 前置检查：论文未入库→自动链 download→convert→ingest |
+| `_writing_handler` | generate_survey / check_ai_flavor / gap_analysis | 三个独立 LLM 调用串行；前置链同 survey |
 | `_glossary_handler` | collect_terms → verify_terms | 校验用 LLM |
-| `_cluster_handler` | cluster_papers | K-means + LLM label |
-| `_citation_handler` | resolve → fetch_citations → filter_relevance → summarize | 条件边控制追多层 |
-| `_paper_handler` | search_kb(get_fulltext) → LLM extract | — |
+| `_cluster_handler` | cluster_papers | K-means + LLM label；前置链同 survey |
+| `_citation_handler` | fetch_citations → filter_relevance | 条件边控制追多层 |
+| `_paper_handler` | search_kb(get_fulltext) → LLM extract | 前置链同 survey |
+| `_subscription_handler` | create_subscription / list_subscriptions | Beat 定时推送为后台进程 |
+| `_video_handler` | download_video→transcribe_video→summarize_video→save_capture | 全部 Celery，handler 内多 tool 串行 |
+| `_memory_handler` | search_memory / get_user_preference | 记忆查询；写入走 side_handler |
+| `_side_handler` | record_feedback / update_preference | 轻量 ReAct ≤ 3 轮，处理 preference/feedback/mentor_quote |
 
 ---
 
@@ -359,6 +361,7 @@ bash scripts/start-all.sh
 | `download_handler` | 论文数 ≥ 10（ask 确认后） | `download_papers_task` |
 | `convert_handler` | 总是 | `convert_papers_task` |
 | `ingest_handler` | 总是 | `ingest_papers_task` |
+| `video_handler` | 总是 | `download_video_task` / `transcribe_video_task` |
 
 ### 3.2 Celery → outbox → WS 进度推送
 

@@ -27,16 +27,7 @@ jobs:
         run: python -m pip install -e ".[all]" pytest pytest-asyncio
 
       - name: Run tests
-        run: |
-          PYTHONPATH=src python -m pytest \
-            tests/test_main_agent_safety_intent.py \
-            tests/test_celery_tasks.py \
-            tests/test_anti_hallucination.py \
-            tests/test_subscription.py \
-            tests/test_video_agent.py \
-            tests/test_v4_api.py \
-            tests/test_v5_supervisor.py \
-            -v --tb=short
+        run: PYTHONPATH=src python -m pytest tests/ -v --tb=short
 
   build-dev:
     needs: test

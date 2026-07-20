@@ -24,7 +24,7 @@ fast_triage → intent_classify → plan → clarify ⇄ plan
 | **clarify 节点**：信息收集用 ReAct，逻辑与 execute 重复 | 可以用 handler 内 inline ask 替代 |
 | **gate 节点**：plan_review / ask_user 逻辑混在一个方法 | handler 可以内联 push ask + wait |
 
-**核心认知**：18 个业务场景全部是**确定性流程**。无需 LLM 规划，无需 LLM 评估。需要用户决策的点用 `ask` 即可。
+**核心认知**：14 个业务场景全部是**确定性流程**。无需 LLM 规划，无需 LLM 评估。需要用户决策的点用 `ask` 即可。
 
 ### 成本对比
 
@@ -59,32 +59,56 @@ fast_triage → intent_classify → plan → clarify ⇄ plan
 ```
                           ┌─ chat ──→ inline_reply ──→ END
                           │
-fast_triage ──→ intent_classify ──→ [primary route]
+fast_triage ──→ intent_classify ──→ side_handler ──→ [primary route]
                           │
                           └─ ops ──→ ops_confirm ──→ execute(ReAct) ──→ END
 ```
 
-### 3.2 Primary 路由表
+### 3.2 Primary 路由表（14 业务意图）
 
 > ✅ = 已实现 | 🔧 = 待实现
+>
+> 设计原则：**Intent = Scenario**。意图就是场景，不再维护独立的 S1~S17 场景 ID 表。详见 [intent-routing-design.md](intent-routing-design.md)。
 
-| primary intent | handler 节点 | 说明 | 状态 |
-|---------------|-------------|------|:---:|
-| `rag` | `rag_handler` | BM25+向量检索 → LLM 回答 | ✅ |
-| `survey` | `literature_search_handler` | 搜索 → 评估 → 返回结果 + 保存调研报告 | ✅ |
-| `ingest` | `ingest_handler` | 扫描本地目录 → PDF→MD → 切片入库 | ✅ |
-| `cleanup` | `cleanup_handler` | 删除原始 PDF/MD 文件，保留 DB 记录 | ✅ |
-| `translation` | `translate_handler` | glossary_search → LLM 翻译 | 🔧 |
-| `writing` | `writing_handler` | 综述/AI检测/gap分析 | 🔧 |
-| `glossary` | `glossary_handler` | 词表收集 → 校验 | 🔧 |
-| `clustering` | `cluster_handler` | K-means → LLM label → 可视化 | 🔧 |
-| `citation_chase` | `citation_handler` | 引用追溯（条件边） | 🔧 |
-| `paper_analysis` | `paper_handler` | 单篇精读 → 知识提取 | 🔧 |
-| `knowledge_mgmt` | (按需路由) | 订阅/全文获取 | 🔧 |
-| `chat` | `inline_reply` | 纯 LLM 回复 | ✅ |
-| `ops` | `ops_confirm` → `execute` | 运维操作 | ✅
+| primary intent | handler 节点序列 | 前置链 | 说明 | 状态 |
+|---------------|-----------------|:---:|------|:---:|
+| `survey` | `literature_search_handler` → END | — | BM25+向量混合搜索 → LLM 评估 → 返回结果 + 保存调研报告 | ✅ |
+| `rag` | `rag_handler` → END | — | BM25+向量检索知识库 → LLM 回答 → ask 反馈收集 | ✅ |
+| `ingest` | `ingest_handler` → END | — | 扫描本地目录 → PDF→MD → 切片入库 (Celery) | ✅ |
+| `translation` | `translate_handler` → END | — | glossary_search → LLM 翻译 | 🔧 |
+| `writing` | `writing_handler` → END | 论文未入库时自动链 `download→convert→ingest` | 综述/AI检测/gap分析 | 🔧 |
+| `glossary` | `glossary_handler` → END | — | 词表收集 → 校验 | 🔧 |
+| `clustering` | `cluster_handler` → END | 论文未入库时自动链 `download→convert→ingest` | K-means → LLM label → 可视化 | 🔧 |
+| `citation_chase` | `citation_handler` → END | — | S2 API 引用追溯（条件边控制追多层） | 🔧 |
+| `paper_analysis` | `paper_handler` → END | 论文未入库时自动链 `download→convert→ingest` | 单篇精读 → 结构化知识提取 | 🔧 |
+| `survey_generate` | `survey_handler` → END | 论文未入库时自动链 `download→convert→ingest` | LLM 基于已入库论文生成综述 | 🔧 |
+| `download` | `download_handler` → `convert_handler?` → `ingest_handler?` | 用户要求入库时自动链 | PDF 下载（N<10 inline / N≥10 Celery） | 🔧 |
+| `subscription` | `subscription_handler` → END | — | 创建/查看订阅；Beat 定时推送为后台进程 | 🔧 |
+| `video` | `video_handler` → END | — | 下载→转写→摘要→存碎片知识 (Celery，handler 内多 tool 串行) | 🔧 |
+| `memory` | `memory_handler` → END | — | 查询历史偏好/反馈/语录 | 🔧 |
+
+> `?` = 节点内检测前置条件，不满足时触发。不是每次都走。
+
+### Side Intent Routing
+
+| side intent | 处理节点 | 工具 |
+|------------|---------|------|
+| `preference` | `side_handler` | `update_preference` |
+| `feedback` | `side_handler` | `record_feedback` |
+| `mentor_quote` | `side_handler` | `record_feedback` |
+
+side_handler 在 primary handler 前运行（轻量 ReAct ≤ 3 轮），因为偏好可能影响后续行为。
+
+### 技术 Intent（不列入业务场景）
+
+| intent | 节点 | 状态 |
+|--------|------|:---:|
+| `chat` | `inline_reply` | ✅ |
+| `ops` | `ops_confirm` → `execute(ReAct)`（含 cleanup 磁盘清理） | ✅ |
 
 ### 3.3 已实现的 Handler 节点
+
+**子流：文献调研多 Turn 链**
 
 ```
 Turn 1: 用户:"找 transformer 论文"
@@ -94,17 +118,23 @@ Turn 1: 用户:"找 transformer 论文"
      如果 query 模糊: ask(text/choice) 先澄清
 
 Turn 2: 用户:"下载前 10 篇" 或 "写综述"
-  → download_papers_handler
+  → download_handler
      10 篇 → inline 阻塞下载
      50+ 篇 → ask(confirm, "后台运行?") → Celery
 
-## 八、日志
+Turn 3: 用户:"生成综述"
+  → survey_handler
+     → 前置检查：论文已入库? → 否 → 自动链 download→convert→ingest
+     → LLM 基于已入库论文生成综述 → message/reply → turn 结束
+```
 
-调研每次搜索都会更新日志记录到event_logs表中。
+**前置条件链**（5 个意图适用）：`paper_analysis` / `survey_generate` / `writing` / `clustering` / `download(入库时)` 在论文未入库时，handler 自动路由到 `download_handler → convert_handler → ingest_handler`，再回到原 handler。
 
-## 九、入库的handler默认会查找目录下的全部PDF文件，然后批量入库进DB，允许用户自定义目录路径。
+### 3.4 入库/清理说明
 
-## 十、清理handler会删除原始PDF/MD文件作为磁盘管理的一个步骤。
+- **入库**：`ingest_handler` 扫描目录下全部 PDF → `convert_to_md`(Celery) → `chunk_embed_ingest`(Celery)，支持自定义目录路径
+- **清理**：磁盘清理 (`cleanup`) 归入 `ops` 意图下的 `execute` 节点，删除原始 PDF/MD 文件保留 DB 记录
+- **搜索日志**：每次调研搜索记录到 `event_logs` 表
 
 ---
 
@@ -189,26 +219,33 @@ LLM 只做决策，不执行。决策空间限定为预定义 action 集合。
 
 ### 7.2 Tool 列表
 
-| Tool | 来源 | 说明 |
-|------|------|------|
-| `search_papers` | LiteratureAgent | BM25+向量混合搜索，跨源（arxiv/S2） |
-| `evaluate_papers` | LiteratureAgent | LLM 评估论文相关性 |
-| `download_paper` | LiteratureAgent | 下载单篇 PDF |
-| `convert_to_md` | LiteratureAgent | PDF→MD 转换 |
-| `search_kb` | KnowledgeAgent | BM25+向量检索知识库 |
-| `chunk_embed_ingest` | KnowledgeAgent | 切片+embedding+去重+入库 |
-| `generate_survey` | WritingAgent | LLM 生成文献综述 |
-| `check_ai_flavor` | WritingAgent | LLM 检测 AI 写作痕迹 |
-| `gap_analysis` | WritingAgent | LLM 分析研究空白 |
-| `glossary_search` | TranslationAgent | 词表检索匹配 |
-| `collect_terms` | GlossaryAgent | TF-IDF 提取候选术语 |
-| `verify_terms` | GlossaryAgent | LLM 校验术语定义 |
-| `cluster_papers` | ClusteringAgent | K-means 聚类 |
-| `fetch_citations` | CitationChaseAgent | S2 API 获取引用 |
-| `filter_relevance` | CitationChaseAgent | LLM 过滤引用相关性 |
-| `process_video` | VideoAgent | 下载+转写+摘要 |
-| `record_feedback` | 新增 | 记录用户反馈/偏好/语录 |
-| `update_preference` | 已有 | 更新用户偏好 |
+| Tool | Handler 节点 | 说明 |
+|------|-------------|------|
+| `search_papers` | literature_search | BM25+向量混合搜索，跨源（arxiv/S2） |
+| `evaluate_papers` | literature_search | LLM 评估论文相关性 |
+| `download_paper` | download | 下载单篇 PDF |
+| `convert_to_md` | convert / ingest | PDF→MD 转换 |
+| `search_kb` | rag / paper | BM25+向量检索知识库 |
+| `chunk_embed_ingest` | ingest | 切片+embedding+去重+入库 |
+| `generate_survey` | survey / writing | LLM 生成文献综述 |
+| `check_ai_flavor` | writing | LLM 检测 AI 写作痕迹 |
+| `gap_analysis` | writing | LLM 分析研究空白 |
+| `glossary_search` | translate | 词表检索匹配 |
+| `collect_terms` | glossary | TF-IDF 提取候选术语 |
+| `verify_terms` | glossary | LLM 校验术语定义 |
+| `cluster_papers` | cluster | K-means 聚类 |
+| `fetch_citations` | citation | S2 API 获取引用 |
+| `filter_relevance` | citation | LLM 过滤引用相关性 |
+| `download_video` | video | yt-dlp 下载视频（Celery） |
+| `transcribe_video` | video | Whisper 转写（Celery） |
+| `summarize_video` | video | LLM 结构化摘要 |
+| `save_capture` | video | 保存碎片知识到 captures 表 |
+| `create_subscription` | subscription | 创建订阅 |
+| `list_subscriptions` | subscription | 查看订阅列表 / 推送历史 |
+| `search_memory` | memory | 语义搜索记忆 |
+| `get_user_preference` | memory | 精确查询偏好 |
+| `record_feedback` | side | 记录反馈/偏好/语录 |
+| `update_preference` | side | 更新用户偏好 |
 
 ---
 
@@ -234,9 +271,10 @@ LLM 只做决策，不执行。决策空间限定为预定义 action 集合。
 | 优先级 | 文件 | 变更 |
 |:---:|------|------|
 | P0 | `CLAUDE.md` | 更新图结构、节点列表、架构概览 |
+| P0 | `docs/development/intent-routing-design.md` | **v5.1 意图-场景-节点路由设计（权威）** |
 | P0 | `docs/development/development-plan.md` | v5 计划 |
 | P0 | `docs/development/agent-architecture-v4.md` → `v5` | 更新架构内容 |
-| P1 | `docs/development/plangraph-routing.md` | intent→handler 路由 |
+| P1 | `docs/development/plangraph-routing.md` | **[DEPRECATED]** 标记废弃，指向 intent-routing-design.md |
 | P1 | `docs/development/gap-analysis.md` | 重算 gap |
 | P1 | `docs/development/acceptance-criteria.md` | 更新 AC |
 | P2 | `docs/development/websocket-protocol.md` | 更新 stage 值表 |
